@@ -1,0 +1,37 @@
+#version 450
+
+// Hi-Z mip downsample. Reads a 2×2 footprint from `srcMip` and writes the
+// pixel-wise minimum into `dstMip`. Convention: depth is 0 at near plane,
+// 1 at far plane (Vulkan reversed-Y, zero-to-one). For SSR acceleration
+// the min of a tile is the "closest" surface inside that tile — a ray
+// whose z falls below the tile min cannot possibly hit anything in the
+// tile and can skip ahead.
+//
+// One dispatch per destination mip. The application loops mip 1..N-1,
+// binding the right per-mip image views each iteration.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Source mip — bound as sampler2D with NEAREST filter (we do our own 2×2
+// fetch). Using a sampler keeps us off subpass-input rules; the layout is
+// SHADER_READ_ONLY_OPTIMAL between mip writes.
+layout(set = 0, binding = 0) uniform sampler2D u_srcMip;
+// Destination mip — storage image view of mip N+1.
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_dstMip;
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(u_dstMip);
+    if (dst.x >= dstSize.x || dst.y >= dstSize.y) return;
+
+    ivec2 srcBase = dst * 2;
+    ivec2 srcSize = textureSize(u_srcMip, 0);
+
+    // 2×2 gather with clamp — handles odd source dimensions (final mip).
+    float d00 = texelFetch(u_srcMip, min(srcBase + ivec2(0, 0), srcSize - 1), 0).r;
+    float d10 = texelFetch(u_srcMip, min(srcBase + ivec2(1, 0), srcSize - 1), 0).r;
+    float d01 = texelFetch(u_srcMip, min(srcBase + ivec2(0, 1), srcSize - 1), 0).r;
+    float d11 = texelFetch(u_srcMip, min(srcBase + ivec2(1, 1), srcSize - 1), 0).r;
+
+    float dMin = min(min(d00, d10), min(d01, d11));
+    imageStore(u_dstMip, dst, vec4(dMin, 0.0, 0.0, 0.0));
+}

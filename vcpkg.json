@@ -1,0 +1,17 @@
+{
+    "name": "pokemotor",
+    "version": "1.0.0",
+    "dependencies": [
+        "freetype",
+        "lua",
+        "sol2",
+        "sdl3",
+        "sdl3-image",
+        "zlib",
+        "vulkan",
+        "vulkan-memory-allocator",
+        "vk-bootstrap",
+        "glslang",
+        "spirv-reflect"
+    ]
+}

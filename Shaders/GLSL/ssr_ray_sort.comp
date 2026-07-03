@@ -1,0 +1,100 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// SSR ray classification + scatter. Runs twice per frame:
+//   pass 0 (count):    each thread classifies its pixel into one of 64
+//                      direction bins (octahedral map of the reflection
+//                      direction), increments totalRayCount + binCounters.
+//   pass 1 (scatter):  after the prefix sum has written binOffsets, each
+//                      thread re-classifies and writes the packed pixel
+//                      coord into the slot binOffsets[binId] + atomic-
+//                      reserved local index.
+//
+// 64 bins on an 8×8 grid over the octahedral [0,1]² mapping. The packet
+// trace shader assumes 256-wide workgroups, so each workgroup processes
+// 256 consecutive sorted-buffer entries which (by construction) point at
+// pixels whose reflection directions live in the same bin → packet
+// coherence inside the workgroup.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// G-Buffer reads. Set/binding numbers come from VulkanContext::createSSRSortDescriptors.
+layout(set = 0, binding = 0) uniform sampler2D gPosition;
+layout(set = 0, binding = 1) uniform sampler2D gNormal;
+
+layout(set = 0, binding = 2, std430) buffer RayCount {
+    uint totalRayCount;
+};
+layout(set = 0, binding = 3, std430) buffer BinCounters {
+    uint binCounters[64];
+};
+layout(set = 0, binding = 4, std430) readonly buffer BinOffsets {
+    uint binOffsets[64];
+};
+layout(set = 0, binding = 5, std430) buffer ScatterCounters {
+    uint scatterCounters[64];
+};
+layout(set = 0, binding = 6, std430) writeonly buffer SortedRays {
+    uint sortedPixels[];
+};
+
+// All SSR sort knobs ride in a single push-constant block. `mode` is the
+// only field that changes between the count and scatter dispatches.
+// vec4 instead of vec3 for cameraPos avoids std430 alignment surprises on
+// the host side.
+layout(push_constant) uniform PC {
+    vec4  cameraPos;
+    int   width;
+    int   height;
+    int   mode;   // 0 = count, 1 = scatter
+    int   _pad0;
+} pc;
+
+#define BIN_GRID 8u
+
+vec2 DirToOctahedral(vec3 dir) {
+    vec3 n = dir / (abs(dir.x) + abs(dir.y) + abs(dir.z));
+    if (n.z < 0.0) {
+        n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0,
+                                         n.y >= 0.0 ? 1.0 : -1.0);
+    }
+    return n.xy * 0.5 + 0.5;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= pc.width || pixel.y >= pc.height) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.width, pc.height);
+
+    vec4 nrmRgh = texture(gNormal, uv);
+    vec3 normal = nrmRgh.rgb;
+    float roughness = nrmRgh.a;
+
+    // Background or very rough surfaces — skip. Cutoff 0.70 matches the
+    // packet trace shader: VNDF-sampled rough rays still produce useful
+    // contribution up to that roughness.
+    if (length(normal) < 0.1 || roughness >= 0.70) return;
+
+    normal = normalize(normal);
+    vec3 worldPos = texture(gPosition, uv).rgb;
+    vec3 V = normalize(pc.cameraPos.xyz - worldPos);
+    float NdotV = max(dot(normal, V), 0.0);
+    if (NdotV <= 0.15) return;
+
+    vec3 R = reflect(-V, normal);
+
+    vec2 oct = DirToOctahedral(R);
+    uvec2 cell = clamp(uvec2(oct * float(BIN_GRID)), uvec2(0u), uvec2(BIN_GRID - 1u));
+    uint binId = cell.y * BIN_GRID + cell.x;
+
+    if (pc.mode == 0) {
+        atomicAdd(totalRayCount, 1u);
+        atomicAdd(binCounters[binId], 1u);
+    } else {
+        uint localIdx = atomicAdd(scatterCounters[binId], 1u);
+        uint sortedPos = binOffsets[binId] + localIdx;
+        uint packedPixel = uint(pixel.x) | (uint(pixel.y) << 16u);
+        sortedPixels[sortedPos] = packedPixel;
+    }
+}

@@ -1,0 +1,40 @@
+#version 460
+
+// Auto-exposure stage 1: build a 256-bin log-luminance histogram of the HDR
+// scene. Each workgroup accumulates into shared memory first to keep the global
+// atomic traffic down, then merges its 256 bins into the global histogram.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_hdr;          // postScratch (HDR)
+layout(set = 0, binding = 1, std430) buffer Histogram { uint histogram[256]; };
+
+layout(push_constant) uniform PC {
+    int   width;
+    int   height;
+    float logMin;       // log2 of the minimum represented luminance
+    float invLogRange;  // 1.0 / (logMax - logMin)
+} pc;
+
+shared uint localHist[256];
+
+uint luminanceToBin(float lum) {
+    if (lum < 1e-4) return 0u;  // bin 0 reserved for near-black
+    float t = clamp((log2(lum) - pc.logMin) * pc.invLogRange, 0.0, 1.0);
+    return uint(t * 254.0 + 1.0);
+}
+
+void main() {
+    localHist[gl_LocalInvocationIndex] = 0u;
+    barrier();
+
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x < pc.width && px.y < pc.height) {
+        vec2 uv  = (vec2(px) + 0.5) / vec2(pc.width, pc.height);
+        vec3 c   = texture(u_hdr, uv).rgb;
+        float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        atomicAdd(localHist[luminanceToBin(lum)], 1u);
+    }
+    barrier();
+
+    atomicAdd(histogram[gl_LocalInvocationIndex], localHist[gl_LocalInvocationIndex]);
+}

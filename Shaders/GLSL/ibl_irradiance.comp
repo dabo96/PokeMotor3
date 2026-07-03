@@ -1,0 +1,80 @@
+#version 450
+
+// Cosine-weighted diffuse irradiance integral, one output texel per workgroup
+// invocation. Output layout matches the env cubemap (6-layer 2D array).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2DArray u_env;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray u_irradiance;
+
+const float PI = 3.14159265359;
+
+vec3 faceUVToDir(uint face, vec2 uv) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    if (face == 0u) return normalize(vec3( 1.0, -ndc.y, -ndc.x));
+    if (face == 1u) return normalize(vec3(-1.0, -ndc.y,  ndc.x));
+    if (face == 2u) return normalize(vec3( ndc.x,  1.0,  ndc.y));
+    if (face == 3u) return normalize(vec3( ndc.x, -1.0, -ndc.y));
+    if (face == 4u) return normalize(vec3( ndc.x, -ndc.y,  1.0));
+                    return normalize(vec3(-ndc.x, -ndc.y, -1.0));
+}
+
+// World-space direction → (uv, layer) sampling coordinate for sampler2DArray.
+vec3 dirToFaceUV(vec3 dir) {
+    vec3  absD = abs(dir);
+    uint  face;
+    vec2  uv;
+    float ma;
+    if (absD.x >= absD.y && absD.x >= absD.z) {
+        face = (dir.x > 0.0) ? 0u : 1u;
+        uv   = (dir.x > 0.0) ? vec2(-dir.z, -dir.y) : vec2( dir.z, -dir.y);
+        ma   = absD.x;
+    } else if (absD.y >= absD.z) {
+        face = (dir.y > 0.0) ? 2u : 3u;
+        uv   = (dir.y > 0.0) ? vec2( dir.x,  dir.z) : vec2( dir.x, -dir.z);
+        ma   = absD.y;
+    } else {
+        face = (dir.z > 0.0) ? 4u : 5u;
+        uv   = (dir.z > 0.0) ? vec2( dir.x, -dir.y) : vec2(-dir.x, -dir.y);
+        ma   = absD.z;
+    }
+    uv = uv / ma * 0.5 + 0.5;
+    return vec3(uv, float(face));
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    ivec3 size  = imageSize(u_irradiance);
+    if (coord.x >= size.x || coord.y >= size.y || coord.z >= size.z) return;
+
+    vec2 outUv  = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+    vec3 normal = faceUVToDir(uint(coord.z), outUv);
+
+    // Build orthonormal basis (tangent, bitangent, normal).
+    vec3 up      = abs(normal.y) > 0.99 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    vec3 tangent = normalize(cross(up, normal));
+    vec3 bit     = cross(normal, tangent);
+
+    // 32 × 64 hemisphere samples — adequate for a 32² target, finishes in ~1ms.
+    const int N_THETA = 32;
+    const int N_PHI   = 64;
+    vec3 irradiance = vec3(0.0);
+    float samples   = 0.0;
+    for (int i = 0; i < N_THETA; ++i) {
+        float theta = 0.5 * PI * (float(i) + 0.5) / float(N_THETA);
+        float sinT  = sin(theta);
+        float cosT  = cos(theta);
+        for (int j = 0; j < N_PHI; ++j) {
+            float phi   = 2.0 * PI * (float(j) + 0.5) / float(N_PHI);
+            vec3  local = vec3(sinT * cos(phi), sinT * sin(phi), cosT);
+            vec3  world = tangent * local.x + bit * local.y + normal * local.z;
+            vec3  fuv   = dirToFaceUV(world);
+            // The cos(theta) and sin(theta) factors come from the hemisphere
+            // integration; the final PI / samples normalises to ambient color.
+            irradiance += textureLod(u_env, fuv, 0.0).rgb * cosT * sinT;
+            samples    += 1.0;
+        }
+    }
+    irradiance = PI * irradiance / samples;
+    imageStore(u_irradiance, coord, vec4(irradiance, 1.0));
+}

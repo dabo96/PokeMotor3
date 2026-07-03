@@ -1,0 +1,203 @@
+Package: vcpkg-cmake
+Version: 2024-04-23
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 55334139d516d2479b50814170d46e0d2971418f2e63ed429428c300a203391f
+Status: install ok installed
+
+Package: zlib
+Version: 1.3.1
+Depends: vcpkg-cmake
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 3cdb69f82aa84ee1c314a0da122679debf8000bc36dbfb15a342b46d4ec02823
+Description: A compression library
+Status: install ok installed
+
+Package: vcpkg-cmake-config
+Version: 2024-05-23
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 1cc579686c1b0c79469f75056a45342a9a6d034a035373a1345962da4e65ca9b
+Status: install ok installed
+
+Package: libpng
+Version: 1.6.54
+Depends: vcpkg-cmake, vcpkg-cmake-config, zlib
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 5a8c6c9de7aeab303b959091c3aeb5e3d2b0f41d63a3df940ebdc403d07e458f
+Description: libpng is a library implementing an interface for reading and writing PNG (Portable Network Graphics) format files
+Status: install ok installed
+
+Package: bzip2
+Version: 1.0.8
+Port-Version: 6
+Depends: vcpkg-cmake
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 90030ed963b4073ece7cc57341454c5731a5e6b69fef52483a8680ae595c3fd3
+Description: bzip2 is a freely available, patent free, high-quality data compressor. It typically compresses files to within 10% to 15% of the best available techniques (the PPM family of statistical compressors), whilst being around twice as fast at compression and six times faster at decompression.
+Default-Features: tool
+Status: install ok installed
+
+Package: bzip2
+Feature: tool
+Architecture: x64-windows
+Multi-Arch: same
+Description: Builds bzip2 executable
+Status: install ok installed
+
+Package: brotli
+Version: 1.2.0
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: a657713b430790faa467fd50f27e7a0bdc352e458df49fe566114174c809823a
+Description: a generic-purpose lossless compression algorithm that compresses data using a combination of a modern variant of the LZ77 algorithm, Huffman coding and 2nd order context modeling.
+Status: install ok installed
+
+Package: freetype
+Version: 2.13.3
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: a7203b11181ff7eb4abee1d9a13a0f00776852be710699be56bada2c318647ad
+Description: A library to render fonts.
+Default-Features: brotli, bzip2, png, zlib
+Status: install ok installed
+
+Package: freetype
+Feature: brotli
+Depends: brotli
+Architecture: x64-windows
+Multi-Arch: same
+Description: Support decompression of WOFF2 streams
+Status: install ok installed
+
+Package: freetype
+Feature: bzip2
+Depends: bzip2
+Architecture: x64-windows
+Multi-Arch: same
+Description: Support bzip2 compressed fonts.
+Status: install ok installed
+
+Package: freetype
+Feature: png
+Depends: libpng
+Architecture: x64-windows
+Multi-Arch: same
+Description: Support PNG compressed OpenType embedded bitmaps.
+Status: install ok installed
+
+Package: freetype
+Feature: zlib
+Depends: zlib
+Architecture: x64-windows
+Multi-Arch: same
+Description: Use zlib instead of internal library for DEFLATE
+Status: install ok installed
+
+Package: lua
+Version: 5.5.0
+Port-Version: 1
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 5254a01d7adba084edce0016d4a35e90493c586715455ce232d8133998fec877
+Description: A powerful, fast, lightweight, embeddable scripting language
+Status: install ok installed
+
+Package: sdl3
+Version: 3.4.0
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 2508355ed4539d65f97df77826555e170cd37bd3c62b0e741f62c4636cc797f6
+Description: Simple DirectMedia Layer is a cross-platform development library designed to provide low level access to audio, keyboard, mouse, joystick, and graphics hardware via OpenGL and Direct3D.
+Status: install ok installed
+
+Package: sdl3-image
+Version: 3.4.0
+Depends: sdl3, vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 450db1b370bed3923371659441ddb41fa8ae41e5f242c647c41d68979bef9680
+Description: SDL_image is an image file loading library. It loads images as SDL surfaces and textures, and supports the following formats: BMP, GIF, JPEG, LBM, PCX, PNG, PNM, TGA, TIFF, WEBP, XCF, XPM, XV
+Status: install ok installed
+
+Package: sol2
+Version: 3.5.0
+Port-Version: 1
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: dda3c687c25eba4cd798d11cb6c0ad24c08105b4abbf1a8d222f6433efb5dda7
+Description: Sol3 (sol2 v3.0) - a C++ <-> Lua API wrapper with advanced features and top notch performance
+Status: install ok installed
+
+Package: glslang
+Version: 16.1.0
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 312f3c03d6dcd7f6b31ce4f80231b8445a32224524423aaf3484a47440bc53a7
+Description: Khronos-reference front end for GLSL/ESSL, partial front end for HLSL, and a SPIR-V generator.
+Status: install ok installed
+
+Package: spirv-reflect
+Version: 1.4.335.0
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: e1ab9cd6d85b05c5d4268421d8d1f1ca92ec50f8293fe4bc5e601d7044c8f576
+Description: SPIRV-Reflect is a lightweight library that provides a C/C++ reflection API for SPIR-V shader bytecode in Vulkan applications.
+Status: install ok installed
+
+Package: vulkan-headers
+Version: 1.4.335.0
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 0d590186d52fc827ff22f2d63297bff14c0a44c00332949f62d5aed6a8afcc5b
+Description: Vulkan header files and API registry
+Status: install ok installed
+
+Package: vk-bootstrap
+Version: 1.4.335
+Depends: vcpkg-cmake, vcpkg-cmake-config, vulkan-headers
+Architecture: x64-windows
+Multi-Arch: same
+Abi: ed9658c71575b81474688f8f556f1a1612bd41e002ae02e3ebcd2e99b325473c
+Description: Vulkan bootstraping library
+Status: install ok installed
+
+Package: vulkan-loader
+Version: 1.4.335.0
+Depends: vcpkg-cmake, vcpkg-cmake-config, vulkan-headers
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 83bfccc1d2b170d75dcb0f8d71bc025f3d0edcadc3b1fafb0f23c94c130e33d2
+Description: Vulkan Development Tools
+Status: install ok installed
+
+Package: vulkan
+Version: 2023-12-17
+Depends: vcpkg-cmake, vulkan-headers, vulkan-loader
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 5d3f854f0a088b8642151b63b77db6a60da55a8b900da4e47cd38a3c90b544e6
+Description: A stub package that ensures that Vulkan headers and a loader are available.
+    On Android, the NDK provides a loader at API level 24 or higher.
+Status: install ok installed
+
+Package: vulkan-memory-allocator
+Version: 3.3.0
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 9a9be58a035f2fa264601d753334e2d45913729b30efcfd47d5c5af8b15153c8
+Description: Easy to integrate Vulkan memory allocation library from GPUOpen
+Status: install ok installed
+

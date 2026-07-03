@@ -1,0 +1,11 @@
+{
+  "texture": "Assets/Textures/tileset.png",
+  "tileSize": 32,
+  "types": [
+    { "name": "Camino",      "cell": 0, "walkable": true,  "encounter": false, "color": [0.78, 0.71, 0.55, 1.0] },
+    { "name": "Cesped",      "cell": 1, "walkable": true,  "encounter": false, "color": [0.40, 0.66, 0.32, 1.0] },
+    { "name": "Hierba alta", "cell": 2, "walkable": true,  "encounter": true,  "color": [0.18, 0.42, 0.16, 1.0] },
+    { "name": "Agua",        "cell": 3, "walkable": false, "encounter": false, "color": [0.24, 0.45, 0.78, 1.0] },
+    { "name": "Arbol",       "cell": 4, "walkable": false, "encounter": false, "color": [0.10, 0.26, 0.12, 1.0] }
+  ]
+}

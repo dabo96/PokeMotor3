@@ -1,0 +1,616 @@
+#include "UI/WidgetHelpers.h"
+#include "core/Context.h"
+#include "core/Renderer.h"
+#include <cmath>
+#include <algorithm>
+#include <cstring>
+
+namespace FluentUI {
+
+// Static variable to store layout constraints for the next widget
+static std::optional<LayoutConstraints> nextConstraints;
+
+bool IsRectInViewport(UIContext *ctx, const Vec2 &pos, const Vec2 &size) {
+  if (!ctx)
+    return true;
+
+  Vec2 viewport = ctx->renderer.GetViewportSize();
+  Vec2 clipPos(0.0f, 0.0f);
+  Vec2 clipSize = viewport;
+
+  if (!ctx->renderer.GetClipStack().empty()) {
+    const auto &clip = ctx->renderer.GetClipStack().back();
+    clipPos = Vec2(static_cast<float>(clip.x), static_cast<float>(clip.y));
+    clipSize =
+        Vec2(static_cast<float>(clip.width), static_cast<float>(clip.height));
+  }
+
+  // Añadimos un margen de seguridad (pérdida de precisión o bordes suaves)
+  constexpr float margin = 10.0f;
+
+  // Comprobación de solapamiento AABB con margen
+  return (pos.x + size.x + margin > clipPos.x && pos.x - margin < clipPos.x + clipSize.x &&
+          pos.y + size.y + margin > clipPos.y && pos.y - margin < clipPos.y + clipSize.y);
+}
+
+float ResolveSpacing(UIContext *ctx, float spacing) {
+  if (spacing >= 0.0f) {
+    return spacing;
+  }
+  return ctx ? ctx->style.spacing : 4.0f;
+}
+
+Vec2 ResolvePadding(UIContext *ctx, const std::optional<Vec2> &paddingOpt) {
+  if (paddingOpt.has_value()) {
+    return paddingOpt.value();
+  }
+  float p = ctx ? ctx->style.padding : 6.0f;
+  return Vec2(p, p);
+}
+
+Vec2 CurrentOffset(UIContext *ctx) {
+  if (!ctx || ctx->offsetStack.empty()) {
+    return Vec2(0.0f, 0.0f);
+  }
+  return ctx->offsetStack.back();
+}
+
+Vec2 GetParentAvailableSpace(UIContext *ctx) {
+  if (!ctx)
+    return Vec2(0.0f, 0.0f);
+
+  if (ctx->layoutStack.empty()) {
+    Vec2 viewport = ctx->renderer.GetViewportSize();
+    float availableX =
+        std::max(0.0f, viewport.x - ctx->cursorPos.x - ctx->style.padding);
+    float availableY =
+        std::max(0.0f, viewport.y - ctx->cursorPos.y - ctx->style.padding);
+    return Vec2(availableX, availableY);
+  }
+  return ctx->layoutStack.back().availableSpace;
+}
+
+Vec2 ComputeAvailableSpace(UIContext *ctx,
+                            const std::optional<Vec2> &explicitSize,
+                            const Vec2 &padding) {
+  Vec2 parentAvailable = GetParentAvailableSpace(ctx);
+  if (explicitSize.has_value()) {
+    parentAvailable = explicitSize.value();
+  }
+
+  Vec2 contentAvailable(std::max(0.0f, parentAvailable.x - padding.x * 2.0f),
+                        std::max(0.0f, parentAvailable.y - padding.y * 2.0f));
+  return contentAvailable;
+}
+
+LayoutConstraints ConsumeNextConstraints(SizeConstraint defaultWidth) {
+  if (nextConstraints.has_value()) {
+    LayoutConstraints c = nextConstraints.value();
+    nextConstraints.reset();
+    return c;
+  }
+  LayoutConstraints c{};
+  if (defaultWidth == SizeConstraint::Fill) {
+    UIContext* ctx = GetContext();
+    if (ctx && !ctx->layoutStack.empty()) {
+      c.width = SizeConstraint::Fill;
+    }
+  }
+  return c;
+}
+
+Vec2 GetCurrentAvailableSpace(UIContext *ctx) {
+  Vec2 space = GetParentAvailableSpace(ctx);
+  if (ctx && !ctx->layoutStack.empty()) {
+    space = ctx->layoutStack.back().availableSpace;
+  }
+  return Vec2(std::max(0.0f, space.x), std::max(0.0f, space.y));
+}
+
+Vec2 ApplyConstraints(UIContext *ctx, const LayoutConstraints &constraints,
+                       const Vec2 &desiredSize) {
+  Vec2 result = desiredSize;
+  Vec2 available = GetCurrentAvailableSpace(ctx);
+
+  // Detect current layout direction to avoid Fill consuming the shared axis
+  bool inHorizontal = ctx && !ctx->layoutStack.empty() && !ctx->layoutStack.back().isVertical;
+  bool inVertical   = ctx && !ctx->layoutStack.empty() &&  ctx->layoutStack.back().isVertical;
+
+  switch (constraints.width) {
+  case SizeConstraint::Fixed:
+    result.x = constraints.fixedWidth;
+    break;
+  case SizeConstraint::Fill:
+    // In horizontal layout, Fill on X would consume all remaining space —
+    // use desiredSize instead so siblings get their share
+    if (inHorizontal) {
+      result.x = desiredSize.x;
+    } else {
+      result.x = available.x > 0.0f ? available.x : desiredSize.x;
+    }
+    break;
+  case SizeConstraint::Auto:
+    if (constraints.fixedWidth > 0.0f) {
+      result.x = constraints.fixedWidth;
+    } else if (inVertical && available.x > 0.0f && result.x > available.x) {
+      // Auto en eje secundario de un vertical layout: el ancho del padre es
+      // un límite — el hijo no debe sobresalirse. Para forzar overflow, usar
+      // SetNextConstraints con un Fixed/min explícito.
+      result.x = available.x;
+    }
+    break;
+  }
+
+  switch (constraints.height) {
+  case SizeConstraint::Fixed:
+    result.y = constraints.fixedHeight;
+    break;
+  case SizeConstraint::Fill:
+    // In vertical layout, Fill on Y would consume all remaining space —
+    // use desiredSize instead so siblings get their share
+    if (inVertical) {
+      result.y = desiredSize.y;
+    } else {
+      result.y = available.y > 0.0f ? available.y : desiredSize.y;
+    }
+    break;
+  case SizeConstraint::Auto:
+    if (constraints.fixedHeight > 0.0f) {
+      result.y = constraints.fixedHeight;
+    } else if (inHorizontal && available.y > 0.0f && result.y > available.y) {
+      // Auto en eje secundario de un horizontal layout (toolbar, statusbar):
+      // la altura del padre acota al hijo para que no se desborde.
+      result.y = available.y;
+    }
+    break;
+  }
+
+  if (constraints.minWidth > 0.0f)
+    result.x = std::max(result.x, constraints.minWidth);
+  if (constraints.maxWidth > 0.0f)
+    result.x = std::min(result.x, constraints.maxWidth);
+  if (constraints.minHeight > 0.0f)
+    result.y = std::max(result.y, constraints.minHeight);
+  if (constraints.maxHeight > 0.0f)
+    result.y = std::min(result.y, constraints.maxHeight);
+
+  result.x = std::max(result.x, 0.0f);
+  result.y = std::max(result.y, 0.0f);
+  return result;
+}
+
+float CurrentLayoutSpacing(UIContext *ctx) {
+  if (!ctx)
+    return 0.0f;
+  if (!ctx->layoutStack.empty())
+    return ctx->layoutStack.back().spacing;
+  return ctx->style.spacing;
+}
+
+float GetCurrentSpacing(UIContext *ctx) { return CurrentLayoutSpacing(ctx); }
+
+bool RectanglesOverlap(const Vec2 &pos1, const Vec2 &size1, const Vec2 &pos2,
+                        const Vec2 &size2) {
+  return !(pos1.x + size1.x <= pos2.x || pos2.x + size2.x <= pos1.x ||
+           pos1.y + size1.y <= pos2.y || pos2.y + size2.y <= pos1.y);
+}
+
+Vec2 ResolveAbsolutePosition(UIContext *ctx, const Vec2 &desiredPos,
+                              const Vec2 &widgetSize) {
+  if (!ctx)
+    return desiredPos;
+
+  // pos is interpreted relative to the current parent container's content
+  // origin (Panel, Vertical/Horizontal, ScrollView, etc.). With no active
+  // container the offset is (0,0), preserving window-absolute behavior for
+  // top-level widgets.
+  Vec2 clamped = desiredPos;
+  if (clamped.x < 0.0f) clamped.x = 0.0f;
+  if (clamped.y < 0.0f) clamped.y = 0.0f;
+  return clamped + CurrentOffset(ctx);
+}
+
+void AdvanceCursor(UIContext *ctx, const Vec2 &size) {
+  if (!ctx)
+    return;
+
+  ctx->lastItemSize = size;
+
+  if (ctx->layoutStack.empty()) {
+    ctx->cursorPos.y += size.y + ctx->style.spacing;
+    return;
+  }
+
+  LayoutStack &stack = ctx->layoutStack.back();
+  if (stack.isVertical) {
+    stack.contentSize.x = std::max(stack.contentSize.x, size.x);
+    stack.contentSize.y += size.y;
+    // Reset X to left edge after each item, applying any active CollapsingHeader indent.
+    stack.cursor.x = stack.contentStart.x + stack.collapseIndent;
+    stack.cursor.y += size.y;
+    stack.availableSpace.y = std::max(0.0f, stack.availableSpace.y - size.y);
+    stack.itemCount++;
+    if (stack.spacing > 0.0f) {
+      stack.cursor.y += stack.spacing;
+      stack.availableSpace.y =
+          std::max(0.0f, stack.availableSpace.y - stack.spacing);
+    }
+    ctx->cursorPos = Vec2(stack.cursor.x, stack.cursor.y);
+  } else {
+    stack.contentSize.x += size.x;
+    stack.contentSize.y = std::max(stack.contentSize.y, size.y);
+    stack.cursor.x += size.x;
+    stack.availableSpace.x = std::max(0.0f, stack.availableSpace.x - size.x);
+    stack.itemCount++;
+    if (stack.spacing > 0.0f) {
+      stack.cursor.x += stack.spacing;
+      stack.availableSpace.x =
+          std::max(0.0f, stack.availableSpace.x - stack.spacing);
+    }
+    ctx->cursorPos = Vec2(stack.cursor.x, stack.contentStart.y);
+  }
+}
+
+Vec2 MeasureTextCached(UIContext *ctx, const std::string &text,
+                        float fontSize) {
+  if (!ctx || text.empty())
+    return Vec2(0.0f, 0.0f);
+
+  // Perf 1.1: Zero-allocation cache key using hash
+  // Combine text hash + fontSize bits into a single uint64_t key
+  uint32_t textHash = 5381;
+  for (char c : text) textHash = ((textHash << 5) + textHash) + static_cast<unsigned char>(c);
+  uint32_t sizeKey;
+  static_assert(sizeof(float) == sizeof(uint32_t));
+  std::memcpy(&sizeKey, &fontSize, sizeof(uint32_t));
+  uint64_t cacheKey = (static_cast<uint64_t>(textHash) << 32) | sizeKey;
+
+  auto it = ctx->textMeasurementCache.find(cacheKey);
+  if (it != ctx->textMeasurementCache.end()) {
+    // Issue 12: Update last access frame
+    it->second.lastAccessFrame = ctx->frame;
+    ctx->perfCounters.textCacheHits++;
+    return it->second.size;
+  }
+
+  ctx->perfCounters.textCacheMisses++;
+  Vec2 size = ctx->renderer.MeasureText(text, fontSize);
+
+  // Evict cache if it exceeds max size
+  if (ctx->textMeasurementCache.size() >= UIContext::TEXT_CACHE_MAX_SIZE) {
+    // Issue 12: Instead of clearing all, remove oldest entries
+    for (auto evIt = ctx->textMeasurementCache.begin(); evIt != ctx->textMeasurementCache.end(); ) {
+      if ((ctx->frame - evIt->second.lastAccessFrame) > UIContext::TEXT_CACHE_STALE_AGE) {
+        evIt = ctx->textMeasurementCache.erase(evIt);
+      } else {
+        ++evIt;
+      }
+    }
+    // If still too big after removing stale, clear half
+    if (ctx->textMeasurementCache.size() >= UIContext::TEXT_CACHE_MAX_SIZE) {
+      size_t toRemove = ctx->textMeasurementCache.size() / 2;
+      auto evIt = ctx->textMeasurementCache.begin();
+      while (toRemove > 0 && evIt != ctx->textMeasurementCache.end()) {
+        evIt = ctx->textMeasurementCache.erase(evIt);
+        --toRemove;
+      }
+    }
+  }
+
+  ctx->textMeasurementCache[cacheKey] = {size, ctx->frame};
+  return size;
+}
+
+Vec2 MeasureTextCached(UIContext *ctx, const std::string &text,
+                        float fontSize, const std::string &fontName) {
+  if (fontName.empty()) return MeasureTextCached(ctx, text, fontSize);
+  if (!ctx || text.empty()) return Vec2(0.0f, 0.0f);
+
+  // Include fontName hash in cache key
+  uint32_t textHash = 5381;
+  for (char c : text) textHash = ((textHash << 5) + textHash) + static_cast<unsigned char>(c);
+  for (char c : fontName) textHash = ((textHash << 5) + textHash) + static_cast<unsigned char>(c);
+  uint32_t sizeKey;
+  std::memcpy(&sizeKey, &fontSize, sizeof(uint32_t));
+  uint64_t cacheKey = (static_cast<uint64_t>(textHash) << 32) | sizeKey;
+
+  auto it = ctx->textMeasurementCache.find(cacheKey);
+  if (it != ctx->textMeasurementCache.end()) {
+    it->second.lastAccessFrame = ctx->frame;
+    ctx->perfCounters.textCacheHits++;
+    return it->second.size;
+  }
+
+  ctx->perfCounters.textCacheMisses++;
+  Vec2 size = ctx->renderer.MeasureTextWithFont(text, fontName, fontSize);
+  ctx->textMeasurementCache[cacheKey] = {size, ctx->frame};
+  return size;
+}
+
+void DrawStyledText(UIContext *ctx, const Vec2 &pos, const std::string &text, const TextStyle &style) {
+  if (!ctx || text.empty()) return;
+  if (style.fontName.empty()) {
+    ctx->renderer.DrawText(pos, text, style.color, style.fontSize);
+  } else {
+    ctx->renderer.DrawTextWithFont(pos, text, style.color, style.fontName, style.fontSize);
+  }
+}
+
+Vec2 MeasureStyledText(UIContext *ctx, const std::string &text, const TextStyle &style) {
+  if (style.fontName.empty()) {
+    return MeasureTextCached(ctx, text, style.fontSize);
+  }
+  return MeasureTextCached(ctx, text, style.fontSize, style.fontName);
+}
+
+// Animation slot offsets - use large prime-based offsets to avoid collisions
+// with other widget IDs. Widgets that use color animations store them at
+// AnimSlot(id, 0), AnimSlot(id, 1), AnimSlot(id, 2).
+uint32_t AnimSlot(uint32_t widgetId, uint32_t slot) {
+  // Use a large offset with different primes per slot to minimize collision risk
+  constexpr uint32_t SLOT_OFFSET_BASE = 0x9E3779B9u; // golden ratio fractional
+  return widgetId + SLOT_OFFSET_BASE * (slot + 1);
+}
+
+// Helper to register hash with GC tracking
+// Perf 1.2: Only register base ID — animation slots registered lazily via RegisterAnimSlots
+static uint32_t RegisterHash(uint32_t hash) {
+  UIContext *ctx = GetContext();
+  if (ctx) {
+    ctx->lastSeenFrame[hash] = ctx->frame;
+    ctx->lastGeneratedId = hash;
+  }
+  return hash;
+}
+
+// Perf 1.2: Lazy registration of animation slots — only called by widgets that use animations
+void RegisterAnimSlots(uint32_t widgetId) {
+  UIContext *ctx = GetContext();
+  if (ctx) {
+    uint32_t frame = ctx->frame;
+    ctx->lastSeenFrame[AnimSlot(widgetId, 0)] = frame;
+    ctx->lastSeenFrame[AnimSlot(widgetId, 1)] = frame;
+    ctx->lastSeenFrame[AnimSlot(widgetId, 2)] = frame;
+  }
+}
+
+uint32_t GenerateId(const char *str) {
+  uint32_t hash = 5381;
+  int c;
+  while ((c = *str++)) {
+    hash = ((hash << 5) + hash) + c;
+  }
+  return RegisterHash(hash);
+}
+
+// Issue 14: Two-part GenerateId without string concatenation
+uint32_t GenerateId(const char *prefix, const char *str) {
+  uint32_t hash = 5381;
+  int c;
+  const char* p = prefix;
+  while ((c = *p++)) {
+    hash = ((hash << 5) + hash) + c;
+  }
+  p = str;
+  while ((c = *p++)) {
+    hash = ((hash << 5) + hash) + c;
+  }
+  return RegisterHash(hash);
+}
+
+// Issue 14: Three-part GenerateId without string concatenation
+uint32_t GenerateId(const char *a, const char *b, const char *c_str) {
+  uint32_t hash = 5381;
+  int c;
+  const char* p = a;
+  while ((c = *p++)) {
+    hash = ((hash << 5) + hash) + c;
+  }
+  p = b;
+  while ((c = *p++)) {
+    hash = ((hash << 5) + hash) + c;
+  }
+  p = c_str;
+  while ((c = *p++)) {
+    hash = ((hash << 5) + hash) + c;
+  }
+  return RegisterHash(hash);
+}
+
+void DrawScrollbar(UIContext *ctx, const Vec2 &barPos, const Vec2 &barSize,
+                   float contentSize, float viewSize, float &scrollOffset,
+                   bool isDragging, Vec2 &dragStartMouse, float &dragStartScroll,
+                   bool &draggingOut, bool isVertical) {
+  if (!ctx || contentSize <= viewSize)
+    return;
+
+  float mouseX = ctx->input.MouseX();
+  float mouseY = ctx->input.MouseY();
+  bool leftDown = ctx->input.IsMouseDown(0);
+  bool leftPressed = ctx->input.IsMousePressed(0);
+
+  float ratio = viewSize / contentSize;
+  float thumbLength = std::max(20.0f, (isVertical ? barSize.y : barSize.x) * ratio);
+  float trackLength = isVertical ? barSize.y : barSize.x;
+  float maxThumbTravel = trackLength - thumbLength;
+  float maxScroll = std::max(0.0f, contentSize - viewSize);
+
+  float thumbOffset = maxScroll > 0.0f ? (scrollOffset / maxScroll) * maxThumbTravel : 0.0f;
+
+  Vec2 thumbPos = isVertical ? Vec2(barPos.x, barPos.y + thumbOffset)
+                             : Vec2(barPos.x + thumbOffset, barPos.y);
+  Vec2 thumbSize = isVertical ? Vec2(barSize.x, thumbLength)
+                              : Vec2(thumbLength, barSize.y);
+
+  bool hoverThumb = (mouseX >= thumbPos.x && mouseX <= thumbPos.x + thumbSize.x &&
+                     mouseY >= thumbPos.y && mouseY <= thumbPos.y + thumbSize.y);
+  bool hoverTrack = (mouseX >= barPos.x && mouseX <= barPos.x + barSize.x &&
+                     mouseY >= barPos.y && mouseY <= barPos.y + barSize.y);
+
+  if (isDragging) {
+    if (!leftDown) {
+      draggingOut = false;
+    } else {
+      float mouseDelta = isVertical ? (mouseY - dragStartMouse.y) : (mouseX - dragStartMouse.x);
+      float scrollDelta = maxThumbTravel > 0.0f ? (mouseDelta / maxThumbTravel) * maxScroll : 0.0f;
+      scrollOffset = std::clamp(dragStartScroll + scrollDelta, 0.0f, maxScroll);
+    }
+  } else if (leftPressed && hoverThumb) {
+    draggingOut = true;
+    dragStartMouse = Vec2(mouseX, mouseY);
+    dragStartScroll = scrollOffset;
+  } else if (leftPressed && hoverTrack) {
+    float clickPos = isVertical ? (mouseY - barPos.y) : (mouseX - barPos.x);
+    float scrollRatio = clickPos / trackLength;
+    scrollOffset = std::clamp(scrollRatio * maxScroll, 0.0f, maxScroll);
+  }
+
+  Color trackColor = hoverTrack ? ctx->style.panel.headerBackground : ctx->style.panel.background;
+  ctx->renderer.DrawRectFilled(barPos, barSize, trackColor, 0.0f);
+
+  Color thumbColor = (hoverThumb || isDragging)
+                         ? ctx->style.button.background.hover
+                         : ctx->style.button.background.normal;
+  ctx->renderer.DrawRectFilled(thumbPos, thumbSize, thumbColor, 4.0f);
+}
+
+Color AdjustContainerBackground(const Color &bg, bool isDarkTheme) {
+  if (isDarkTheme) {
+    return Color(bg.r * 1.15f, bg.g * 1.15f, bg.b * 1.15f, 1.0f);
+  }
+  return Color(bg.r * 0.92f, bg.g * 0.92f, bg.b * 0.92f, 1.0f);
+}
+
+Color AdjustListSurfaceBackground(const Color &bg, bool isDarkTheme) {
+  // Stronger contrast than AdjustContainerBackground so list/tree surfaces are
+  // visible even when nested inside an already-adjusted panel.
+  if (isDarkTheme) {
+    return Color(bg.r * 1.35f, bg.g * 1.35f, bg.b * 1.35f, 1.0f);
+  }
+  return Color(bg.r * 0.85f, bg.g * 0.85f, bg.b * 0.85f, 1.0f);
+}
+
+bool PointInRect(const Vec2 &p, const Vec2 &pos, const Vec2 &size) {
+  return p.x >= pos.x && p.x < pos.x + size.x && p.y >= pos.y &&
+         p.y < pos.y + size.y;
+}
+
+Color InputFieldBackground(UIContext *ctx, bool hover) {
+  Color bg = ctx->GetEffectivePanelStyle().background;
+  if (ctx->style.isDarkTheme) {
+    // Recessed "well": clearly darker than the surrounding surface. Hover lifts
+    // it a little back toward the surface for feedback.
+    float f = hover ? 0.85f : 0.62f;
+    return Color(bg.r * f, bg.g * f, bg.b * f, 1.0f);
+  }
+  // Light: lift toward white so the field reads as a distinct input on the gray
+  // surface. Hover makes it a touch grayer.
+  float lift = hover ? 0.45f : 0.78f;
+  return Color(bg.r + (1.0f - bg.r) * lift,
+               bg.g + (1.0f - bg.g) * lift,
+               bg.b + (1.0f - bg.b) * lift, 1.0f);
+}
+
+Color InputFieldBorder(UIContext *ctx, bool hover) {
+  Color bg = ctx->GetEffectivePanelStyle().background;
+  if (ctx->style.isDarkTheme) {
+    // Brighter than the surface so the field edge reads as a crisp 1px line.
+    float f = hover ? 1.95f : 1.55f;
+    return Color(std::min(bg.r * f, 1.0f), std::min(bg.g * f, 1.0f),
+                 std::min(bg.b * f, 1.0f), 1.0f);
+  }
+  // Light: a touch darker than the surface for a subtle gray outline.
+  float f = hover ? 0.55f : 0.72f;
+  return Color(bg.r * f, bg.g * f, bg.b * f, 1.0f);
+}
+
+void SetNextConstraints(const LayoutConstraints &constraints) {
+  nextConstraints = constraints;
+}
+
+// DPI helpers (Phase 4)
+float GetDPIScale() {
+    auto* ctx = GetContext();
+    return ctx ? ctx->dpiScale : 1.0f;
+}
+
+float Scaled(float value) {
+    auto* ctx = GetContext();
+    return ctx ? value * ctx->dpiScale : value;
+}
+
+// Style override stack (Phase 6)
+void PushStyle(const Style& override) {
+    auto* ctx = GetContext();
+    if (ctx) ctx->styleStack.push_back(override);
+}
+
+void PopStyle() {
+    auto* ctx = GetContext();
+    if (ctx && !ctx->styleStack.empty()) ctx->styleStack.pop_back();
+}
+
+void PushButtonStyle(const ButtonStyle& s) {
+    auto* ctx = GetContext();
+    if (ctx) ctx->buttonStyleStack.push_back(s);
+}
+
+void PopButtonStyle() {
+    auto* ctx = GetContext();
+    if (ctx && !ctx->buttonStyleStack.empty()) ctx->buttonStyleStack.pop_back();
+}
+
+void PushPanelStyle(const PanelStyle& s) {
+    auto* ctx = GetContext();
+    if (ctx) ctx->panelStyleStack.push_back(s);
+}
+
+void PopPanelStyle() {
+    auto* ctx = GetContext();
+    if (ctx && !ctx->panelStyleStack.empty()) ctx->panelStyleStack.pop_back();
+}
+
+void PushTextColor(const Color& color) {
+    auto* ctx = GetContext();
+    if (ctx) ctx->textColorStack.push_back(color);
+}
+
+void PopTextColor() {
+    auto* ctx = GetContext();
+    if (ctx && !ctx->textColorStack.empty()) ctx->textColorStack.pop_back();
+}
+
+// Accessibility (Phase 6)
+void DrawAccessibilityFocusRing(const Vec2& pos, const Vec2& size) {
+    auto* ctx = GetContext();
+    if (!ctx) return;
+
+    // High-contrast focus ring: 2px outline with accent color
+    Color focusColor(0.4f, 0.6f, 1.0f, 0.9f); // Bright blue
+    float thickness = 2.0f;
+    float offset = 2.0f;
+
+    Vec2 ringPos = {pos.x - offset, pos.y - offset};
+    Vec2 ringSize = {size.x + offset * 2.0f, size.y + offset * 2.0f};
+
+    // Outer ring
+    ctx->renderer.DrawRect(ringPos, ringSize, focusColor, 4.0f);
+    // Inner ring (white for contrast)
+    Vec2 innerPos = {pos.x - offset + thickness, pos.y - offset + thickness};
+    Vec2 innerSize = {size.x + (offset - thickness) * 2.0f, size.y + (offset - thickness) * 2.0f};
+    ctx->renderer.DrawRect(innerPos, innerSize, Color(1.0f, 1.0f, 1.0f, 0.6f), 3.0f);
+}
+
+float DrawWidgetIcon(UIContext *ctx, const Vec2 &rectPos, const Vec2 &rectSize,
+                     uint32_t codepoint, const Color &color,
+                     float iconSize, float leftPadding, float gap) {
+    if (codepoint == 0u) return 0.0f;
+    if (!ctx) return iconSize + gap;
+
+    Vec2 iconPos(rectPos.x + leftPadding,
+                 rectPos.y + (rectSize.y - iconSize) * 0.5f);
+    ctx->renderer.DrawIconGlyph(iconPos, codepoint, color, iconSize);
+    return iconSize + gap;
+}
+
+} // namespace FluentUI

@@ -1,0 +1,16 @@
+{
+  "_comment": "Hoja de sprites del jugador. Para caminado real: pon una hoja con la grilla columns x rows (p.ej. 4 columnas x 4 filas: una fila por dirección) y lista los frames de cada clip. Ahora apunta a 001.png como hoja 1x1 (sin ciclo de frames; el caminado se nota por el saltito).",
+  "texture": "Assets/Models/Sprites/001.png",
+  "columns": 1,
+  "rows": 1,
+  "clips": {
+    "idle_down":  { "frames": [0], "frameTime": 0.20, "loop": true },
+    "idle_up":    { "frames": [0], "frameTime": 0.20, "loop": true },
+    "idle_left":  { "frames": [0], "frameTime": 0.20, "loop": true },
+    "idle_right": { "frames": [0], "frameTime": 0.20, "loop": true },
+    "walk_down":  { "frames": [0], "frameTime": 0.12, "loop": true },
+    "walk_up":    { "frames": [0], "frameTime": 0.12, "loop": true },
+    "walk_left":  { "frames": [0], "frameTime": 0.12, "loop": true },
+    "walk_right": { "frames": [0], "frameTime": 0.12, "loop": true }
+  }
+}

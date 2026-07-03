@@ -1,0 +1,44 @@
+#version 450
+
+// Bloom prefilter: reads the post-process scratch (HDR linear), extracts
+// the bright pixels with a soft knee threshold, and writes the result to
+// bloom mip 0. Half-resolution output (mip 0 already starts at /2).
+//
+// Soft-knee filter (UE/CryEngine): smooth transition around the threshold
+// so subtle highlights also contribute without hard clipping.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_src;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D u_dst;
+
+layout(push_constant) uniform PC {
+    float threshold;     // bright pass cutoff in luminance
+    float knee;          // soft-knee width (e.g. 0.5 of threshold)
+    int   dstWidth;
+    int   dstHeight;
+} pc;
+
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    if (dst.x >= pc.dstWidth || dst.y >= pc.dstHeight) return;
+
+    // Sample 4 source texels per destination texel (2× downsample average).
+    vec2 srcSize = vec2(textureSize(u_src, 0));
+    vec2 uv = (vec2(dst) + 0.5) / vec2(pc.dstWidth, pc.dstHeight);
+
+    vec3 c = texture(u_src, uv).rgb;
+    float l = Luma(c);
+
+    // Soft knee: see Karis 2013 / UE4 BloomCommon.usf.
+    float brightness = max(c.r, max(c.g, c.b));
+    float knee = max(pc.knee, 1e-4);
+    float soft = clamp(brightness - pc.threshold + knee, 0.0, 2.0 * knee);
+    soft = (soft * soft) / (4.0 * knee + 1e-4);
+    float contribution = max(soft, brightness - pc.threshold);
+    contribution /= max(brightness, 1e-4);
+
+    imageStore(u_dst, dst, vec4(c * contribution, 1.0));
+}

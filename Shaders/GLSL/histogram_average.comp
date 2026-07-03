@@ -1,0 +1,52 @@
+#version 460
+
+// Auto-exposure stage 2: reduce the histogram to a weighted average log-
+// luminance, convert back to linear, and ease the stored exposure toward it
+// (temporal eye adaptation). Single 256-thread workgroup.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Histogram { uint histogram[256]; };
+layout(set = 0, binding = 1, std430) buffer Exposure  { float avgLuminance; };
+
+layout(push_constant) uniform PC {
+    float logMin;
+    float logRange;     // logMax - logMin
+    float dt;           // seconds since last frame
+    float tau;          // adaptation time constant (s)
+    uint  pixelCount;
+    float minLum;       // clamp floor
+    float maxLum;       // clamp ceil
+    float _pad;
+} pc;
+
+shared uint histShared[256];
+
+void main() {
+    uint idx   = gl_LocalInvocationIndex;
+    uint count = histogram[idx];
+    // Weight each bin by its index (its luminance position). Bin 0 = black → 0.
+    histShared[idx] = count * idx;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (idx < s) histShared[idx] += histShared[idx + s];
+        barrier();
+    }
+
+    if (idx == 0u) {
+        uint  blackCount = histogram[0];
+        float denom      = max(float(pc.pixelCount) - float(blackCount), 1.0);
+        float avgBin     = float(histShared[0]) / denom;             // [1..255]
+        float logAvg     = (avgBin - 1.0) / 254.0 * pc.logRange + pc.logMin;
+        float avgLum     = clamp(exp2(logAvg), pc.minLum, pc.maxLum);
+
+        float prev  = avgLuminance;
+        if (prev <= 0.0) prev = avgLum;  // first frame: no history
+        float rate  = 1.0 - exp(-pc.dt / max(pc.tau, 1e-3));
+        avgLuminance = prev + (avgLum - prev) * rate;
+    }
+    // The histogram is NOT cleared here: the build pass zeroes it with a
+    // vkCmdFillBuffer + barrier at the start of each frame (same pattern as the
+    // SSR counters), which is what synchronizes the shared buffer across the
+    // frames in flight — an in-shader clear would race the next frame's build.
+}

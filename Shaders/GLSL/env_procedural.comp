@@ -1,0 +1,53 @@
+#version 450
+
+// Writes a procedural environment cubemap stored as a 6-layer 2D array
+// (no VK_IMAGE_VIEW_TYPE_CUBE — we treat faces as array layers everywhere).
+// Replace this shader with an HDR equirect → cube converter when real
+// .hdr / .exr assets enter the pipeline.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2DArray u_env;
+
+// Cubemap face → direction. Layer index follows OpenGL's traditional order
+// (+X, -X, +Y, -Y, +Z, -Z), and so does the corresponding UV layout we use
+// throughout the IBL pipeline.
+vec3 faceUVToDir(uint face, vec2 uv) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    if (face == 0u) return normalize(vec3( 1.0, -ndc.y, -ndc.x));
+    if (face == 1u) return normalize(vec3(-1.0, -ndc.y,  ndc.x));
+    if (face == 2u) return normalize(vec3( ndc.x,  1.0,  ndc.y));
+    if (face == 3u) return normalize(vec3( ndc.x, -1.0, -ndc.y));
+    if (face == 4u) return normalize(vec3( ndc.x, -ndc.y,  1.0));
+                    return normalize(vec3(-ndc.x, -ndc.y, -1.0));
+}
+
+vec3 proceduralSky(vec3 dir) {
+    float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+    // Warm horizon → cool zenith, with a light ground when looking down. The
+    // ground colour matches the real light-grey floor (~0.5) instead of a near-
+    // black tint — otherwise metallic verticals (the carts' cabinet doors)
+    // reflect that dark hemisphere downward and it reads as a shadow/smudge.
+    vec3 zenith   = vec3(0.30, 0.50, 0.85);
+    vec3 horizon  = vec3(0.95, 0.80, 0.65);
+    vec3 ground   = vec3(0.45, 0.47, 0.52);
+    vec3 sky = (dir.y > 0.0)
+        ? mix(horizon, zenith, smoothstep(0.0, 0.6, t))
+        : mix(horizon, ground, smoothstep(0.6, 0.0, t));
+
+    // Sun disk — direction matches main.cpp's sun (after normalization).
+    vec3  sunDir = normalize(vec3(0.4, 1.0, 0.3));
+    float sd     = max(dot(dir, sunDir), 0.0);
+    sky += vec3(3.5, 3.2, 2.6) * pow(sd, 256.0);
+    return sky;
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    ivec3 size  = imageSize(u_env);
+    if (coord.x >= size.x || coord.y >= size.y || coord.z >= size.z) return;
+
+    vec2 uv  = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+    vec3 dir = faceUVToDir(uint(coord.z), uv);
+    imageStore(u_env, coord, vec4(proceduralSky(dir), 1.0));
+}

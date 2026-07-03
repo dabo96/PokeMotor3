@@ -1,0 +1,65 @@
+#version 460
+
+// Exclusive prefix sum over 64 bin counters → bin offsets, plus indirect
+// dispatch args for the packet trace. One workgroup, 64 threads. Classic
+// Blelloch up-sweep / down-sweep scan.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BinCounters {
+    uint binCounters[64];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer BinOffsets {
+    uint binOffsets[64];
+};
+layout(set = 0, binding = 2, std430) readonly buffer RayCount {
+    uint totalRayCount;
+};
+layout(set = 0, binding = 3, std430) writeonly buffer IndirectDispatch {
+    uint numGroupsX;
+    uint numGroupsY;
+    uint numGroupsZ;
+};
+
+shared uint sharedPrefix[64];
+#define N 64u
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    sharedPrefix[tid] = binCounters[tid];
+    barrier();
+
+    // ---- Up-sweep (reduce) ----
+    for (uint stride = 1u; stride < N; stride <<= 1u) {
+        uint idx = (tid + 1u) * (stride << 1u) - 1u;
+        if (idx < N) {
+            sharedPrefix[idx] += sharedPrefix[idx - stride];
+        }
+        barrier();
+    }
+
+    // Clear the root for an exclusive scan.
+    if (tid == 0u) sharedPrefix[N - 1u] = 0u;
+    barrier();
+
+    // ---- Down-sweep ----
+    for (uint stride = N >> 1u; stride >= 1u; stride >>= 1u) {
+        uint idx = (tid + 1u) * (stride << 1u) - 1u;
+        if (idx < N) {
+            uint tmp = sharedPrefix[idx - stride];
+            sharedPrefix[idx - stride] = sharedPrefix[idx];
+            sharedPrefix[idx] += tmp;
+        }
+        barrier();
+    }
+
+    binOffsets[tid] = sharedPrefix[tid];
+
+    if (tid == 0u) {
+        uint total = totalRayCount;
+        // Packet trace uses workgroup size 256.
+        numGroupsX = (total + 255u) / 256u;
+        numGroupsY = 1u;
+        numGroupsZ = 1u;
+    }
+}

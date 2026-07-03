@@ -1,0 +1,172 @@
+#version 460
+
+// SVGF temporal pass — reprojects last frame's denoised SSR using motion
+// vectors, applies geometry-based rejection (normal + depth), then blends
+// current and history with a Karis luma-distance weight. Also accumulates
+// the per-pixel luminance moments used by the spatial pass for variance
+// estimation.
+//
+// Inputs:
+//   binding 0 — current SSR (RGB = color, A = confidence)
+//   binding 1 — last frame's denoised color (history)
+//   binding 2 — last frame's moments (R=moment1, G=moment2, B=historyLen)
+//   binding 3 — gNormal     (xyz + roughness)
+//   binding 4 — gPosition   (xyz + metallic)
+//   binding 5 — gMotion     (xy UV-space motion)
+// Outputs:
+//   binding 6 — current frame color (RGBA16F): RGB color, A confidence
+//   binding 7 — current frame moments (RGBA16F): R=moment1, G=moment2, B=histLen, A=variance
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_currentSSR;
+layout(set = 0, binding = 1) uniform sampler2D u_historyColor;
+layout(set = 0, binding = 2) uniform sampler2D u_historyMoments;
+layout(set = 0, binding = 3) uniform sampler2D u_gNormal;
+layout(set = 0, binding = 4) uniform sampler2D u_gPosition;
+layout(set = 0, binding = 5) uniform sampler2D u_gMotion;
+
+layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D u_outColor;
+layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D u_outMoments;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+    int historyValid;   // 0 = first frame after reset, no history
+    int _pad0;
+} pc;
+
+vec3 RGB2YCoCg(vec3 rgb) {
+    return vec3(
+        0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b,
+         0.5 * rgb.r              -  0.5 * rgb.b,
+        -0.25 * rgb.r + 0.5 * rgb.g - 0.25 * rgb.b
+    );
+}
+
+float Luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= pc.width || pixel.y >= pc.height) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.width, pc.height);
+    vec2 texelSize = 1.0 / vec2(pc.width, pc.height);
+
+    vec4  currentData       = texture(u_currentSSR, uv);
+    vec3  currentColor      = currentData.rgb;
+    float currentConfidence = currentData.a;
+    float currentLum        = Luminance(currentColor);
+
+    vec3  currentNormal = normalize(texture(u_gNormal, uv).rgb);
+    vec3  currentPos    = texture(u_gPosition, uv).rgb;
+    float currentDepth  = length(currentPos);
+
+    // No history → straight through with seed moments (variance 1 → strong
+    // spatial blur on the first frame).
+    if (pc.historyValid == 0) {
+        imageStore(u_outColor,   pixel, vec4(currentColor, currentConfidence));
+        imageStore(u_outMoments, pixel, vec4(currentLum, currentLum * currentLum, 1.0, 1.0));
+        return;
+    }
+
+    vec2 motion    = texture(u_gMotion, uv).rg;
+    vec2 historyUV = uv - motion;
+
+    bool historyOOB = (historyUV.x < 0.0 || historyUV.x > 1.0 ||
+                      historyUV.y < 0.0 || historyUV.y > 1.0);
+    if (historyOOB) {
+        imageStore(u_outColor,   pixel, vec4(currentColor, currentConfidence));
+        imageStore(u_outMoments, pixel, vec4(currentLum, currentLum * currentLum, 1.0, 1.0));
+        return;
+    }
+
+    vec4 historyColorData   = texture(u_historyColor, historyUV);
+    vec3 historyColor       = historyColorData.rgb;
+    float historyConfidence = historyColorData.a;
+
+    vec4  historyMomentsData = texture(u_historyMoments, historyUV);
+    float histMoment1   = historyMomentsData.r;
+    float histMoment2   = historyMomentsData.g;
+    float historyLength = historyMomentsData.b;
+
+    // ---- Geometry rejection ----
+    vec3  historyNormal = texture(u_gNormal,   historyUV).rgb;
+    float normalDot     = dot(normalize(historyNormal), currentNormal);
+    bool  normalReject  = (normalDot < 0.8);
+
+    vec3  historyPos   = texture(u_gPosition, historyUV).rgb;
+    float historyDepth = length(historyPos);
+    float depthDiff    = abs(currentDepth - historyDepth) / max(currentDepth, 0.001);
+    bool  depthReject  = (depthDiff > 0.1);
+
+    if (normalReject || depthReject) {
+        imageStore(u_outColor,   pixel, vec4(currentColor, currentConfidence));
+        imageStore(u_outMoments, pixel, vec4(currentLum, currentLum * currentLum, 1.0, 1.0));
+        return;
+    }
+
+    // ---- Karis luma-weight rejection (Ch 25 PICA PICA p.452) -------------
+    // Soft exp2(-10 * |luma - mean| / sigma) instead of hard YCoCg clamp.
+    vec3 moment1 = vec3(0.0);
+    vec3 moment2 = vec3(0.0);
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 sUV = uv + vec2(x, y) * texelSize;
+            vec3 sc  = RGB2YCoCg(texture(u_currentSSR, sUV).rgb);
+            moment1 += sc;
+            moment2 += sc * sc;
+        }
+    }
+    moment1 /= 9.0;
+    moment2 /= 9.0;
+    vec3 sigma = sqrt(max(moment2 - moment1 * moment1, vec3(0.0)));
+
+    vec3  historyYCoCg = RGB2YCoCg(historyColor);
+    float lumaDist     = abs(historyYCoCg.x - moment1.x) / max(sigma.x, 1e-4);
+    float karisW       = exp2(-10.0 * lumaDist);
+
+    // ---- Adaptive temporal blend ----
+    float motionLength  = length(motion) * float(max(pc.width, pc.height));
+    float maxHistoryLen = 48.0;
+    float newHistoryLen = min(historyLength + 1.0, maxHistoryLen);
+
+    float alpha = max(1.0 / newHistoryLen, 0.03);
+    // SSR history is reprojected with the SURFACE motion vector, but a reflection
+    // doesn't move with its surface — under camera motion the reprojection is
+    // wrong and leaves trails. So as motion grows, lean hard toward the current
+    // frame (alpha→0.85) instead of keeping 50% stale history. Costs a little
+    // temporal noise while moving (the A-Trous spatial pass cleans it up); the
+    // proper fix (parallax-correct reprojection / half-res reconstruct) is the
+    // SSR item in the render backlog.
+    alpha = mix(alpha, 0.85, clamp(motionLength * 0.5, 0.0, 1.0));
+
+    if (currentConfidence < 0.01 && historyConfidence > 0.01) {
+        alpha          = 0.15;
+        newHistoryLen  = max(newHistoryLen - 2.0, 1.0);
+    }
+    if (currentConfidence > 0.1 && historyConfidence < 0.01) {
+        alpha         = 0.7;
+        newHistoryLen = 1.0;
+    }
+
+    alpha = mix(1.0, alpha, karisW);
+    if (karisW < 0.5) {
+        newHistoryLen = max(newHistoryLen * karisW * 2.0, 1.0);
+    }
+
+    vec3  resultColor      = mix(historyColor, currentColor, alpha);
+    float resultConfidence = mix(historyConfidence, currentConfidence, alpha);
+
+    float resultLum = Luminance(resultColor);
+    float newMoment1 = mix(histMoment1, resultLum, alpha);
+    float newMoment2 = mix(histMoment2, resultLum * resultLum, alpha);
+
+    float variance = max(newMoment2 - newMoment1 * newMoment1, 0.0);
+    if (newHistoryLen < 4.0) variance = max(variance, 0.5);
+
+    imageStore(u_outColor,   pixel, vec4(resultColor, resultConfidence));
+    imageStore(u_outMoments, pixel, vec4(newMoment1, newMoment2, newHistoryLen, variance));
+}

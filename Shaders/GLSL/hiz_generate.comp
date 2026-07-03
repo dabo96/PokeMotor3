@@ -1,0 +1,21 @@
+#version 450
+
+// FASE 8 — first compute pipeline. Copies the depth buffer into a R32F storage
+// image. Real Hi-Z mip-chain downsampling lands when SSR (FASE 13) needs it;
+// for now this pass exists to validate that compute dispatches survive the
+// render graph's auto-barrier resolution.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_depth;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D u_hiz;
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size  = imageSize(u_hiz);
+    if (coord.x >= size.x || coord.y >= size.y) return;
+
+    // texelFetch with depth aspect — read mip 0 directly. UVs are integer
+    // pixel coords. Result is the linearized [0,1] depth at that pixel.
+    float d = texelFetch(u_depth, coord, 0).r;
+    imageStore(u_hiz, coord, vec4(d, 0.0, 0.0, 0.0));
+}

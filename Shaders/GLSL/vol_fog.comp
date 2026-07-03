@@ -1,0 +1,154 @@
+#version 450
+
+// Half-resolution screen-space volumetric fog. Per pixel, raymarches from
+// the camera up to the depth-buffer surface, accumulating scattering and
+// transmittance through a simple height-fall-off density medium.
+//
+//   density(p) = densityFloor + densityScale * exp(-heightFactor * p.y)
+//
+// Output: RGBA16F — RGB = in-scattered fog color, A = transmittance (1 = no fog,
+// 0 = fully obscured). Composited by tonemap.frag.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_depth;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D u_dst;
+// CSM shadow array (comparison sampler) — god rays.
+layout(set = 0, binding = 2) uniform sampler2DArrayShadow u_shadow;
+// Previous frame's fog (linear + clamp sampler) — temporal reprojection history.
+layout(set = 0, binding = 3) uniform sampler2D u_history;
+
+// Per-frame camera UBO (reused) — only the cascade data is read here.
+layout(set = 1, binding = 0) uniform CameraUBO {
+    mat4 view;
+    mat4 proj;
+    vec4 cameraPos;
+    vec4 lightDirection;
+    vec4 lightColor;
+    vec4 ambient;
+    mat4 lightSpaceMatrix[3];
+    vec4 cascadeSplits;
+    mat4 prevViewProj;
+    vec4 jitter;
+} u;
+
+layout(push_constant) uniform PC {
+    mat4  invViewProj;
+    vec4  cameraPos;
+    vec4  sunDir;        // light direction (toward light) in xyz, w unused
+    vec4  fogColor;      // .rgb base scatter color, .a = god rays toggle (0/1)
+    int   dstWidth;
+    int   dstHeight;
+    int   steps;
+    float densityFloor;
+    float densityScale;
+    float heightFactor;
+    float scatterStrength;
+    float maxDistance;
+    int   historyValid;   // 0 = no temporal blend this frame
+    float temporalAlpha;  // history weight (e.g. 0.9)
+    float jitter;         // [0,1) sample offset for this frame
+} pc;
+
+vec3 ReconstructWorld(vec2 uv, float depth) {
+    vec4 ndc = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec4 w   = pc.invViewProj * ndc;
+    return w.xyz / w.w;
+}
+
+int pickCascade(float viewDist) {
+    if (viewDist < u.cascadeSplits.x) return 0;
+    if (viewDist < u.cascadeSplits.y) return 1;
+    if (viewDist < u.cascadeSplits.z) return 2;
+    return 3;
+}
+
+// Sun visibility at a world-space sample (1 = lit, 0 = shadowed).
+float sampleSunShadow(vec3 worldPos, float viewDist) {
+    int cascade = pickCascade(viewDist);
+    if (cascade >= 3) return 1.0;  // past the last cascade → treat as lit
+    vec4 lc  = u.lightSpaceMatrix[cascade] * vec4(worldPos, 1.0);
+    vec3 ndc = lc.xyz / lc.w;
+    vec2 uv  = ndc.xy * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    float refZ = clamp(ndc.z - 0.002, 0.0, 1.0);
+    return texture(u_shadow, vec4(uv, float(cascade), refZ));
+}
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    if (dst.x >= pc.dstWidth || dst.y >= pc.dstHeight) return;
+
+    vec2 uv = (vec2(dst) + 0.5) / vec2(pc.dstWidth, pc.dstHeight);
+
+    // Sample depth at this UV. Bilinear is fine since the half-res tile
+    // covers ~4 full-res depth samples; we accept the slight bias near
+    // depth discontinuities for fog (it dissipates the artefact anyway).
+    float depth = texture(u_depth, uv).r;
+    if (depth >= 1.0) depth = 1.0;  // skybox = max fog range
+
+    vec3 worldEnd   = ReconstructWorld(uv, depth);
+    vec3 worldStart = pc.cameraPos.xyz;
+    vec3 dir        = worldEnd - worldStart;
+    float rayLen    = length(dir);
+    rayLen = min(rayLen, pc.maxDistance);
+    if (rayLen < 1e-3) {
+        imageStore(u_dst, dst, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    dir /= rayLen;
+
+    int   steps    = max(pc.steps, 1);
+    float stepLen  = rayLen / float(steps);
+    vec3  scatter  = vec3(0.0);
+    float trans    = 1.0;
+
+    // Single-scattering toward the sun with an anisotropic Henyey-Greenstein
+    // phase (g>0 = forward scattering → bright glow around the sun direction),
+    // instead of the old flat isotropic term.
+    vec3  sun   = normalize(pc.sunDir.xyz);
+    float mu    = dot(dir, sun);
+    const float g = 0.6;
+    float gd    = 1.0 + g * g - 2.0 * g * mu;
+    float phase = (1.0 - g * g) / (4.0 * 3.14159265359 * pow(max(gd, 1e-4), 1.5));
+
+    bool godRays = pc.fogColor.a > 0.5;
+    for (int i = 0; i < steps; ++i) {
+        vec3 p = worldStart + dir * (float(i) + pc.jitter) * stepLen;
+        float h = max(p.y, 0.0);
+        float density = pc.densityFloor + pc.densityScale * exp(-pc.heightFactor * h);
+        density = max(density, 0.0);
+        float stepTrans = exp(-density * stepLen);
+        // God rays: shadowed samples receive no sunlight, so they don't scatter
+        // → bright shafts appear where geometry lets the sun through.
+        float sun = 1.0;
+        if (godRays) {
+            sun = sampleSunShadow(p, length(p - u.cameraPos.xyz));
+        }
+        // The HG phase already carries the directional sun glow; scatterStrength
+        // is just an overall in-scatter intensity knob.
+        vec3 stepScatter = pc.fogColor.rgb * density * stepLen
+                         * pc.scatterStrength * phase * sun;
+        scatter += trans * stepScatter;
+        trans   *= stepTrans;
+    }
+
+    // Temporal reprojection: blend this frame's noisy fog with the previous
+    // frame's accumulated result, reprojected via prevViewProj. worldEnd is the
+    // ray's end point (depth surface or skybox), already reconstructed above.
+    vec4 curOut = vec4(scatter, trans);
+    if (pc.historyValid != 0) {
+        vec4 prevClip = u.prevViewProj * vec4(worldEnd, 1.0);
+        if (prevClip.w > 0.0) {
+            vec2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+            // Same uv<->ndc convention as ReconstructWorld (the proj already
+            // carries Vulkan's Y flip, so no extra flip here).
+            if (all(greaterThanEqual(prevUV, vec2(0.0))) &&
+                all(lessThanEqual(prevUV, vec2(1.0)))) {
+                vec4 hist = texture(u_history, prevUV);
+                curOut = mix(curOut, hist, pc.temporalAlpha);
+            }
+        }
+    }
+    imageStore(u_dst, dst, curOut);
+}

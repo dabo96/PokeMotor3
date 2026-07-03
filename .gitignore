@@ -1,0 +1,31 @@
+# Build folders
+/build/
+/bin/
+/out/
+
+# Visual Studio / CMake
+.vs/
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.obj
+
+# Debug files
+*.pdb
+*.ilk
+
+# User settings
+.vscode/
+.claude/
+
+# Vulkan SPIR-V build artifacts (regenerated from Shaders/GLSL/)
+Shaders/SPV/*.spv
+!Shaders/SPV/.gitkeep
+
+# Vulkan pipeline cache (runtime artifact)
+pipeline_cache.bin

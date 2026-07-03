@@ -1,0 +1,99 @@
+{
+  "Charmander": {
+    "id": 4,
+    "type1": "Fire",
+    "baseStats": { "hp": 39, "attack": 52, "defense": 43, "spAttack": 60, "spDefense": 50, "speed": 65 },
+    "learnset": [
+      { "level": 1, "move": "Scratch" },
+      { "level": 1, "move": "Growl" },
+      { "level": 7, "move": "Ember" },
+      { "level": 13, "move": "Smokescreen" },
+      { "level": 19, "move": "Flamethrower" }
+    ],
+    "evolutionLevel": 16,
+    "evolutionTarget": "Charmeleon",
+    "catchRate": 45,
+    "expYield": 62
+  },
+  "Charmeleon": {
+    "id": 5,
+    "type1": "Fire",
+    "baseStats": { "hp": 58, "attack": 64, "defense": 58, "spAttack": 80, "spDefense": 65, "speed": 80 },
+    "learnset": [
+      { "level": 1, "move": "Scratch" },
+      { "level": 1, "move": "Ember" },
+      { "level": 7, "move": "Ember" },
+      { "level": 17, "move": "Slash" },
+      { "level": 24, "move": "Flamethrower" }
+    ],
+    "evolutionLevel": 36,
+    "evolutionTarget": "Charizard",
+    "catchRate": 45,
+    "expYield": 142
+  },
+  "Bulbasaur": {
+    "id": 1,
+    "type1": "Grass",
+    "type2": "Poison",
+    "baseStats": { "hp": 45, "attack": 49, "defense": 49, "spAttack": 65, "spDefense": 65, "speed": 45 },
+    "learnset": [
+      { "level": 1, "move": "Tackle" },
+      { "level": 1, "move": "Growl" },
+      { "level": 7, "move": "Vine Whip" },
+      { "level": 13, "move": "Poison Powder" },
+      { "level": 20, "move": "Razor Leaf" }
+    ],
+    "evolutionLevel": 16,
+    "evolutionTarget": "Ivysaur",
+    "catchRate": 45,
+    "expYield": 64
+  },
+  "Ivysaur": {
+    "id": 2,
+    "type1": "Grass",
+    "type2": "Poison",
+    "baseStats": { "hp": 60, "attack": 62, "defense": 63, "spAttack": 80, "spDefense": 80, "speed": 60 },
+    "learnset": [
+      { "level": 1, "move": "Tackle" },
+      { "level": 1, "move": "Vine Whip" },
+      { "level": 7, "move": "Vine Whip" },
+      { "level": 20, "move": "Razor Leaf" },
+      { "level": 28, "move": "Solar Beam" }
+    ],
+    "evolutionLevel": 32,
+    "evolutionTarget": "Venusaur",
+    "catchRate": 45,
+    "expYield": 142
+  },
+  "Rattata": {
+    "id": 19,
+    "type1": "Normal",
+    "baseStats": { "hp": 30, "attack": 56, "defense": 35, "spAttack": 25, "spDefense": 35, "speed": 72 },
+    "learnset": [
+      { "level": 1, "move": "Tackle" },
+      { "level": 4, "move": "Quick Attack" },
+      { "level": 10, "move": "Bite" },
+      { "level": 16, "move": "Hyper Fang" }
+    ],
+    "evolutionLevel": 20,
+    "evolutionTarget": "Raticate",
+    "catchRate": 255,
+    "expYield": 51
+  },
+  "Pidgey": {
+    "id": 16,
+    "type1": "Normal",
+    "type2": "Flying",
+    "baseStats": { "hp": 40, "attack": 45, "defense": 40, "spAttack": 35, "spDefense": 35, "speed": 56 },
+    "learnset": [
+      { "level": 1, "move": "Tackle" },
+      { "level": 5, "move": "Gust" },
+      { "level": 12, "move": "Quick Attack" },
+      { "level": 19, "move": "Wing Attack" }
+    ],
+    "evolutionLevel": 18,
+    "evolutionTarget": "Pidgeotto",
+    "catchRate": 255,
+    "expYield": 50
+  }
+}

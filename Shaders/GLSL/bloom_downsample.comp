@@ -1,0 +1,69 @@
+#version 450
+
+// Bloom downsample: 13-tap filter from Sledgehammer's "Next Generation
+// Post-Processing in Call of Duty: Advanced Warfare" (Jorge Jimenez 2014).
+// Reduces aliasing/firefly artefacts vs the naive 2×2 box.
+//
+// Source mip is bound as sampler2D with LINEAR + CLAMP_TO_EDGE — we
+// rely on bilinear filtering inside each 4-sample group.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_src;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D u_dst;
+
+layout(push_constant) uniform PC {
+    int dstWidth;
+    int dstHeight;
+} pc;
+
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    if (dst.x >= pc.dstWidth || dst.y >= pc.dstHeight) return;
+
+    vec2 uv = (vec2(dst) + 0.5) / vec2(pc.dstWidth, pc.dstHeight);
+    vec2 srcTexel = 1.0 / vec2(textureSize(u_src, 0));
+
+    // 13-tap. Center 4 are weighted heavier than the outer 9.
+    //   A B C
+    //   D E   F     (E is the centre)
+    //   G H I
+    vec3 A = texture(u_src, uv + srcTexel * vec2(-2.0, -2.0)).rgb;
+    vec3 B = texture(u_src, uv + srcTexel * vec2( 0.0, -2.0)).rgb;
+    vec3 C = texture(u_src, uv + srcTexel * vec2( 2.0, -2.0)).rgb;
+
+    vec3 D = texture(u_src, uv + srcTexel * vec2(-2.0,  0.0)).rgb;
+    vec3 E = texture(u_src, uv).rgb;
+    vec3 F = texture(u_src, uv + srcTexel * vec2( 2.0,  0.0)).rgb;
+
+    vec3 G = texture(u_src, uv + srcTexel * vec2(-2.0,  2.0)).rgb;
+    vec3 H = texture(u_src, uv + srcTexel * vec2( 0.0,  2.0)).rgb;
+    vec3 I = texture(u_src, uv + srcTexel * vec2( 2.0,  2.0)).rgb;
+
+    // Inner 4 (weighted higher).
+    vec3 J = texture(u_src, uv + srcTexel * vec2(-1.0, -1.0)).rgb;
+    vec3 K = texture(u_src, uv + srcTexel * vec2( 1.0, -1.0)).rgb;
+    vec3 L = texture(u_src, uv + srcTexel * vec2(-1.0,  1.0)).rgb;
+    vec3 M = texture(u_src, uv + srcTexel * vec2( 1.0,  1.0)).rgb;
+
+    // Karis partial average: group the 13 taps into 5 boxes and weight each box
+    // by 1/(1+luma) (normalized), so a single very bright texel (firefly) can't
+    // dominate and sparkle through the bloom chain. Box weights follow the CoD
+    // 13-tap layout (inner 2×2 = 0.5, four 2×2 corners = 0.125 each).
+    vec3 box0 = (J + K + L + M) * 0.25;  // inner
+    vec3 box1 = (A + B + D + E) * 0.25;  // top-left
+    vec3 box2 = (B + C + E + F) * 0.25;  // top-right
+    vec3 box3 = (D + E + G + H) * 0.25;  // bottom-left
+    vec3 box4 = (E + F + H + I) * 0.25;  // bottom-right
+    float w0 = 0.5   / (1.0 + Luma(box0));
+    float w1 = 0.125 / (1.0 + Luma(box1));
+    float w2 = 0.125 / (1.0 + Luma(box2));
+    float w3 = 0.125 / (1.0 + Luma(box3));
+    float w4 = 0.125 / (1.0 + Luma(box4));
+    vec3  c = (box0*w0 + box1*w1 + box2*w2 + box3*w3 + box4*w4)
+            / max(w0 + w1 + w2 + w3 + w4, 1e-4);
+
+    imageStore(u_dst, dst, vec4(c, 1.0));
+}

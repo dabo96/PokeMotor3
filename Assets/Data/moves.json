@@ -1,0 +1,66 @@
+{
+  "Tackle": {
+    "type": "Normal", "category": "Physical", "power": 40, "accuracy": 100, "pp": 35,
+    "description": "A full-body charge attack."
+  },
+  "Scratch": {
+    "type": "Normal", "category": "Physical", "power": 40, "accuracy": 100, "pp": 35,
+    "description": "Scratches the foe with sharp claws."
+  },
+  "Growl": {
+    "type": "Normal", "category": "Status", "power": 0, "accuracy": 100, "pp": 40,
+    "description": "Lowers the foe's Attack stat."
+  },
+  "Ember": {
+    "type": "Fire", "category": "Special", "power": 40, "accuracy": 100, "pp": 25,
+    "description": "A small flame attack."
+  },
+  "Flamethrower": {
+    "type": "Fire", "category": "Special", "power": 90, "accuracy": 100, "pp": 15,
+    "description": "A powerful stream of fire."
+  },
+  "Smokescreen": {
+    "type": "Normal", "category": "Status", "power": 0, "accuracy": 100, "pp": 20,
+    "description": "Lowers the foe's accuracy."
+  },
+  "Slash": {
+    "type": "Normal", "category": "Physical", "power": 70, "accuracy": 100, "pp": 20,
+    "description": "Slashes with claws. High critical-hit ratio."
+  },
+  "Vine Whip": {
+    "type": "Grass", "category": "Physical", "power": 45, "accuracy": 100, "pp": 25,
+    "description": "Strikes the foe with slender vines."
+  },
+  "Razor Leaf": {
+    "type": "Grass", "category": "Physical", "power": 55, "accuracy": 95, "pp": 25,
+    "description": "Razor-edged leaves are launched to slash."
+  },
+  "Solar Beam": {
+    "type": "Grass", "category": "Special", "power": 120, "accuracy": 100, "pp": 10,
+    "description": "Absorbs light, then attacks in the next turn."
+  },
+  "Poison Powder": {
+    "type": "Poison", "category": "Status", "power": 0, "accuracy": 75, "pp": 35,
+    "description": "A cloud of poisonous dust."
+  },
+  "Quick Attack": {
+    "type": "Normal", "category": "Physical", "power": 40, "accuracy": 100, "pp": 30,
+    "description": "An extremely fast attack that always goes first."
+  },
+  "Bite": {
+    "type": "Normal", "category": "Physical", "power": 60, "accuracy": 100, "pp": 25,
+    "description": "Bites the foe with sharp fangs."
+  },
+  "Hyper Fang": {
+    "type": "Normal", "category": "Physical", "power": 80, "accuracy": 90, "pp": 15,
+    "description": "The foe is attacked with sharp fangs."
+  },
+  "Gust": {
+    "type": "Flying", "category": "Special", "power": 40, "accuracy": 100, "pp": 35,
+    "description": "Strikes the foe with a gust of wind."
+  },
+  "Wing Attack": {
+    "type": "Flying", "category": "Physical", "power": 60, "accuracy": 100, "pp": 35,
+    "description": "Strikes the foe with wings."
+  }
+}

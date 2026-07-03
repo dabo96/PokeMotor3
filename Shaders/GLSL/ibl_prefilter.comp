@@ -1,0 +1,124 @@
+#version 450
+
+// Pre-filters the environment cubemap for GGX specular IBL. Dispatched once
+// per mip level — higher mips get higher roughness, so they integrate over
+// wider cones of the source environment.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2DArray u_env;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray u_prefiltered;
+
+layout(push_constant) uniform PC {
+    float roughness;
+    uint  mipSize;  // resolution of this mip's face
+    uint  envSize;  // resolution of the source env cubemap face (mip 0)
+} pc;
+
+const float PI = 3.14159265359;
+
+float distributionGGX(float NdotH, float roughness) {
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float d  = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-7);
+}
+
+vec3 faceUVToDir(uint face, vec2 uv) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    if (face == 0u) return normalize(vec3( 1.0, -ndc.y, -ndc.x));
+    if (face == 1u) return normalize(vec3(-1.0, -ndc.y,  ndc.x));
+    if (face == 2u) return normalize(vec3( ndc.x,  1.0,  ndc.y));
+    if (face == 3u) return normalize(vec3( ndc.x, -1.0, -ndc.y));
+    if (face == 4u) return normalize(vec3( ndc.x, -ndc.y,  1.0));
+                    return normalize(vec3(-ndc.x, -ndc.y, -1.0));
+}
+
+vec3 dirToFaceUV(vec3 dir) {
+    vec3  absD = abs(dir);
+    uint  face;
+    vec2  uv;
+    float ma;
+    if (absD.x >= absD.y && absD.x >= absD.z) {
+        face = (dir.x > 0.0) ? 0u : 1u;
+        uv   = (dir.x > 0.0) ? vec2(-dir.z, -dir.y) : vec2( dir.z, -dir.y);
+        ma   = absD.x;
+    } else if (absD.y >= absD.z) {
+        face = (dir.y > 0.0) ? 2u : 3u;
+        uv   = (dir.y > 0.0) ? vec2( dir.x,  dir.z) : vec2( dir.x, -dir.z);
+        ma   = absD.y;
+    } else {
+        face = (dir.z > 0.0) ? 4u : 5u;
+        uv   = (dir.z > 0.0) ? vec2( dir.x, -dir.y) : vec2(-dir.x, -dir.y);
+        ma   = absD.z;
+    }
+    uv = uv / ma * 0.5 + 0.5;
+    return vec3(uv, float(face));
+}
+
+float radicalInverseVdC(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+vec2 hammersley(uint i, uint N) {
+    return vec2(float(i) / float(N), radicalInverseVdC(i));
+}
+
+vec3 importanceSampleGGX(vec2 Xi, vec3 N, float roughness) {
+    float a = roughness * roughness;
+    float phi = 2.0 * PI * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a * a - 1.0) * Xi.y));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+    vec3 H = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+
+    vec3 up      = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, N));
+    vec3 bit     = cross(N, tangent);
+    return normalize(tangent * H.x + bit * H.y + N * H.z);
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    if (coord.x >= int(pc.mipSize) || coord.y >= int(pc.mipSize) || coord.z >= 6) return;
+
+    vec2 uv = (vec2(coord.xy) + 0.5) / float(pc.mipSize);
+    vec3 N  = faceUVToDir(uint(coord.z), uv);
+    // Karis approximation: assume V = N. Removes view dependency from the
+    // pre-filter so we can sample with R later.
+    vec3 V  = N;
+
+    vec3 result = vec3(0.0);
+    float totalWeight = 0.0;
+    const uint SAMPLE_COUNT = 256u;
+    for (uint i = 0u; i < SAMPLE_COUNT; ++i) {
+        vec2 Xi = hammersley(i, SAMPLE_COUNT);
+        vec3 H  = importanceSampleGGX(Xi, N, pc.roughness);
+        vec3 L  = normalize(2.0 * dot(V, H) * H - V);
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL > 0.0) {
+            // Karis "prefiltered importance sampling": pick an env mip from the
+            // sample's solid angle vs. a texel's solid angle. Samples that the GGX
+            // PDF spreads thin (high roughness) read a coarser, pre-averaged mip,
+            // so a lone ultra-bright texel (the sun) no longer sparkles — it's
+            // already blurred into its neighbourhood at that mip. V == N here, so
+            // dot(N,H) doubles as dot(V,H).
+            float NdotH    = max(dot(N, H), 0.0);
+            float D        = distributionGGX(NdotH, pc.roughness);
+            // pdf = D * NdotH / (4 * HdotV); with V == N, HdotV == NdotH so it
+            // reduces to D / 4.
+            float pdf      = D * 0.25 + 1e-4;
+            float saTexel  = 4.0 * PI / (6.0 * float(pc.envSize) * float(pc.envSize));
+            float saSample = 1.0 / (float(SAMPLE_COUNT) * pdf + 1e-4);
+            float mipLevel = (pc.roughness == 0.0) ? 0.0 : max(0.5 * log2(saSample / saTexel), 0.0);
+            result      += textureLod(u_env, dirToFaceUV(L), mipLevel).rgb * NdotL;
+            totalWeight += NdotL;
+        }
+    }
+    result = (totalWeight > 0.0) ? result / totalWeight : result;
+    imageStore(u_prefiltered, coord, vec4(result, 1.0));
+}

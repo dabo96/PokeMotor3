@@ -1,0 +1,41 @@
+#version 450
+
+// Projects an equirectangular HDRI (sampler2D) into the 6-layer cube array used
+// by the IBL pipeline. Replaces the procedural sky. faceUVToDir matches
+// env_procedural.comp's convention so irradiance/prefilter keep working.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_equirect;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2DArray u_env;
+
+// Cubemap face → direction. Layer index follows OpenGL's traditional order
+// (+X, -X, +Y, -Y, +Z, -Z), copied verbatim from env_procedural.comp.
+vec3 faceUVToDir(uint face, vec2 uv) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    if (face == 0u) return normalize(vec3( 1.0, -ndc.y, -ndc.x));
+    if (face == 1u) return normalize(vec3(-1.0, -ndc.y,  ndc.x));
+    if (face == 2u) return normalize(vec3( ndc.x,  1.0,  ndc.y));
+    if (face == 3u) return normalize(vec3( ndc.x, -1.0, -ndc.y));
+    if (face == 4u) return normalize(vec3( ndc.x, -ndc.y,  1.0));
+                    return normalize(vec3(-ndc.x, -ndc.y, -1.0));
+}
+
+const float PI = 3.14159265359;
+
+vec2 dirToEquirectUV(vec3 d) {
+    // Standard equirect mapping. u from atan around Y (longitude), v from the
+    // polar angle (y up → v=0 at the top of the image, the sky).
+    float u = atan(d.z, d.x) / (2.0 * PI) + 0.5;
+    float v = acos(clamp(d.y, -1.0, 1.0)) / PI;
+    return vec2(u, v);
+}
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    ivec3 size  = imageSize(u_env);
+    if (coord.x >= size.x || coord.y >= size.y || coord.z >= size.z) return;
+    vec2 uv  = (vec2(coord.xy) + 0.5) / vec2(size.xy);
+    vec3 dir = faceUVToDir(uint(coord.z), uv);
+    vec3 col = texture(u_equirect, dirToEquirectUV(dir)).rgb;
+    imageStore(u_env, coord, vec4(col, 1.0));
+}
