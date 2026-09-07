@@ -17,16 +17,11 @@ TileSet& TileSet::instance() {
     return s;
 }
 
-// Los 5 tipos clásicos: respaldo cuando no hay tileset.json (o está corrupto).
-void TileSet::setDefaults() {
-    m_types = {
-        { "Camino",      0, true,  false, { 0.78f, 0.71f, 0.55f, 1.0f } },
-        { "Cesped",      1, true,  false, { 0.40f, 0.66f, 0.32f, 1.0f } },
-        { "Hierba alta", 2, true,  true,  { 0.18f, 0.42f, 0.16f, 1.0f } },
-        { "Agua",        3, false, false, { 0.24f, 0.45f, 0.78f, 1.0f } },
-        { "Arbol",       4, false, false, { 0.10f, 0.26f, 0.12f, 1.0f } },
-    };
-    m_texture = "Assets/Textures/tileset.png";
+// Registro VACÍO: es lo que tiene un proyecto sin tileset.json. Los tipos los da de alta el
+// usuario en el editor de tiles (o vienen con la plantilla). El motor ya no inventa cinco.
+void TileSet::setEmpty() {
+    m_types.clear();
+    m_texture.clear();
     m_cols = 8;
     m_rows = 8;
     m_tileW = 16;
@@ -74,6 +69,22 @@ bool TileSet::removeType(int i) {
     return true;
 }
 
+// Nombres de grupo únicos por orden de aparición (omite los tipos sueltos, group vacío).
+std::vector<std::string> TileSet::groupOrder() const {
+    std::vector<std::string> out;
+    for (const auto& d : m_types) {
+        if (d.group.empty()) continue;
+        if (std::find(out.begin(), out.end(), d.group) == out.end()) out.push_back(d.group);
+    }
+    return out;
+}
+
+void TileSet::setGroupWalkable(const std::string& group, bool walkable) {
+    if (group.empty()) return;
+    for (auto& d : m_types)
+        if (d.group == group) d.walkable = walkable;
+}
+
 bool TileSet::save(const std::string& path) const {
     nlohmann::json j;
     j["texture"] = m_texture;
@@ -91,13 +102,15 @@ bool TileSet::save(const std::string& path) const {
     }
     nlohmann::json types = nlohmann::json::array();
     for (const auto& d : m_types) {
-        types.push_back({
+        nlohmann::json t = {
             { "name",      d.name },
             { "cell",      d.cell },
             { "walkable",  d.walkable },
             { "encounter", d.encounter },
             { "color",     { d.color.x, d.color.y, d.color.z, d.color.w } },
-        });
+        };
+        if (!d.group.empty()) t["group"] = d.group;   // solo si pertenece a un grupo
+        types.push_back(std::move(t));
     }
     j["types"] = types;
 
@@ -116,11 +129,11 @@ void TileSet::ensureLoaded() {
 
 bool TileSet::load(const std::string& path) {
     std::ifstream f(Project::instance().resolveRead(path));
-    if (!f) { setDefaults(); return false; }   // sin archivo → defaults (no es error)
+    if (!f) { setEmpty(); return false; }   // sin archivo → registro vacío (no es error)
     try {
         nlohmann::json j;
         f >> j;
-        m_texture = j.value("texture", std::string("Assets/Textures/tileset.png"));
+        m_texture = j.value("texture", std::string());
 
         // Tamaño de tile en px (cuadrado por defecto; tileWidth/tileHeight lo separan).
         m_tileW = m_tileH = std::max(1, j.value("tileSize", 16));
@@ -141,6 +154,7 @@ bool TileSet::load(const std::string& path) {
                 d.cell      = t.value("cell", 0);
                 d.walkable  = t.value("walkable", true);
                 d.encounter = t.value("encounter", false);
+                d.group     = t.value("group", std::string());   // vacío = tile suelto
                 if (t.contains("color") && t["color"].is_array() && t["color"].size() >= 3) {
                     const auto& col = t["color"];
                     d.color = Vec4(col[0].get<float>(), col[1].get<float>(), col[2].get<float>(),
@@ -149,12 +163,11 @@ bool TileSet::load(const std::string& path) {
                 m_types.push_back(d);
             }
         }
-        if (m_types.empty()) setDefaults();   // JSON sin tipos válidos → defaults
         m_loaded = true;
         LOG_INFO("TileSet: %d tipos cargados de '%s'.", static_cast<int>(m_types.size()), path.c_str());
         return true;
     } catch (...) {
-        setDefaults();
+        setEmpty();
         return false;
     }
 }

@@ -1,8 +1,61 @@
 #include "Theme/FluentTheme.h"
+#include "Theme/Material.h" // brief 34 Parte B/D: ColorTokens + Tokens::Light/Dark
+#include "core/SystemColors.h" // brief 34 Parte F: HighContrast del SO
 
 namespace FluentUI {
 
     namespace {
+        // Brief 34 Parte C/D — compone un token alpha (fg) sobre una base opaca (bg)
+        // y devuelve el color OPACO equivalente. Permite derivar superficies del
+        // sistema de tokens sin volverlas translúcidas (ni multiplicadores a ojo).
+        Color Flatten(const Color& fg, const Color& bg) {
+            const float a = fg.a;
+            return Color(bg.r * (1.0f - a) + fg.r * a,
+                         bg.g * (1.0f - a) + fg.g * a,
+                         bg.b * (1.0f - a) + fg.b * a,
+                         1.0f);
+        }
+
+        // ── OKLab / OKLCH (Björn Ottosson) — base de la paleta de acento (Parte D).
+        // Trabajar la luminosidad en un espacio perceptual evita el clipping y la
+        // degradación de la variación RGB ingenua con acentos claros/oscuros.
+        inline float srgb2lin(float c) {
+            return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        }
+        inline float lin2srgb(float c) {
+            return c <= 0.0031308f ? 12.92f * c : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+        }
+        struct OKLab { float L, a, b; };
+        OKLab RgbToOklab(const Color& c) {
+            const float r = srgb2lin(c.r), g = srgb2lin(c.g), bl = srgb2lin(c.b);
+            const float l = 0.4122214708f*r + 0.5363325363f*g + 0.0514459929f*bl;
+            const float m = 0.2119034982f*r + 0.6806995451f*g + 0.1073969566f*bl;
+            const float s = 0.0883024619f*r + 0.2817188376f*g + 0.6299787005f*bl;
+            const float l_ = std::cbrt(l), m_ = std::cbrt(m), s_ = std::cbrt(s);
+            return { 0.2104542553f*l_ + 0.7936177850f*m_ - 0.0040720468f*s_,
+                     1.9779984951f*l_ - 2.4285922050f*m_ + 0.4505937099f*s_,
+                     0.0259040371f*l_ + 0.7827717662f*m_ - 0.8086757660f*s_ };
+        }
+        Color OklabToRgb(const OKLab& c, float alpha) {
+            const float l_ = c.L + 0.3963377774f*c.a + 0.2158037573f*c.b;
+            const float m_ = c.L - 0.1055613458f*c.a - 0.0638541728f*c.b;
+            const float s_ = c.L - 0.0894841775f*c.a - 1.2914855480f*c.b;
+            const float l = l_*l_*l_, m = m_*m_*m_, s = s_*s_*s_;
+            const float r  =  4.0767416621f*l - 3.3077115913f*m + 0.2309699292f*s;
+            const float g  = -1.2684380046f*l + 2.6097574011f*m - 0.3413193965f*s;
+            const float bl = -0.0041960863f*l - 0.7034186147f*m + 1.7076147010f*s;
+            auto c01 = [](float v){ return std::clamp(v, 0.0f, 1.0f); };
+            return Color(c01(lin2srgb(c01(r))), c01(lin2srgb(c01(g))), c01(lin2srgb(c01(bl))), alpha);
+        }
+        // Desplaza la luminosidad OKLab hacia blanco (t>0) o negro (t<0) por fracción
+        // |t| (tono y cromaticidad estables). Preserva el alpha del color base.
+        Color ShiftLightness(const Color& base, float t) {
+            OKLab o = RgbToOklab(base);
+            const float target = t >= 0.0f ? 1.0f : 0.0f;
+            o.L = o.L + (target - o.L) * std::fabs(t);
+            return OklabToRgb(o, base.a);
+        }
+
         TextStyle MakeTextStyle(float size, FontWeight weight, const Color& color, float lineHeight = 0.0f)
         {
             TextStyle ts;
@@ -13,13 +66,15 @@ namespace FluentUI {
             return ts;
         }
 
-        ButtonStyle MakeButtonStyle(const Color& base, const Color& hover, const Color& pressed, const Color& disabledForeground, const Color& textColor)
+        ButtonStyle MakeButtonStyle(const Color& base, const Color& hover, const Color& pressed, const Color& disabledBg, const Color& disabledForeground, const Color& textColor)
         {
             ButtonStyle style;
             style.background.normal = base;
             style.background.hover = hover;
             style.background.pressed = pressed;
-            style.background.disabled = Color(base.r, base.g, base.b, 0.4f);
+            // Brief 34 Parte C/D: disabled = AccentFillColorDisabled (token WinUI real),
+            // no la derivación base·0.4 alpha.
+            style.background.disabled = disabledBg;
 
             style.foreground.normal = textColor;
             style.foreground.hover = textColor;
@@ -40,47 +95,24 @@ namespace FluentUI {
             return style;
         }
 
-        PanelStyle MakePanelStyle(bool darkTheme)
+        PanelStyle MakePanelStyle(const ColorTokens& t, const AccentRoles& accent)
         {
             PanelStyle panel;
-            if (darkTheme)
-            {
-                // Fondo más claro que el background para mejor contraste (como Windows Settings)
-                panel.background = FluentColors::ContainerBackgroundDark;
-                // Hacer el fondo aún más distintivo
-                panel.background = Color(
-                    panel.background.r * 1.12f,
-                    panel.background.g * 1.12f,
-                    panel.background.b * 1.12f,
-                    1.0f
-                );
-                panel.headerBackground = FluentColors::SurfaceAltDark;
-                panel.borderColor = FluentColors::ContainerBorderDark;  // Para uso futuro si se necesita
-                panel.headerText = MakeTextStyle(16.0f, FontWeight::SemiBold, FluentColors::TextPrimaryDark);
-                panel.titleButton.normal = FluentColors::AccentHover;
-                panel.titleButton.hover = FluentColors::Accent;
-                panel.titleButton.pressed = FluentColors::AccentPressed;
-                panel.titleButton.disabled = Color(FluentColors::AccentHover.r, FluentColors::AccentHover.g, FluentColors::AccentHover.b, 0.4f);
-            }
-            else
-            {
-                // Fondo más oscuro que el background para mejor contraste
-                panel.background = FluentColors::ContainerBackgroundLight;
-                // Hacer el fondo aún más distintivo
-                panel.background = Color(
-                    panel.background.r * 0.94f,
-                    panel.background.g * 0.94f,
-                    panel.background.b * 0.94f,
-                    1.0f
-                );
-                panel.headerBackground = FluentColors::SurfaceAlt;
-                panel.borderColor = FluentColors::ContainerBorderLight;  // Para uso futuro si se necesita
-                panel.headerText = MakeTextStyle(16.0f, FontWeight::SemiBold, FluentColors::TextPrimary);
-                panel.titleButton.normal = FluentColors::Accent;
-                panel.titleButton.hover = FluentColors::AccentHover;
-                panel.titleButton.pressed = FluentColors::AccentPressed;
-                panel.titleButton.disabled = Color(FluentColors::Accent.r, FluentColors::Accent.g, FluentColors::Accent.b, 0.4f);
-            }
+            // Brief 34 Parte B/4: superficie del panel derivada de tokens WinUI, sin
+            // los multiplicadores a ojo. La capa (SolidBackgroundFillColorTertiary)
+            // queda por encima del fondo base de la ventana: en oscuro es más clara
+            // (como Windows Settings), en claro un leve realce — sin calibrar a mano.
+            panel.background = t.solidBackgroundTertiary;
+            // Cabecera: velo sutil sobre el propio panel, aplanado a opaco.
+            panel.headerBackground = Flatten(t.subtleFillSecondary, panel.background);
+            panel.borderColor = t.controlStrokeSecondary; // trazo WinUI (borde 0 abajo)
+            panel.headerText = MakeTextStyle(16.0f, FontWeight::SemiBold, t.textPrimary);
+            // Acento resuelto por tema (Parte D): tono + hover/pressed por opacidad,
+            // disabled desde el token AccentFillColorDisabled.
+            panel.titleButton.normal = accent.rest;
+            panel.titleButton.hover = accent.hover;
+            panel.titleButton.pressed = accent.pressed;
+            panel.titleButton.disabled = t.accentFillDisabled;
 
             panel.borderWidth = 0.0f;  // Sin borde visible - solo contraste de fondo
             panel.cornerRadius = 10.0f;
@@ -96,21 +128,24 @@ namespace FluentUI {
             return panel;
         }
 
-        SeparatorStyle MakeSeparatorStyle(bool darkTheme)
+        SeparatorStyle MakeSeparatorStyle(const ColorTokens& t)
         {
             SeparatorStyle separator;
-            separator.color = darkTheme ? Color(1.0f, 1.0f, 1.0f, 0.15f)
-                                        : Color(0.0f, 0.0f, 0.0f, 0.15f);
+            // Brief 34 Parte 4: divisor = DividerStrokeColorDefault (token WinUI),
+            // en vez del gris/blanco al 15% calibrado a mano.
+            separator.color = t.dividerStroke;
             separator.thickness = 1.0f;
             separator.padding = 12.0f;
             return separator;
         }
 
-        LabelStyle MakeLabelStyle(const TextStyle& baseText)
+        LabelStyle MakeLabelStyle(const TextStyle& baseText, const ColorTokens& t)
         {
             LabelStyle label;
             label.text = baseText;
-            label.disabledColor = Color(baseText.color.r, baseText.color.g, baseText.color.b, baseText.color.a * 0.45f);
+            // Brief 34 Parte C/4: color de texto deshabilitado = TextFillColorDisabled
+            // (token WinUI explícito), no la derivación color*0.45 alpha.
+            label.disabledColor = t.textDisabled;
             return label;
         }
 
@@ -118,13 +153,17 @@ namespace FluentUI {
         {
             Style style;
             style.isDarkTheme = darkTheme;
-            style.backgroundColor = darkTheme ? FluentColors::BackgroundDark : FluentColors::Background;
+
+            // Brief 34 Parte B/4: paleta del tema desde las familias de tokens WinUI.
+            const ColorTokens t = darkTheme ? Tokens::Dark() : Tokens::Light();
+
+            style.backgroundColor = t.solidBackgroundBase;
             style.spacing = 10.0f;
             style.padding = 14.0f;
 
-            const Color textPrimary = darkTheme ? FluentColors::TextPrimaryDark : FluentColors::TextPrimary;
-            const Color textSecondary = darkTheme ? FluentColors::TextSecondaryDark : FluentColors::TextSecondary;
-            const Color textTertiary = darkTheme ? FluentColors::TextTertiaryDark : FluentColors::TextTertiary;
+            const Color textPrimary = t.textPrimary;
+            const Color textSecondary = t.textSecondary;
+            const Color textTertiary = t.textTertiary;
 
             // Tamaños de fuente según Fluent Design System
             style.typography.caption = MakeTextStyle(13.0f, FontWeight::Regular, textSecondary, 18.0f);
@@ -136,22 +175,56 @@ namespace FluentUI {
             style.typography.titleLarge = MakeTextStyle(28.0f, FontWeight::SemiBold, textPrimary, 36.0f);
             style.typography.display = MakeTextStyle(42.0f, FontWeight::Bold, textPrimary, 52.0f);
 
-            // Botón con mejor contraste y sombras más suaves
+            // Brief 34 Parte D: acento por defecto → paleta OKLCH + remapeo por tema.
+            const AccentRoles accent = AccentRolesForTheme(MakeAccentPalette(FluentColors::Accent), darkTheme);
+            style.accentColor = accent.rest; // tono resuelto que usan sliders/checks/etc.
+
+            // Botón de acento: fills desde los roles; texto y disabled desde tokens
+            // *OnAccent* (por tema: negro sobre acento claro / blanco sobre oscuro).
             ButtonStyle buttonStyle = MakeButtonStyle(
-                FluentColors::Accent,
-                FluentColors::AccentHover,
-                FluentColors::AccentPressed,
-                Color(textPrimary.r, textPrimary.g, textPrimary.b, 0.45f),
-                Color(1.0f, 1.0f, 1.0f, 1.0f));
+                accent.rest, accent.hover, accent.pressed,
+                t.accentFillDisabled, t.textOnAccentDisabled, t.textOnAccentPrimary);
             style.button = buttonStyle;
 
-            style.label = MakeLabelStyle(style.typography.body);
-            style.panel = MakePanelStyle(darkTheme);
-            style.separator = MakeSeparatorStyle(darkTheme);
+            style.label = MakeLabelStyle(style.typography.body, t);
+            style.panel = MakePanelStyle(t, accent);
+            style.separator = MakeSeparatorStyle(t);
+
+            // Brief 11: themed drop-shadow tint. Light mode uses a solid black; dark
+            // mode keeps black but at a lower alpha so shadows read as a soft halo
+            // instead of a hard black smudge over already-dark surfaces.
+            style.shadowColor = darkTheme ? Color(0.0f, 0.0f, 0.0f, 0.55f)
+                                          : Color(0.0f, 0.0f, 0.0f, 1.0f);
 
             return style;
         }
     } // namespace
+
+    // Brief 34 Parte D — 7 tonos perceptuales desde el acento base. Los desplazamientos
+    // de luminosidad OKLab (±0.16/0.32/0.50 hacia blanco/negro) dan pasos perceptuales
+    // uniformes que no se degradan con acentos extremos (a diferencia del RGB ±0.08 / ×0.85).
+    AccentPalette MakeAccentPalette(const Color& base) {
+        return AccentPalette{
+            ShiftLightness(base, -0.50f), // dark3
+            ShiftLightness(base, -0.32f), // dark2
+            ShiftLightness(base, -0.16f), // dark1
+            base,                         // base
+            ShiftLightness(base,  0.16f), // light1
+            ShiftLightness(base,  0.32f), // light2
+            ShiftLightness(base,  0.50f), // light3
+        };
+    }
+
+    // Remapeo rol→tono por tema (mapeo WinUI: Default = Light2 en oscuro / Dark1 en
+    // claro). Hover/pressed = ese tono a 0.9/0.8 de opacidad (compone sobre el fondo).
+    AccentRoles AccentRolesForTheme(const AccentPalette& p, bool darkTheme) {
+        const Color rest = darkTheme ? p.light2 : p.dark1;
+        return AccentRoles{
+            rest,
+            Color(rest.r, rest.g, rest.b, 0.9f),
+            Color(rest.r, rest.g, rest.b, 0.8f),
+        };
+    }
 
     Style GetDefaultFluentStyle() {
         return BuildStyle(false);
@@ -163,22 +236,17 @@ namespace FluentUI {
 
     Style CreateCustomFluentStyle(const Color& accentColor, bool darkTheme) {
         Style style = BuildStyle(darkTheme);
+        const ColorTokens t = darkTheme ? Tokens::Dark() : Tokens::Light();
 
-        // Aplicar color de acento personalizado
-        const Color accentHover = FluentColors::GetAccentHover(accentColor);
-        const Color accentPressed = FluentColors::GetAccentPressed(accentColor);
-        // Choose white or black text based on accent luminance
-        float luminance = 0.2126f * accentColor.r + 0.7152f * accentColor.g + 0.0722f * accentColor.b;
-        const Color textColor = luminance > 0.5f
-            ? Color(0.0f, 0.0f, 0.0f, 1.0f)   // Dark text on light accent
-            : Color(1.0f, 1.0f, 1.0f, 1.0f);   // White text on dark accent
-        
+        // Brief 34 Parte D: paleta perceptual desde el acento dado + remapeo por tema.
+        // Robusto en extremos: en oscuro el tono resuelto es claro (Light2) y el texto
+        // OnAccent es oscuro; en claro, al revés — legible en ambos sin heurística de
+        // luminancia. La firma pública se mantiene.
+        const AccentRoles accent = AccentRolesForTheme(MakeAccentPalette(accentColor), darkTheme);
+
         ButtonStyle buttonStyle = MakeButtonStyle(
-            accentColor,
-            accentHover,
-            accentPressed,
-            Color(textColor.r, textColor.g, textColor.b, 0.45f),
-            textColor);
+            accent.rest, accent.hover, accent.pressed,
+            t.accentFillDisabled, t.textOnAccentDisabled, t.textOnAccentPrimary);
         // Botones casi planos (estilo Fluent): apenas un velo de sombra para dar
         // un mínimo de elevación, sin la banda oscura inferior que se veía pesada.
         buttonStyle.shadowOpacity = 0.10f;
@@ -187,78 +255,74 @@ namespace FluentUI {
         buttonStyle.cornerRadius = 6.0f;
         style.button = buttonStyle;
 
-        // Brand accent usado por sliders, checkboxes, progress bars, radios,
-        // plots, date pickers, etc. (ctx->style.accentColor). Sin esto se queda
-        // en el azul por defecto y el acento personalizado no se reflejaría en
-        // todos esos widgets aunque el botón sí cambie (usa button.background).
-        style.accentColor = accentColor;
+        // Brand accent (tono resuelto) usado por sliders, checkboxes, progress bars,
+        // radios, plots, date pickers, etc. (ctx->style.accentColor).
+        style.accentColor = accent.rest;
 
-        // Aplicar acento a otros elementos si es necesario
-        style.panel.titleButton.normal = accentColor;
-        style.panel.titleButton.hover = accentHover;
-        style.panel.titleButton.pressed = accentPressed;
-        
+        // Acento en la barra de título del panel.
+        style.panel.titleButton.normal = accent.rest;
+        style.panel.titleButton.hover = accent.hover;
+        style.panel.titleButton.pressed = accent.pressed;
+        style.panel.titleButton.disabled = t.accentFillDisabled;
+
         return style;
     }
 
-    // Phase 6: High Contrast Accessibility Theme
+    // Brief 34 Parte F — HighContrast leído del SO. En HC WinUI NO inventa colores:
+    // mapea todo a los 8 SystemColor* (GetSysColor). Sin translúcidos, sin acrylic,
+    // sin reveal, sin sombras; bordes de 2px. Fuera de Windows usa el fallback de
+    // SystemColors (negro/blanco/amarillo), de modo que el build/CI no requiere Win32.
     Style GetHighContrastStyle() {
+        const SystemColors sys = SystemColors::Query();
         Style style;
-        style.isDarkTheme = true;
+        // El tema base (claro/oscuro) se deduce del fondo real del SO.
+        style.isDarkTheme = sys.window.Luminance() < 0.5f;
+        style.isHighContrast = true; // desactiva bisel/reveal/acrylic aguas abajo
 
-        // Pure black background, pure white text
-        Color black(0.0f, 0.0f, 0.0f, 1.0f);
-        Color white(1.0f, 1.0f, 1.0f, 1.0f);
-        Color yellow(1.0f, 1.0f, 0.0f, 1.0f);   // Highlight/accent
-        Color cyan(0.0f, 1.0f, 1.0f, 1.0f);      // Links/interactive
-        Color green(0.0f, 1.0f, 0.0f, 1.0f);      // Enabled states
-        Color gray(0.5f, 0.5f, 0.5f, 1.0f);       // Disabled
-
-        style.backgroundColor = black;
+        style.backgroundColor = sys.window;
+        style.accentColor = sys.highlight; // sliders/checks/etc. usan el highlight del SO
         style.spacing = 8.0f;
         style.padding = 12.0f;
+        style.shadowColor = Color(0.0f, 0.0f, 0.0f, 0.0f); // sin sombras en HC
 
-        // Typography — large, high-contrast text
-        auto makeText = [&](float size) -> TextStyle {
-            return {size, 0.0f, FontWeight::Regular, white};
+        auto makeText = [&](float size, FontWeight w = FontWeight::Regular) -> TextStyle {
+            return {size, 0.0f, w, sys.windowText};
         };
-        style.typography.caption = makeText(13.0f);
-        style.typography.body = makeText(15.0f);
-        style.typography.bodyStrong = {15.0f, 0.0f, FontWeight::Bold, white};
-        style.typography.subtitle = makeText(20.0f);
-        style.typography.subtitleStrong = {20.0f, 0.0f, FontWeight::Bold, white};
-        style.typography.title = makeText(24.0f);
-        style.typography.titleLarge = makeText(32.0f);
-        style.typography.display = makeText(48.0f);
+        style.typography.caption        = makeText(13.0f);
+        style.typography.body           = makeText(15.0f);
+        style.typography.bodyStrong     = makeText(15.0f, FontWeight::Bold);
+        style.typography.subtitle       = makeText(20.0f);
+        style.typography.subtitleStrong = makeText(20.0f, FontWeight::Bold);
+        style.typography.title          = makeText(24.0f, FontWeight::Bold);
+        style.typography.titleLarge     = makeText(32.0f, FontWeight::Bold);
+        style.typography.display        = makeText(48.0f, FontWeight::Bold);
 
-        // Button — bright borders, clear states
-        style.button.background = {black, yellow, cyan, Color(0.2f, 0.2f, 0.2f, 1.0f)};
-        style.button.foreground = {white, black, black, gray};
-        style.button.border = {white, yellow, cyan, gray};
+        // Botón: cara/texto del SO; hover/pressed usan el highlight; borde 2px.
+        style.button.background = {sys.btnFace, sys.highlight, sys.highlight, sys.btnFace};
+        style.button.foreground = {sys.btnText, sys.highlightText, sys.highlightText, sys.grayText};
+        style.button.border     = {sys.windowText, sys.highlight, sys.highlight, sys.grayText};
         style.button.padding = Vec2(18.0f, 12.0f);
         style.button.cornerRadius = 4.0f;
         style.button.borderWidth = 2.0f;
         style.button.shadowOpacity = 0.0f;
-        style.button.text = {15.0f, 0.0f, FontWeight::Bold, white};
+        style.button.text = makeText(15.0f, FontWeight::Bold);
 
-        // Label
-        style.label.text = {15.0f, 0.0f, FontWeight::Regular, white};
-        style.label.disabledColor = gray;
+        style.label.text = makeText(15.0f);
+        style.label.disabledColor = sys.grayText;
 
-        // Panel — clear borders
-        style.panel.background = Color(0.05f, 0.05f, 0.05f, 1.0f);
-        style.panel.headerBackground = Color(0.1f, 0.1f, 0.1f, 1.0f);
-        style.panel.borderColor = white;
+        // Panel: bordes claros de 2px, sin acrylic ni sombra.
+        style.panel.background = sys.window;
+        style.panel.headerBackground = sys.btnFace;
+        style.panel.borderColor = sys.windowText;
         style.panel.borderWidth = 2.0f;
         style.panel.cornerRadius = 4.0f;
         style.panel.shadowOpacity = 0.0f;
-        style.panel.headerText = {15.0f, 0.0f, FontWeight::Bold, white};
-        style.panel.titleButton = {cyan, yellow, green, gray};
+        style.panel.headerText = makeText(15.0f, FontWeight::Bold);
+        style.panel.titleButton = {sys.highlight, sys.highlightText, sys.highlightText, sys.grayText};
         style.panel.padding = Vec2(12.0f, 12.0f);
-        style.panel.useAcrylic = false; // No acrylic in high contrast
+        style.panel.useAcrylic = false;
 
-        // Separator
-        style.separator.color = white;
+        style.separator.color = sys.windowText;
         style.separator.thickness = 2.0f;
         style.separator.padding = 8.0f;
 
@@ -288,8 +352,8 @@ namespace FluentUI {
         style.spacing = 10.0f;
         style.padding = 14.0f;
         style.accentColor = accent;
-        // Alpha=0 → slider falls back to accentColor (Fluent 2 brand fill)
-        style.sliderFillColor = Color(0.0f, 0.0f, 0.0f, 0.0f);
+        // sliderFillColor se deja en nullopt → el slider usa accentColor (brand
+        // fill Fluent 2). Brief 34 Parte C: ya no se usa el sentinela alpha=0.
 
         // Typography aligned to Fluent 2 fontSizeBase tokens:
         //   100=10, 200=12 (caption), 300=14 (body), 400=16, 500=20, 600=24

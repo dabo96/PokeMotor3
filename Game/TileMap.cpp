@@ -48,6 +48,21 @@ void TileMap::assign(int w, int h, std::vector<TileType> tiles, IVec2 start) {
     m_start = start;
 }
 
+void TileMap::resize(int w, int h) {
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    std::vector<TileType> nt(static_cast<size_t>(w) * h, kTileDefault);
+    const int cw = std::min(w, m_w), ch = std::min(h, m_h);   // región conservada
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x)
+            nt[static_cast<size_t>(y) * w + x] = m_tiles[static_cast<size_t>(y) * m_w + x];
+    m_tiles = std::move(nt);
+    m_w = w;
+    m_h = h;
+    m_start.x = std::clamp(m_start.x, 0, w - 1);   // reajusta el inicio si quedó fuera
+    m_start.y = std::clamp(m_start.y, 0, h - 1);
+}
+
 TileType TileMap::at(int x, int y) const {
     if (!inBounds(x, y)) return kTileDefault;   // fuera de límites: colisión la cubre walkable()
     return m_tiles[static_cast<size_t>(y) * m_w + x];

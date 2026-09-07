@@ -42,17 +42,19 @@ void LuaVM::installEventPrelude() {
     }
 }
 
-sol::table LuaVM::loadModule(const std::string& path) {
+sol::table LuaVM::loadModule(const std::string& path, std::string* outError) {
     // Entorno NUEVO por script (hereda los globals, pero sus asignaciones globales —
     // on_start/on_update/exports — quedan aquí, sin contaminar el estado global ni a
     // otros scripts). Permite recargar limpio. Error → se loguea y se devuelve el
     // entorno parcial (el ScriptSystem verá on_update inválido y no lo llamará).
     sol::environment env(m_lua, sol::create, m_lua.globals());
+    if (outError) outError->clear();
     sol::protected_function_result res =
         m_lua.safe_script_file(path, env, sol::script_pass_on_error);
     if (!res.valid()) {
         const sol::error err = res;
         LOG_ERROR("Lua: error en '%s': %s", path.c_str(), err.what());
+        if (outError) *outError = err.what();
     }
     return env;
 }

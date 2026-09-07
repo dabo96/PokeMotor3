@@ -33,6 +33,62 @@ float GetCurrentSpacing(UIContext *ctx);
 bool RectanglesOverlap(const Vec2 &pos1, const Vec2 &size1, const Vec2 &pos2, const Vec2 &size2);
 Vec2 ResolveAbsolutePosition(UIContext *ctx, const Vec2 &desiredPos, const Vec2 &widgetSize);
 void AdvanceCursor(UIContext *ctx, const Vec2 &size);
+
+// Flag "next-widget": centra horizontalmente el texto del siguiente TextInput
+// (single-line). Usado por TimePicker para los campos HH/MM/SS. Se consume una
+// sola vez; si no se llama, el TextInput mantiene su alineación a la izquierda.
+void SetNextTextInputCenterX();
+bool ConsumeNextTextInputCenterX();
+
+// brief 35 Part F: opt-in de layout animado (FLIP) para el SIGUIENTE contenedor
+// (ListView, etc.). Al insertar/eliminar/reordenar ítems, cada ítem se desliza desde
+// su posición anterior a la nueva en vez de saltar. Flag one-shot; se consume una vez.
+void SetNextAnimateLayout();
+bool ConsumeNextAnimateLayout();
+
+// brief 32: de la lista (id,bbox) capturada por un scope de interactivos, devuelve
+// solo los bboxes cuyos id son focusables (interactivos) — es decir, los que están
+// en ctx->focusableWidgets[focusStart..]. Labels/iconos (no focusables) se descartan.
+// Reutilizable por Card y (potencialmente) TitleBar; misma regla que brief 30.
+std::vector<Rect> CollectInteractiveRects(
+    UIContext *ctx, size_t focusStart,
+    const std::vector<std::pair<uint32_t, Rect>> &items);
+
+// brief 32: guard RAII para el mecanismo de captura genérico
+// (UIContext::interactiveCapture). Arma la captura al construir (guardando el
+// estado previo, así anida) y la desarma al destruir. Durante su vida, todo widget
+// que llame SetLastItem apila su bbox. `ExcludedRects()` devuelve los rects de los
+// interactivos capturados hasta el momento — llamar tras dibujar el contenido y
+// ANTES de que el guard salga de scope.
+struct ScopedInteractiveCapture {
+  explicit ScopedInteractiveCapture(UIContext *ctx);
+  ~ScopedInteractiveCapture();
+  ScopedInteractiveCapture(const ScopedInteractiveCapture &) = delete;
+  ScopedInteractiveCapture &operator=(const ScopedInteractiveCapture &) = delete;
+  // Rects de los widgets interactivos capturados en este scope.
+  std::vector<Rect> ExcludedRects() const;
+  // ¿El punto cae sobre algún interactivo capturado?
+  bool HitsInteractive(const Vec2 &p) const;
+
+private:
+  UIContext *ctx_;
+  size_t prevFocusStart_;
+  bool prevActive_;
+  std::vector<std::pair<uint32_t, Rect>> prevItems_;
+};
+
+// brief 18.5 (RTL): when the active context is RTL, swap a left/right directional
+// icon codepoint (chevrons, arrows, carets) for its mirror so navigational glyphs
+// point along the reading direction. Returns the codepoint unchanged in LTR or
+// for non-directional icons. Takes/returns a raw Unicode codepoint (Icons::*).
+uint32_t MirrorDirectionalIcon(UIContext *ctx, uint32_t codepoint);
+
+// brief 18.5 (RTL): mirror the x position of a child of known width inside the
+// current horizontal layout (or the window) so callers with an explicit width can
+// place themselves right-aligned in RTL. Returns x unchanged in LTR. `x` is the
+// intended left edge in window coordinates; `width` is the child's width.
+float MirrorXInContainer(UIContext *ctx, float x, float width);
+
 Vec2 MeasureTextCached(UIContext *ctx, const std::string &text, float fontSize);
 Vec2 MeasureTextCached(UIContext *ctx, const std::string &text, float fontSize, const std::string &fontName);
 
@@ -43,6 +99,18 @@ uint32_t GenerateId(const char *str);
 // Issue 14: Overloads that avoid string concatenation
 uint32_t GenerateId(const char *prefix, const char *str);
 uint32_t GenerateId(const char *a, const char *b, const char *c);
+
+// brief 21: ID scope stack (ImGui-style PushID/PopID). Push a new scope seed
+// derived from the current seed + a discriminant; subsequent GenerateId() calls
+// (i.e. all widgets) mix that seed in, so identical labels under different scopes
+// get distinct IDs without "##" suffixes. Containers push/pop automatically; user
+// code calls PushID(index) when iterating items with repeated labels. Must be
+// balanced (every PushID paired with a PopID); a debug assert at end-of-frame
+// catches leaks.
+void PushID(const char *str);
+void PushID(int i);
+void PushID(const void *ptr);
+void PopID();
 
 // Issue 8: Shared UTF-8 decoder (defined in Renderer.cpp)
 std::uint32_t DecodeUTF8(const char*& ptr, const char* end);
@@ -87,8 +155,43 @@ Color InputFieldBackground(UIContext *ctx, bool hover);
 // 1px border colour for input fields. Slightly brighter than the surface on dark
 // themes and slightly darker on light themes, so the field edge is always visible
 // against the panel even when the recessed fill is close to the background.
-// `hover` returns a stronger variant for hover feedback.
+// `hover` se IGNORA (se mantiene por compatibilidad de API): el borde de un campo
+// NO cambia con el puntero. El feedback de hover es el fondo (InputFieldBackground)
+// y el de foco, el borde de acento que interpola cada widget.
 Color InputFieldBorder(UIContext *ctx, bool hover);
+
+// brief 35 Part B: helper compartido de color de estado. Extrae el patrón del
+// piloto de Button (springColor[0..2] = fill/foreground/border) a una función
+// reutilizable, de modo que cualquier widget transicione color en
+// hover/press/focus/disabled sin saltos y con reversión continua (sin "kick").
+//   - Configura los springs la primera vez (response = token de motion) y hace
+//     SetImmediate al target inicial (sin animar la aparición).
+//   - Cada frame hace SetTarget hacia el color del estado actual y notifica al
+//     driver de activeSpringColorIds mientras siga asentándose.
+//   - reduceMotion: SpringValue::SetTarget degrada a snap internamente (via
+//     MotionDuration), así que el modo reducido salta sin CPU en la lista activa.
+// `id` debe ser el id crudo del widget; usa los slots springColor[0..2].
+struct AnimatedColors { Color fill, foreground, border; };
+struct FluentMaterial; // definido en Theme/Material.h
+AnimatedColors AnimateStateColors(UIContext *ctx, uint32_t id,
+                                  const FluentMaterial &target,
+                                  const Color &foregroundTarget,
+                                  float response = MotionTokens::Interactive);
+
+// brief 35 Part B: transición suave de un ÚNICO color de fondo (fill) hacia `target`
+// vía color spring (springColor[0] del id). Para ítems de colecciones (ListView,
+// TreeView, MenuItem) cuyo fondo cambia entre normal/hover/selección — evita el salto
+// al pasar el ratón o seleccionar. `id` debe ser estable por identidad del ítem (p.ej.
+// derivado de su contenido). reduceMotion→snap. Devuelve el color interpolado.
+Color AnimateFill(UIContext *ctx, uint32_t id, const Color &target,
+                  float response = MotionTokens::Interactive);
+
+// brief 35 Wave 2: progreso de foco animado (0=sin foco, 1=enfocado) para campos de
+// entrada. El llamador interpola el color del borde (neutro→acento) y el tinte de fondo
+// por el valor devuelto, así el foco entra/sale suave en vez de conmutar de golpe.
+// springFloat[0] sobre el id del widget; el driver lo retira al estabilizar;
+// reduceMotion colapsa a un snap inmediato (vía MotionConfig).
+float AnimateInputFocus(UIContext *ctx, uint32_t id, bool hasFocus);
 
 // Common utility
 bool PointInRect(const Vec2 &p, const Vec2 &pos, const Vec2 &size);
@@ -140,6 +243,11 @@ inline void DrawFocusRing(UIContext *ctx, const Vec2 &pos, const Vec2 &size,
 // inmediato widget por widget; sin esta comprobación, el widget de debajo
 // procesaría el click destinado al overlay.
 inline bool IsMouseInputBlocked(UIContext *ctx) {
+  // Frame de apertura de un flyout: traga el mismo mouse-down que lo abrió para su
+  // propio contenido, de modo que un control del flyout dibujado bajo el cursor
+  // (p.ej. el botón "Got it" del TeachingTip, que se coloca sobre su ancla) no se
+  // dispare con ese click y lo cierre al instante. Solo dura ese frame.
+  if (ctx->insideFlyout && ctx->flyoutOpenedThisFrame) return true;
   // El propio contenido interactivo de un overlay (items de combo o de menú)
   // nunca se bloquea, esté donde esté (p.ej. un combo dentro de un modal cuyos
   // items se renderizan diferidos tras EndModal).
@@ -164,6 +272,17 @@ inline bool IsMouseInputBlocked(UIContext *ctx) {
                   ctx->openMenuDropdownSize)) {
     return true;
   }
+  // Flyout abierto (brief 14): bloqueo solo bajo el rect del flyout, igual que el
+  // combo. Su propio contenido queda exento vía insideFlyout.
+  if (ctx->activeFlyoutId != 0 && !ctx->insideFlyout) {
+    // brief 22 (fase 6): consulta sin crear entrada — busca en widgetStates.
+    auto it = ctx->widgetStates.find(ctx->activeFlyoutId);
+    if (it != ctx->widgetStates.end() && it->second.flyout &&
+        PointInRect(Vec2(mx, my), it->second.flyout->position,
+                    it->second.flyout->measuredSize)) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -182,8 +301,11 @@ inline bool IsMouseOver(UIContext *ctx, const Vec2 &pos, const Vec2 &size) {
   return over;
 }
 
-// Perf 1.2: Register animation slots for widgets that use color/float animations
-// Call this only from widgets that actually use ctx->colorAnimations[AnimSlot(...)]
-void RegisterAnimSlots(uint32_t widgetId);
+// brief 22 (fase 9): RegisterAnimSlots eliminado — solo marcaba lastSeenFrame para
+// el GC rotatorio, que ya no existe (el GC del mapa unificado widgetStates usa
+// WidgetState.lastFrameSeen, refrescado por GetWidgetState). AnimSlot (arriba) SE
+// CONSERVA: dejó de ser un "slot de animación" y ahora es un simple mezclador de id
+// que InputWidgets/SignatureControls usan para derivar ids uint32 disjuntos por
+// sub-estado dentro de widgetStates.
 
 } // namespace FluentUI

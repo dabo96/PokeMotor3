@@ -42,6 +42,7 @@ private:
 struct AnimationSet {
     SpriteSheet                                    sheet;
     std::unordered_map<std::string, AnimationClip> clips;
+    std::string                                    texturePath;  // ruta de la hoja (vacía si no cargó)
     bool                                           valid = false;
 };
 

@@ -1,6 +1,8 @@
+#include "core/PlatformBackend.h" // brief 26: OS services via GetPlatform(ctx)
 #include "UI/Widgets.h"
 #include "UI/WidgetHelpers.h"
 #include "Theme/FluentTheme.h"
+#include "Theme/Material.h"
 #include "core/Animation.h"
 #include "core/Context.h"
 #include "core/Renderer.h"
@@ -107,6 +109,15 @@ void BeginHorizontal(float spacing, std::optional<Vec2> size,
   stack.itemCount = 0;
   stack.contentStart = stack.origin + stack.padding;
   stack.cursor = stack.contentStart;
+  // brief 18.5: capture the active RTL direction on this horizontal layout so
+  // AdvanceCursor can mirror the X axis. Only meaningful with a finite width.
+  // NOTE: geometric right→left packing of *auto-sized* children needs a measure
+  // pass in immediate mode (the child draws at cursorPos before its width is
+  // known), which would require touching every widget. That is deferred to a
+  // future pass (see AdvanceCursor's RTL branch); the flag + direction plumbing
+  // ship now so directional icons (MirrorDirectionalIcon) and explicit-width
+  // mirroring work today.
+  stack.rtl = ctx->IsRTL() && available.x > 1.0f;
   ctx->layoutStack.push_back(stack);
   ctx->cursorPos = stack.contentStart;
 
@@ -215,8 +226,19 @@ bool Button(const std::string &label, uint32_t iconCodepoint, const Vec2 &size, 
   }
 
   // Generar ID único para este botón
-  // NO incluir posición para que el ID sea estable cuando el widget se mueve
-  uint32_t buttonId = GenerateId("BTN:", label.c_str());
+  // NO incluir posición para que el ID sea estable cuando el widget se mueve.
+  // Botones icon-only (label vacío): derivar el id del codepoint del icono, si
+  // no todos los IconButton comparten el mismo id ("BTN:" + "") → comparten
+  // WidgetState (hover spring/ripple) y el resaltado se activa en TODOS a la vez.
+  // Con label presente el id queda byte-idéntico al anterior (estado preservado).
+  uint32_t buttonId;
+  if (label.empty() && iconCodepoint != 0u) {
+    char cpBuf[16];
+    std::snprintf(cpBuf, sizeof(cpBuf), "%u", iconCodepoint);
+    buttonId = GenerateId("BTN:", cpBuf);
+  } else {
+    buttonId = GenerateId("BTN:", label.c_str());
+  }
 
   // Registrar como widget enfocable
   if (enabled) {
@@ -240,8 +262,8 @@ bool Button(const std::string &label, uint32_t iconCodepoint, const Vec2 &size, 
   // También activar con Enter/Space cuando tiene focus
   bool hasFocus = (ctx->focusedWidgetId == buttonId);
   if (hasFocus && enabled) {
-    if (ctx->input.IsKeyPressed(SDL_SCANCODE_RETURN) ||
-        ctx->input.IsKeyPressed(SDL_SCANCODE_SPACE)) {
+    if (ctx->input.IsKeyPressed(UIKey::Enter) ||
+        ctx->input.IsKeyPressed(UIKey::Space)) {
       clicked = true;
     }
   }
@@ -249,11 +271,11 @@ bool Button(const std::string &label, uint32_t iconCodepoint, const Vec2 &size, 
   // Agregar ripple effect cuando se hace click
   if (clicked && enabled) {
     // Use button center for keyboard-triggered clicks, mouse position otherwise
-    Vec2 clickPos = hasFocus && (ctx->input.IsKeyPressed(SDL_SCANCODE_RETURN) ||
-                                  ctx->input.IsKeyPressed(SDL_SCANCODE_SPACE))
+    Vec2 clickPos = hasFocus && (ctx->input.IsKeyPressed(UIKey::Enter) ||
+                                  ctx->input.IsKeyPressed(UIKey::Space))
                         ? Vec2(btnPos.x + btnSize.x * 0.5f, btnPos.y + btnSize.y * 0.5f)
                         : Vec2(mouseX, mouseY);
-    auto &ripple = ctx->rippleEffects[buttonId];
+    auto &ripple = ctx->GetWidgetState(buttonId).ripple;
     ripple.AddRipple(clickPos, std::max(btnSize.x, btnSize.y) * 1.5f, 0.4f);
   }
 
@@ -268,67 +290,63 @@ bool Button(const std::string &label, uint32_t iconCodepoint, const Vec2 &size, 
     return state.normal;
   };
 
-  // Perf 1.2: Register animation slots for GC tracking (only widgets that use animations)
-  RegisterAnimSlots(buttonId);
+  // Brief 07: source the button surface (fill, border, corner, elevation, reveal)
+  // from a data-driven material instead of ad-hoc maths. ResolveButtonMaterial reads
+  // the EFFECTIVE button style so push/pop style stacks still apply; the result is
+  // identical to the previous inline logic (regression-free parity). Foreground/text
+  // color is not part of the surface material and keeps coming from buttonStyle.
+  WidgetState btnState = !enabled ? WidgetState::Disabled
+                       : pressed  ? WidgetState::Pressed
+                       : hover    ? WidgetState::Hover
+                                  : WidgetState::Rest;
+  FluentMaterial btnMat = ResolveButtonMaterial(buttonStyle, btnState);
+  // Brief 34 Parte E: bisel de elevación Win11 (borde 1px con degradado vertical,
+  // realce arriba / sombra abajo desde tokens).
+  // El bisel se aplana sobre el fondo EN REPOSO (no sobre el del estado actual): así
+  // el contorno es EXACTAMENTE el mismo en rest/hover/pressed y lo único que cambia al
+  // pasar el ratón es el color de fondo. Antes se aplanaba sobre el fill del estado, lo
+  // que aclaraba el borde en hover (efecto de "borde que se enciende").
+  const Color btnBevelBase = enabled ? buttonStyle.background.normal : btnMat.fill;
+  ApplyElevationBorder(btnMat, ctx->style, &btnBevelBase);
 
-  // Obtener o crear animaciones de color
-  auto &bgAnim = ctx->colorAnimations[AnimSlot(buttonId, 0)];
-  auto &fgAnim = ctx->colorAnimations[AnimSlot(buttonId, 1)];
-  auto &borderAnim = ctx->colorAnimations[AnimSlot(buttonId, 2)];
-
-  // Inicializar animaciones si es necesario (primera vez)
-  if (!bgAnim.IsInitialized()) {
-    bgAnim.SetImmediate(getTargetColor(buttonStyle.background));
-  }
-  if (!fgAnim.IsInitialized()) {
-    fgAnim.SetImmediate(getTargetColor(buttonStyle.foreground));
-  }
-  if (!borderAnim.IsInitialized()) {
-    borderAnim.SetImmediate(getTargetColor(buttonStyle.border));
-  }
-
-  // Actualizar objetivos de animación
-  bgAnim.SetTarget(getTargetColor(buttonStyle.background), 0.2f,
-                   Easing::EaseOutCubic);
-  fgAnim.SetTarget(getTargetColor(buttonStyle.foreground), 0.2f,
-                   Easing::EaseOutCubic);
-  borderAnim.SetTarget(getTargetColor(buttonStyle.border), 0.2f,
-                       Easing::EaseOutCubic);
-
-  // Perf 2.2: Notify context of active animations
-  if (bgAnim.IsAnimating()) ctx->NotifyColorAnimActive(AnimSlot(buttonId, 0));
-  if (fgAnim.IsAnimating()) ctx->NotifyColorAnimActive(AnimSlot(buttonId, 1));
-  if (borderAnim.IsAnimating()) ctx->NotifyColorAnimActive(AnimSlot(buttonId, 2));
-
-  // Obtener colores animados
-  Color bgColor = bgAnim.Get();
-  Color fgColor = fgAnim.Get();
-  Color borderColor = borderAnim.Get();
+  // brief 35 Part B: bg/fg/border color transition ahora vía helper compartido
+  // AnimateStateColors (springColor[0..2], response = MotionTokens::Interactive).
+  // Antes era el piloto inline de brief 10 Part C; el comportamiento es idéntico —
+  // spring interrumpible (reversión continua sin "kick"), snap con reduceMotion.
+  AnimatedColors btnCol = AnimateStateColors(
+      ctx, buttonId, btnMat, getTargetColor(buttonStyle.foreground));
+  Color bgColor = btnCol.fill;
+  Color fgColor = btnCol.foreground;
+  Color borderColor = btnCol.border;
 
   // Viewport culling: skip drawing if button is completely off-screen
   if (IsRectInViewport(ctx, btnPos, btnSize)) {
     if (buttonStyle.shadowOpacity > 0.0f) {
-      // Sombra por elevación (z) reactiva al estado: en REPOSO el botón es plano
-      // (z=ButtonRest=0, sin sombra) para que se vea igual en claro y oscuro; la
-      // sombra aparece al pasar el ratón (ButtonHover) y se mantiene, algo más
-      // hundida, al presionar (ButtonPressed); deshabilitado queda plano.
+      // Sombra por elevación (z) reactiva al estado, resuelta por el material
+      // (rest=plano, hover elevado, pressed algo hundido, disabled plano).
       // shadowOpacity del tema actúa de interruptor (los temas "flat" lo ponen a 0).
-      float z = !enabled ? 0.0f
-              : pressed  ? Elevation::Z::ButtonPressed
-              : hover    ? Elevation::Z::ButtonHover
-                         : Elevation::Z::ButtonRest;
-      ctx->renderer.DrawElevationShadow(btnPos, btnSize, buttonStyle.cornerRadius, z);
+      ctx->renderer.DrawElevationShadow(btnPos, btnSize, btnMat.radius, btnMat.elevationZ);
     }
 
     if (hasFocus && enabled) {
-      DrawFocusRing(ctx, btnPos, btnSize, buttonStyle.cornerRadius);
+      DrawFocusRing(ctx, btnPos, btnSize, btnMat.radius);
     }
 
-    ctx->renderer.DrawRectFilled(btnPos, btnSize, bgColor,
-                                 buttonStyle.cornerRadius);
-    if (buttonStyle.borderWidth > 0.0f) {
-      ctx->renderer.DrawRect(btnPos, btnSize, borderColor,
-                             buttonStyle.cornerRadius);
+    // Reveal highlight (brief 04): enabled buttons react to the nearby cursor across
+    // their whole surface. The material carries the intensity; consumed by the next
+    // DrawRect* call.
+    ctx->renderer.SetNextRevealIntensity(btnMat.revealIntensity);
+    ctx->renderer.DrawRectFilled(btnPos, btnSize, bgColor, btnMat.radius);
+    if (btnMat.borderWidth > 0.0f) {
+      ctx->renderer.DrawRect(btnPos, btnSize, borderColor, btnMat.radius, btnMat.borderBottom);
+    }
+
+    // Brief 11: a subtle inset shadow while pressed makes the button read as
+    // physically pushed in. Drawn AFTER the fill so it sits on top, clipped to
+    // the rounded interior.
+    if (pressed && enabled) {
+      ctx->renderer.DrawInsetShadow(btnPos, btnSize, btnMat.radius, 2.5f,
+                                    Color(0.0f, 0.0f, 0.0f, 0.22f));
     }
 
     Vec2 contentPos(btnPos.x + buttonStyle.padding.x,
@@ -350,11 +368,18 @@ bool Button(const std::string &label, uint32_t iconCodepoint, const Vec2 &size, 
             (btnSize.y - buttonStyle.padding.y * 2.0f - textSize.y) * 0.5f - 1.0f); // Pequeño ajuste visual
 
     if (!label.empty()) {
+      // Brief 35-A: the button paints its OWN surface, so the contrast direction
+      // must be measured against that fill, not against the window background. It
+      // matters most for accent-filled buttons in a light theme — white text on a
+      // blue fill is light-on-dark and would otherwise be fattened instead of
+      // thinned.
+      ctx->renderer.PushTextBackdrop(bgColor);
       ctx->renderer.DrawText(textPos, label, fgColor, buttonStyle.text.fontSize);
+      ctx->renderer.PopTextBackdrop();
     }
 
     // Dibujar ripple effects
-    auto &ripple = ctx->rippleEffects[buttonId];
+    auto &ripple = ctx->GetWidgetState(buttonId).ripple;
     for (const auto &r : ripple.GetRipples()) {
       ctx->renderer.DrawRipple(r.center, r.radius, r.opacity);
     }
@@ -460,6 +485,35 @@ static bool SegmentedControlImpl(const std::string &id,
   int currentIndex = activeIndex ? *activeIndex : 0;
   if (currentIndex < 0 || currentIndex >= (int)options.size()) currentIndex = 0;
 
+  // brief 35 Part D: "pill" de acento DESLIZANTE entre segmentos + color de texto
+  // animado por segmento (blanco↔body) SINCRONIZADO, para que el texto siga legible
+  // durante el deslizamiento (a diferencia de rellenar el segmento de golpe). Geometría
+  // objetivo del segmento activo; el pill se dibuja ANTES de los textos, para quedar
+  // bajo ellos. Estado del pill en el WidgetState del contenedor (springFloat[0]=x,
+  // [1]=ancho); token Navigational; primer frame SetImmediate; reduceMotion → snap.
+  float pillTargetX = widgetPos.x;
+  float pillTargetW = segWidths.empty() ? 0.0f : segWidths[0];
+  {
+    float cx = widgetPos.x;
+    for (size_t i = 0; i < options.size(); ++i) {
+      if ((int)i == currentIndex) { pillTargetX = cx; pillTargetW = segWidths[i]; break; }
+      cx += segWidths[i] + gap;
+    }
+  }
+  uint32_t segId = GenerateId("SEG:", id.c_str());
+  {
+    auto &ps = ctx->GetWidgetState(segId);
+    auto &xS = ps.springFloat[0];
+    auto &wS = ps.springFloat[1];
+    if (!xS.IsInitialized()) { xS.Configure(MotionTokens::Navigational, 1.0f); xS.SetImmediate(pillTargetX); }
+    if (!wS.IsInitialized()) { wS.Configure(MotionTokens::Navigational, 1.0f); wS.SetImmediate(pillTargetW); }
+    xS.SetTarget(pillTargetX);
+    wS.SetTarget(pillTargetW);
+    if (xS.IsAnimating() || wS.IsAnimating()) ctx->NotifySpringFloatActive(segId);
+    ctx->renderer.DrawRectFilled(Vec2(xS.Get(), widgetPos.y),
+                                 Vec2(wS.Get(), finalSize.y), accent, radius);
+  }
+
   bool changed = false;
   float cursorX = widgetPos.x;
   for (size_t i = 0; i < options.size(); ++i) {
@@ -473,19 +527,24 @@ static bool SegmentedControlImpl(const std::string &id,
       changed = true;
     }
 
-    Color segBg(0, 0, 0, 0);
-    Color textColor = textStyle.color;
-    if (isActive) {
-      segBg = accent;
-      textColor = Color(1.0f, 1.0f, 1.0f, 1.0f);
-    } else if (hover) {
-      // Overlay tinted by theme so the hover is visible on light backgrounds too.
-      segBg = ctx->style.isDarkTheme ? Color(1.0f, 1.0f, 1.0f, 0.08f)
-                                     : Color(0.0f, 0.0f, 0.0f, 0.06f);
+    // El relleno de acento del segmento activo lo dibuja el pill deslizante; aquí solo
+    // el overlay de hover para segmentos NO activos.
+    if (!isActive && hover) {
+      Color hv = ctx->style.isDarkTheme ? Color(1.0f, 1.0f, 1.0f, 0.08f)
+                                        : Color(0.0f, 0.0f, 0.0f, 0.06f);
+      ctx->renderer.DrawRectFilled(segPos, segSize, hv, radius);
     }
-    if (segBg.a > 0.001f) {
-      ctx->renderer.DrawRectFilled(segPos, segSize, segBg, radius);
-    }
+
+    // Color de texto/icono animado: blanco cuando activo, body si no. Spring propio por
+    // segmento (springColor[0] en su WidgetState) → cruza suave durante el slide, así el
+    // texto del segmento entrante no queda ilegible mientras el pill llega.
+    uint32_t segTxtId = GenerateId("SEGTXT:", (id + ":" + std::to_string(i)).c_str());
+    auto &tcS = ctx->GetWidgetState(segTxtId).springColor[0];
+    Color txtTarget = isActive ? Color(1.0f, 1.0f, 1.0f, 1.0f) : textStyle.color;
+    if (!tcS.IsInitialized()) { tcS.Configure(MotionTokens::Navigational, 1.0f); tcS.SetImmediate(txtTarget); }
+    tcS.SetTarget(txtTarget);
+    if (tcS.IsAnimating()) ctx->NotifySpringColorActive(segTxtId);
+    Color textColor = tcS.Get();
 
     Vec2 ts = MeasureTextCached(ctx, options[i], textStyle.fontSize);
     uint32_t cp = (icons && i < icons->size()) ? (*icons)[i] : 0u;
@@ -509,11 +568,6 @@ static bool SegmentedControlImpl(const std::string &id,
   }
 
   if (activeIndex) *activeIndex = currentIndex;
-
-  // Generate stable id used as a hash key; not currently used but reserved
-  // for future state (focus, animations).
-  uint32_t segId = GenerateId("SEG:", id.c_str());
-  (void)segId;
 
   ctx->lastItemPos = widgetPos;
   AdvanceCursor(ctx, finalSize);
@@ -657,6 +711,89 @@ void Label(const std::string &text, uint32_t iconCodepoint,
   } else {
     ctx->lastItemSize = finalSize;
   }
+}
+
+// brief 17 — HyperlinkButton: accent-colored inline link. Underlined on hover,
+// hand cursor, focusable (Enter/Space activates). Opens the url with the OS via
+// SDL_OpenURL when non-empty. Sits inline beside Label in a horizontal row.
+bool HyperlinkButton(const std::string &text, const std::string &url,
+                     float fontSize) {
+  UIContext *ctx = GetContext();
+  if (!ctx)
+    return false;
+
+  const TextStyle &ts = ctx->style.GetTextStyle(TypographyStyle::Body);
+  float fs = fontSize > 0.0f ? fontSize : ts.fontSize;
+
+  Vec2 measured = MeasureTextCached(ctx, text, fs);
+  if (measured.y <= 0.0f)
+    measured.y = fs;
+  Vec2 contentSize(measured.x, std::max(measured.y, fs));
+
+  bool inHorizontal =
+      !ctx->layoutStack.empty() && !ctx->layoutStack.back().isVertical;
+  if (inHorizontal) {
+    float lineH = ctx->layoutStack.back().availableSpace.y;
+    if (lineH > contentSize.y)
+      contentSize.y = lineH;
+  }
+
+  LayoutConstraints constraints = ConsumeNextConstraints(SizeConstraint::Auto);
+  Vec2 finalSize = ApplyConstraints(ctx, constraints, contentSize);
+  Vec2 pos = ctx->cursorPos;
+
+  uint32_t id = GenerateId("LINK:", text.c_str());
+  ctx->focusableWidgets.push_back(id);
+
+  bool hover = IsMouseOver(ctx, pos, finalSize);
+  bool focused = (ctx->focusedWidgetId == id);
+  bool activated = false;
+
+  if (hover) {
+    ctx->desiredCursor = UIContext::CursorType::Hand;
+    if (ctx->input.IsMousePressed(0)) {
+      ctx->focusedWidgetId = id;
+      focused = true;
+      activated = true;
+    }
+  }
+  if (focused && (ctx->input.IsKeyPressed(UIKey::Enter) ||
+                  ctx->input.IsKeyPressed(UIKey::KeypadEnter) ||
+                  ctx->input.IsKeyPressed(UIKey::Space))) {
+    activated = true;
+  }
+
+  Color col = FluentColors::Accent;
+  if (hover)
+    col = Color(std::min(col.r + 0.12f, 1.0f), std::min(col.g + 0.12f, 1.0f),
+                std::min(col.b + 0.12f, 1.0f), col.a);
+
+  if (IsRectInViewport(ctx, pos, finalSize)) {
+    if (focused)
+      DrawFocusRing(ctx, pos, finalSize, 2.0f);
+    Vec2 textPos(pos.x, pos.y + (finalSize.y - measured.y) * 0.5f);
+    ctx->renderer.DrawText(textPos, text, col, fs);
+    if (hover) {
+      // Bugfix: anclar el subrayado a la baseline real de la fuente. DrawText sitúa
+      // la baseline en textPos.y + ascender*fs (ascender ≈ 1.079 aquí), así que el
+      // viejo fs*0.95 caía en medio del glifo = efecto de tachado. Baseline + holgura.
+      float asc = ctx->renderer.GetFontAscender();
+      if (asc <= 0.0f) asc = 0.8f;
+      float underY = textPos.y + asc * fs + std::max(1.0f, fs * 0.08f);
+      ctx->renderer.DrawLine(Vec2(textPos.x, underY),
+                             Vec2(textPos.x + measured.x, underY), col, 1.0f);
+    }
+  }
+
+  if (activated && !url.empty()) {
+    GetPlatform(ctx)->OpenURL(url.c_str());
+  }
+
+  ctx->lastItemPos = pos;
+  AdvanceCursor(ctx, finalSize);
+  SetLastItem(id, pos, pos + finalSize, hover, hover && ctx->input.IsMouseDown(0),
+              focused, activated);
+  return activated;
 }
 
 void IconLabel(uint32_t iconCodepoint, float size, std::optional<Color> color,
@@ -1029,7 +1166,11 @@ void LabelRich(const std::string &markup, float maxWidth,
               ? Color(0.30f, 0.60f, 1.0f, 1.0f)
               : t.color;
           ctx->renderer.DrawText(Vec2(xCursor, baseline), t.text, linkCol, t.size);
-          float underY = baseline + t.size * 0.95f;
+          // Subrayado bajo la baseline real (t.size*0.95 caía en medio del
+          // glifo = tachado). Mismo patrón que HyperlinkButton.
+          float asc = ctx->renderer.GetFontAscender();
+          if (asc <= 0.0f) asc = 0.8f;
+          float underY = baseline + asc * t.size + std::max(1.0f, t.size * 0.08f);
           ctx->renderer.DrawLine(Vec2(xCursor, underY),
                                  Vec2(xCursor + t.measured.x, underY),
                                  linkCol, 1.0f);
@@ -1151,6 +1292,8 @@ void BeginGrid(const std::string& id, int columns, float rowHeight) {
   grid.totalHeight = 0.0f;
 
   ctx->gridStack.push_back(grid);
+  // brief 21: scope grid cell content by the grid id (paired with gridStack).
+  PushID(id.c_str());
 
   // Position cursor at first cell (row 0, col 0)
   ctx->cursorPos = grid.gridOrigin;
@@ -1198,6 +1341,8 @@ void EndGrid() {
 
   auto grid = ctx->gridStack.back();
   ctx->gridStack.pop_back();
+  // brief 21: pop the scope pushed in BeginGrid.
+  PopID();
 
   // Account for the last row (which wasn't committed by GridNextCell wrapping)
   // Check if any cells were emitted in the current (last) row
@@ -1301,10 +1446,6 @@ void Image(const std::string& id, void* textureHandle, const Vec2& size,
     ctx->renderer.DrawImage(imgPos, imgSize, textureHandle, uv0, uv1);
   }
 
-  // Publica el rect del último item para hit-tests externos (DragDropSource, tooltips).
-  ctx->lastItemPos  = imgPos;
-  ctx->lastItemSize = imgSize;
-
   if (!hasAbsolutePos) {
     AdvanceCursor(ctx, imgSize);
   }
@@ -1354,14 +1495,14 @@ bool ColorPicker(const std::string &label, Color *value,
   uint32_t pickerId = GenerateId("CPICK:", label.c_str());
 
   // Get or create state
-  auto &state = ctx->colorPickerStates[pickerId];
+  auto &state = ctx->GetColorPickerState(pickerId);
   if (!state.initialized) {
     value->ToHSV(state.hue, state.saturation, state.value);
     state.alpha = value->a;
     state.initialized = true;
   }
-
-  ctx->lastSeenFrame[pickerId] = ctx->frame;
+  // brief 22 (fase 9): antes marcaba lastSeenFrame (GC rotatorio, ya retirado).
+  // GetColorPickerState(pickerId) arriba ya refrescó WidgetState.lastFrameSeen.
 
   bool changed = false;
 
@@ -1611,33 +1752,32 @@ bool ColorPicker(const std::string &label, Color *value,
 
     // Keyboard handling when editing hex
     if (state.editingHex) {
-      if (ctx->input.IsKeyPressed(SDL_SCANCODE_RETURN) ||
-          ctx->input.IsKeyPressed(SDL_SCANCODE_KP_ENTER)) {
+      if (ctx->input.IsKeyPressed(UIKey::Enter) ||
+          ctx->input.IsKeyPressed(UIKey::KeypadEnter)) {
         Color parsed = Color::FromHex(state.hexText.c_str());
         parsed.a = state.alpha;
         parsed.ToHSV(state.hue, state.saturation, state.value);
         state.editingHex = false;
         changed = true;
-      } else if (ctx->input.IsKeyPressed(SDL_SCANCODE_ESCAPE)) {
+      } else if (ctx->input.IsKeyPressed(UIKey::Escape)) {
         state.editingHex = false;
-      } else if (ctx->input.IsKeyPressed(SDL_SCANCODE_BACKSPACE)) {
+      } else if (ctx->input.IsKeyPressed(UIKey::Backspace)) {
         if (!state.hexText.empty())
           state.hexText.pop_back();
       } else {
         // Hex character input (0-9, a-f)
-        for (int sc = SDL_SCANCODE_A; sc <= SDL_SCANCODE_F; ++sc) {
-          if (ctx->input.IsKeyPressed(static_cast<SDL_Scancode>(sc)) &&
-              state.hexText.size() < 7) {
-            bool shift = ctx->input.IsKeyDown(SDL_SCANCODE_LSHIFT) ||
-                         ctx->input.IsKeyDown(SDL_SCANCODE_RSHIFT);
-            char ch = shift ? ('A' + (sc - SDL_SCANCODE_A)) : ('a' + (sc - SDL_SCANCODE_A));
+        for (int i = 0; i < 6; ++i) {  // A..F
+          UIKey k = static_cast<UIKey>(static_cast<int>(UIKey::A) + i);
+          if (ctx->input.IsKeyPressed(k) && state.hexText.size() < 7) {
+            bool shift = ctx->input.ShiftDown();
+            char ch = shift ? static_cast<char>('A' + i) : static_cast<char>('a' + i);
             state.hexText += ch;
           }
         }
-        for (int sc = SDL_SCANCODE_0; sc <= SDL_SCANCODE_9; ++sc) {
-          if (ctx->input.IsKeyPressed(static_cast<SDL_Scancode>(sc)) &&
-              state.hexText.size() < 7) {
-            state.hexText += ('0' + (sc - SDL_SCANCODE_0));
+        for (int i = 0; i < 10; ++i) {  // 0..9
+          UIKey k = static_cast<UIKey>(static_cast<int>(UIKey::Num0) + i);
+          if (ctx->input.IsKeyPressed(k) && state.hexText.size() < 7) {
+            state.hexText += static_cast<char>('0' + i);
           }
         }
       }
@@ -1696,7 +1836,7 @@ bool ColorPicker(const std::string &label, Color *value,
           }
           state.eyedropperActive = false;
         }
-        if (ctx->input.IsKeyPressed(SDL_SCANCODE_ESCAPE)) {
+        if (ctx->input.IsKeyPressed(UIKey::Escape)) {
           state.eyedropperActive = false;
         }
       }

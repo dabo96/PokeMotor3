@@ -16,6 +16,7 @@
 #include "Editor/TileEditorUI.h"
 #endif
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <system_error>
@@ -154,6 +155,8 @@ bool Engine::init() {
     // ahí (eligiendo la ruta); enterProject() monta el juego al confirmarse (ver run()).
     m_appState = AppState::Welcome;
     m_editor.setWelcomeMode(true);
+    m_runMode  = RunMode::Edit;          // con editor se abre EDITANDO: nada de mundo corriendo solo
+    m_editor.setRunMode(m_runMode);
 #else
     // Release/juego: el proyecto va empaquetado junto al exe. Abre su .pkproj si existe;
     // si no, usa esa carpeta como raíz tal cual. Luego monta el juego.
@@ -174,62 +177,18 @@ bool Engine::init() {
 // overworld. Llamado tras elegir proyecto (bienvenida) o al arrancar en release.
 void Engine::enterProject() {
     // Auto-carga la escena inicial del proyecto (lo último guardado) ANTES de empujar el
-    // overworld, para que éste se vincule a ella. Sin escena guardada, se siembra el mapa demo.
-    bool loadedScene = false;
+    // overworld, para que éste se vincule a ella. Un proyecto en blanco no trae ninguna: la
+    // escena queda vacía y se puebla desde el menú Entidad (el motor no siembra contenido).
     {
         const std::string& start = Project::instance().startScene();
         if (!start.empty()) {
             const std::string abs = Project::instance().resolveRead(start);
-            if (m_sceneManager.load(abs)) {
-                loadedScene = true;
+            if (m_sceneManager.load(abs))
                 LOG_INFO("Escena inicial del proyecto cargada: %s", abs.c_str());
-            }
         }
     }
 
-    setupGame();    // carga datos y empuja el overworld (crea al jugador-entidad con script)
-
-    // NPCs de prueba TEMPORALES: solo en una escena NUEVA (sin escena guardada). Si se cargó
-    // una escena del proyecto, sus entidades ya vienen del disco (no re-sembrar/duplicar).
-    if (!loadedScene) {
-    // TEMPORAL (verificación UI de juego, Fase 4): un NPC con DialogueComponent en (3,5),
-    // a la izquierda del inicio del jugador (5,5) en el mapa de demo. Para probar: da un
-    // paso a la IZQUIERDA (queda en (4,5) mirando a la izq) y pulsa Enter mirando al NPC.
-    {
-        Scene& sc = m_sceneManager.current();
-        Entity  e = sc.createEntity();
-        sc.add<NameComponent>(e, NameComponent{ "NPC" });
-        Transform tr; tr.position = Vec2(3.0f, 5.0f);
-        sc.add<Transform>(e, tr);
-        SpriteComponent sp;
-        sp.texturePath = "Assets/Models/Sprites/001.png";
-        sp.tex         = m_assets.loadTexture(sp.texturePath);
-        sp.layer       = 1;
-        sc.add<SpriteComponent>(e, sp);
-        sc.add<DialogueComponent>(e, DialogueComponent{
-            "Hola! Bienvenido a PokeMotor. Esta es la caja de dialogo con efecto maquina "
-            "de escribir, capaz de paginar texto largo en varias paginas. Pulsa Enter para "
-            "avanzar y, al final, para cerrar el dialogo." });
-    }
-
-    // TEMPORAL (verificación UI ↔ Scripting): un NPC con SCRIPT de evento en (7,5), a la
-    // derecha del inicio del jugador (5,5). Su on_interact corre como corrutina: presenta
-    // diálogo + elección con ramas (ver npc_healer.lua). Para probar: da un paso a la
-    // DERECHA (queda en (6,5) mirando a la der) y pulsa Enter mirando al NPC.
-    {
-        Scene& sc = m_sceneManager.current();
-        Entity  e = sc.createEntity();
-        sc.add<NameComponent>(e, NameComponent{ "Enfermera" });
-        Transform tr; tr.position = Vec2(7.0f, 5.0f);
-        sc.add<Transform>(e, tr);
-        SpriteComponent sp;
-        sp.texturePath = "Assets/Models/Sprites/001.png";
-        sp.tex         = m_assets.loadTexture(sp.texturePath);
-        sp.layer       = 1;
-        sc.add<SpriteComponent>(e, sp);
-        sc.add<ScriptComponent>(e, ScriptComponent{ "Assets/Scripts/npc_healer.lua" });
-    }
-    }  // if (!loadedScene)
+    setupGame();    // carga los datos del proyecto y empuja el overworld
 
     m_appState = AppState::Running;
 }
@@ -273,11 +232,14 @@ void Engine::run() {
         // Pantalla de BIENVENIDA: aún no hay proyecto ni juego. Solo dibujamos la UI y
         // esperamos a que el usuario cree/abra un proyecto; entonces montamos el juego.
         if (m_appState == AppState::Welcome) {
-            m_editor.beginFrame(frameTime);
+            // El extent del renderer (no el tamaño lógico de la ventana) es el espacio
+            // en el que la UI debe maquetarse: es el mismo attachment que recibirá
+            // EditorUI::render, y el pass del editor usa loadOp=LOAD.
+            m_editor.beginFrame(frameTime, m_renderer.uiExtent());
             render(0.0f);                       // pila de modos vacía → solo limpia + UI bienvenida
-            std::string projPath; bool isNew = false;
-            if (m_editor.consumeProjectChoice(projPath, isNew)) {
-                const bool ok = isNew ? Project::instance().newProject(projPath, "")
+            std::string projPath, projTemplate; bool isNew = false;
+            if (m_editor.consumeProjectChoice(projPath, isNew, projTemplate)) {
+                const bool ok = isNew ? Project::instance().newProject(projPath, "", projTemplate)
                                       : Project::instance().openProject(projPath);
                 if (ok) { enterProject(); m_editor.setWelcomeMode(false); }
             }
@@ -288,24 +250,63 @@ void Engine::run() {
         // Guardar/abrir/nueva escena: ahora en el menú Archivo del editor (con diálogo
         // nativo). El editor ejecuta la acción sobre el SceneManager + ScriptSystem.
 
-        accumulator += frameTime;
-        while (accumulator >= kFixedDt) {
-            fixedUpdate(static_cast<float>(kFixedDt));
-            accumulator -= kFixedDt;
+#ifdef ENGINE_EDITOR
+        // Play/Pausa/Stop: por los botones de la toolbar o por atajo (F5 alterna jugar/parar,
+        // F6 pausa). El atajo se lee del input del JUEGO, que no compite con el teclado del
+        // editor (las teclas de función no escriben en ningún campo de texto).
+        {
+            RunMode req = m_runMode;
+            if (m_editor.consumeRunModeRequest(req)) applyRunMode(req);
+        }
+        if (m_input.wasKeyPressed(Key::F5))
+            applyRunMode(m_runMode == RunMode::Edit ? RunMode::Play : RunMode::Edit);
+        if (m_input.wasKeyPressed(Key::F6))
+            applyRunMode(m_runMode == RunMode::Play ? RunMode::Paused
+                       : m_runMode == RunMode::Paused ? RunMode::Play : m_runMode);
+#endif
+
+        // La SIMULACIÓN solo avanza en Play. En Edit/Pausa el resto del frame sigue igual
+        // (input del editor, variableUpdate para picking/drops, render): lo que se congela
+        // es el paso fijo, no el editor.
+        if (m_runMode == RunMode::Play) {
+            accumulator += frameTime;
+            while (accumulator >= kFixedDt) {
+                fixedUpdate(static_cast<float>(kFixedDt));
+                accumulator -= kFixedDt;
+            }
+        } else {
+            accumulator = 0.0;   // no acumules tiempo mientras está parado (evita un salto al reanudar)
         }
 
         const float alpha = static_cast<float>(accumulator / kFixedDt);
         variableUpdate(frameTime);
+
+        // Selección a recuperar tras un Stop. Va DESPUÉS de variableUpdate porque el modo
+        // del mundo re-vincula ahí la escena restaurada (bindScene) y corre su picking:
+        // asignarla antes la dejaría a merced de ese mismo frame.
+        if (m_pendingSelIndex >= 0) {
+            const std::vector<Entity> all = m_sceneManager.current().allEntities();
+            if (m_pendingSelIndex < static_cast<int>(all.size())) {
+                m_selection.entity = all[m_pendingSelIndex];   // misma entidad, identidad nueva
+                LOG_INFO("Stop: selección recuperada (entidad %u de %zu).",
+                         m_selection.entity.id, all.size());
+            } else {
+                LOG_WARN("Stop: no se pudo recuperar la selección (índice %d de %zu entidades).",
+                         m_pendingSelIndex, all.size());
+            }
+            m_pendingSelIndex = -1;
+        }
+
         m_bus.dispatch();          // entrega los eventos del frame, tras la lógica
 #ifdef ENGINE_EDITOR
-        m_editor.beginFrame(frameTime);   // NewFrame + construye los paneles
+        m_editor.beginFrame(frameTime, m_renderer.uiExtent());   // NewFrame + construye los paneles
 #endif
         render(alpha);             // interpolado entre los dos últimos pasos fijos
 
 #ifdef ENGINE_EDITOR
         // Editor de tiles en ventana OS aparte (T3): abrir bajo demanda, renderizar, cerrar.
         if (m_editor.consumeTileEditorRequest() && !m_tileWindow.isOpen()) {
-            m_tileWindow.open(m_vulkan, "PokeMotor — Editor de tiles", 1280, 1024);
+            m_tileWindow.open(m_editor.uiContext(), "PokeMotor — Editor de tiles", 1280, 1024);
             // La ventana recrea su backend FluentUI en cada apertura: el atlas registrado
             // en el backend anterior quedó colgante. Forzamos re-registro en el nuevo.
             m_tileEditor.resetAtlasCache();
@@ -343,8 +344,35 @@ GameContext Engine::makeGameContext() {
     ctx.stack     = &m_game;
     ctx.scripts   = m_scriptSystem.get();   // API de grid: el overworld registra su colisión
     ctx.selection = &m_selection;
+    ctx.mode      = m_runMode;              // Edit/Play/Pausa: cada modo se auto-gatea
 #ifdef ENGINE_EDITOR
     ctx.uiCapturesMouse = m_editor.wantsInput();   // ratón sobre cualquier panel/barra del editor
+    ctx.gizmo = static_cast<GizmoTool>(m_editor.gizmoTool());   // Mover/Rotar/Escalar del dock
+    // Rect del viewport → coordenadas del RATÓN. La UI se maqueta en píxeles del
+    // framebuffer y el input del juego llega en coordenadas lógicas de ventana: en un
+    // display escalado (150 %, etc.) no son la misma unidad y el hit-test fallaría.
+    {
+        float vx = 0.0f, vy = 0.0f, vw = 0.0f, vh = 0.0f;
+        m_editor.viewportRect(vx, vy, vw, vh);
+        const VkExtent2D ui = m_renderer.uiExtent();
+        const float sx = (ui.width  > 0 && m_window.width()  > 0)
+                       ? static_cast<float>(m_window.width())  / static_cast<float>(ui.width)  : 1.0f;
+        const float sy = (ui.height > 0 && m_window.height() > 0)
+                       ? static_cast<float>(m_window.height()) / static_cast<float>(ui.height) : 1.0f;
+        ctx.viewportX = vx * sx;  ctx.viewportW = vw * sx;
+        ctx.viewportY = vy * sy;  ctx.viewportH = vh * sy;
+
+        // Paneles flotantes del HUD: con el layout overlay el viewport es la ventana entera,
+        // así que lo que decide si un clic era para la escena es restarles su rect (misma
+        // conversión de píxeles de UI a coordenadas del ratón que el viewport).
+        const int n = std::min(m_editor.uiRectCount(), GameContext::kMaxUiRects);
+        for (int i = 0; i < n; ++i) {
+            float rx = 0.0f, ry = 0.0f, rw = 0.0f, rh = 0.0f;
+            m_editor.uiRectAt(i, rx, ry, rw, rh);
+            ctx.uiRects[i] = { rx * sx, ry * sy, rw * sx, rh * sy };
+        }
+        ctx.uiRectCount = n;
+    }
 #endif
     ctx.screenW  = m_window.width();
     ctx.screenH  = m_window.height();
@@ -356,12 +384,78 @@ void Engine::fixedUpdate(float dt) {
     m_game.fixedUpdate(ctx, dt);
 }
 
+// Transición de estado pedida por el editor (botones o atajos). De momento solo cambia el
+// gate del bucle y avisa por consola; la FASE A2 colgará aquí el snapshot de la escena al
+// entrar en Play y su restauración al parar, para que jugar no altere lo que estás editando.
+void Engine::applyRunMode(RunMode m) {
+    if (m == m_runMode) return;
+    const RunMode prev = m_runMode;
+    m_runMode = m;
+    switch (m) {
+        case RunMode::Play:   LOG_INFO("Play: la simulación corre (scripts, pasos, encuentros)."); break;
+        case RunMode::Paused: LOG_INFO("Pausa: la simulación está congelada."); break;
+        case RunMode::Edit:   LOG_INFO("Stop: vuelta a edición."); break;
+    }
+    // Empezar a jugar: foto de la escena tal y como la estás editando. Se guarda también
+    // qué entidad tenías seleccionada (por ÍNDICE: los Entity de la escena restaurada son
+    // otros) y si había cambios sin guardar, para dejarlo todo igual al parar.
+    if (prev == RunMode::Edit && m != RunMode::Edit) {
+        m_playSnapshot = m_sceneManager.toJson();
+        m_playSelIndex = -1;
+        const std::vector<Entity> all = m_sceneManager.current().allEntities();
+        if (m_selection.has())
+            for (size_t i = 0; i < all.size(); ++i)
+                if (all[i] == m_selection.entity) { m_playSelIndex = static_cast<int>(i); break; }
+#ifdef ENGINE_EDITOR
+        m_playDirty = m_editor.sceneDirty();
+#endif
+        LOG_INFO("Play: foto de la escena (%zu entidades; selección = índice %d).",
+                 all.size(), m_playSelIndex);
+    }
+
+    if (m == RunMode::Edit) {
+        // Parar con un combate/menú/diálogo abierto dejaría ese overlay pegado en pantalla
+        // y sin forma de cerrarlo (en edición el juego no recibe input): se cierran hasta
+        // dejar el modo base (el overworld). Antes de tocar la escena, que su onExit aún
+        // trabaja sobre la que hay.
+        GameContext ctx = makeGameContext();
+        while (m_game.size() > 1) m_game.pop(ctx);
+        // Se olvidan las instancias de script (con sus corrutinas de evento): el siguiente
+        // Play vuelve a correr on_start desde cero, como una partida nueva.
+        if (m_scriptSystem) m_scriptSystem->clear();
+
+        // Y la escena vuelve a la foto: se deshace TODO lo que la partida movió (posición
+        // del jugador, cámara, lo que crearan los scripts). El modo del mundo detecta que
+        // el puntero de escena cambió y re-vincula sus entidades por su cuenta.
+        if (!m_playSnapshot.is_null()) {
+            m_sceneManager.fromJson(m_playSnapshot);
+            m_playSnapshot = nlohmann::json{};
+            // La selección NO se aplica aquí: este frame todavía tiene que pasar por el
+            // modo del mundo (re-vincula la escena y hace su picking), así que se difiere
+            // al final del frame — ver m_pendingSelIndex en run().
+            m_selection.clear();
+            m_pendingSelIndex = m_playSelIndex;
+            m_playSelIndex    = -1;
+            LOG_INFO("Stop: escena restaurada (%zu entidades); selección pendiente = índice %d.",
+                     m_sceneManager.current().allEntities().size(), m_pendingSelIndex);
+#ifdef ENGINE_EDITOR
+            m_editor.setSceneDirty(m_playDirty);   // jugar no ensucia el proyecto
+#endif
+        }
+    }
+#ifdef ENGINE_EDITOR
+    m_editor.setRunMode(m_runMode);   // el editor dibuja el estado REAL, no el pedido
+#endif
+}
+
 void Engine::variableUpdate(float dt) {
     // Cada modo configura el renderer (cámara, sprite, draw items, luces): así el
     // overworld dibuja el tilemap y el combate una pantalla distinta, sin que el
     // Engine sepa en qué modo está.
     GameContext ctx = makeGameContext();
-    m_game.handleInput(ctx);
+    // El input del JUEGO (menú, interactuar, guardar partida) solo en Play: en edición las
+    // teclas son del editor y nada del mundo debe reaccionar a ellas.
+    if (m_runMode == RunMode::Play) m_game.handleInput(ctx);
     // El ScriptSystem (on_update de gameplay) lo corre el modo del mundo (OverworldMode)
     // dentro de su variableUpdate, no aquí: así un overlay que congela el mundo (menú,
     // diálogo) pausa también esos scripts (el jugador deja de moverse). Ver
@@ -373,7 +467,7 @@ void Engine::variableUpdate(float dt) {
     // su modo (overworld) esté congelado bajo el DialogueMode que él mismo empujó: al
     // cerrarse el diálogo, el done() pone waiting=false y este pump reanuda el script. El
     // push de nuevos DialogueModes ocurre aquí, ya fuera de GameStack::variableUpdate.
-    if (m_scriptSystem) m_scriptSystem->pumpEvents(dt);
+    if (m_scriptSystem && m_runMode == RunMode::Play) m_scriptSystem->pumpEvents(dt);
 }
 
 void Engine::render(float /*alpha*/) {

@@ -22,6 +22,10 @@ public:
     DX11Backend() = default;
     ~DX11Backend() override = default;
 
+    // --- Capabilities (brief 24) ---
+    // Skeleton backend: implements none of the optional features yet.
+    uint32_t Capabilities() const override { return 0; }
+
     bool Init(void* windowHandle, void* existingContext = nullptr) override;
     void Shutdown() override;
     void BeginFrame(const Color& clearColor) override;
@@ -38,7 +42,7 @@ public:
     void DrawBatch(ShaderType type, const RenderVertex* vertices, size_t vertexCount,
                    const unsigned int* indices, size_t indexCount,
                    void* textureHandle, const float* projectionMatrix,
-                   const Color& textColor = {1, 1, 1, 1}) override;
+                   const Color& textColor = {1, 1, 1, 1}, float msdfPxRange = 0.0f) override;
     void DrawLines(const RenderVertex* vertices, size_t vertexCount,
                    float width, const float* projectionMatrix) override;
 };

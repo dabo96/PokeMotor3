@@ -29,6 +29,12 @@ public:
     // editor). 'tiles' debe medir w*h; si no, se rellena con el tipo por defecto.
     void     assign(int w, int h, std::vector<TileType> tiles, IVec2 start);
 
+    // Cambia el tamaño de la grilla CONSERVANDO lo pintado en la región común (anclada en la
+    // esquina 0,0). Las celdas nuevas usan el tipo por defecto; el inicio del jugador se
+    // reajusta si queda fuera. OJO: cambia width() → quien indexe por y*width+x (los
+    // overrides del TileMapComponent) debe remapearse (lo hace el editor al guardar).
+    void     resize(int w, int h);
+
     bool saveJson(const std::string& path) const;                     // T1: persistencia del mapa
     bool loadJson(const std::string& path);                           // devuelve false si no existe/corrupto
     // Fuera de límites = muro infranqueable (el borde del mapa siempre bloquea).

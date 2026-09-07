@@ -17,6 +17,7 @@ public:
     void clear(GameContext& ctx);
 
     bool      empty() const { return m_modes.empty(); }
+    size_t    size()  const { return m_modes.size(); }   // Stop cierra los overlays hasta el modo base
     GameMode* top()         { return m_modes.empty() ? nullptr : m_modes.back().get(); }
 
     // handleInput va solo a la cima; update/render descienden respetando los flags de

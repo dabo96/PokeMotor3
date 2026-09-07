@@ -23,6 +23,8 @@ namespace {
 std::mutex            g_logMutex;
 std::deque<LogEntry>  g_logEntries;       // las últimas líneas (para la UI)
 constexpr std::size_t kMaxLog = 500;
+unsigned              g_warnCount = 0;    // acumulados (no se pierden al rotar el ring)
+unsigned              g_errorCount = 0;
 }  // namespace
 
 void logMessage(LogLevel lvl, const char* fmt, ...) {
@@ -39,8 +41,15 @@ void logMessage(LogLevel lvl, const char* fmt, ...) {
 
     // Retiene en el buffer (ring de kMaxLog) para la consola del editor.
     std::lock_guard<std::mutex> lk(g_logMutex);
+    if (lvl == LogLevel::Warn)  ++g_warnCount;
+    if (lvl == LogLevel::Error) ++g_errorCount;
     g_logEntries.push_back({ lvl, buf });
     while (g_logEntries.size() > kMaxLog) g_logEntries.pop_front();
+}
+
+LogCounts logCounts() {
+    std::lock_guard<std::mutex> lk(g_logMutex);
+    return LogCounts{ g_warnCount, g_errorCount };
 }
 
 void logSnapshot(std::vector<LogEntry>& out) {

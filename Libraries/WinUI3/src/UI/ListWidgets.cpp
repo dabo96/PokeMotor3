@@ -2,12 +2,14 @@
 #include "UI/WidgetHelpers.h"
 #include "UI/Icons.h"
 #include "Theme/FluentTheme.h"
+#include "Theme/Material.h" // brief 34: ColorTokens (SubtleFill para hover/selección)
 #include "core/Animation.h"
 #include "core/Context.h"
 #include "core/Renderer.h"
 #include "core/WidgetNodes.h"
-#include <SDL3/SDL.h>
+#include "core/UIKey.h"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -48,6 +50,9 @@ static bool BeginListViewSingleImpl(const std::string &id, const Vec2 &size,
 
   uint32_t listViewId = GenerateId("LISTVIEW:", id.c_str());
 
+  // brief 35 Part F: ¿este ListView anima su layout (FLIP)? Flag one-shot opt-in.
+  bool animateLayout = ConsumeNextAnimateLayout();
+
   // Register in widget tree (Phase 1)
   ctx->widgetTree.FindOrCreate(listViewId, ctx->frame, [&]() {
       auto node = std::make_unique<ListViewNode>(listViewId);
@@ -55,7 +60,7 @@ static bool BeginListViewSingleImpl(const std::string &id, const Vec2 &size,
       return node;
   });
 
-  auto &state = ctx->listViewStates[listViewId];
+  auto &state = ctx->GetListState(listViewId);
 
   if (!state.initialized) {
     state.selectedItem = selectedItem ? *selectedItem : -1;
@@ -139,6 +144,20 @@ static bool BeginListViewSingleImpl(const std::string &id, const Vec2 &size,
     Vec2 itemPos(listViewPos.x, listViewPos.y + i * state.itemSize.y - state.scrollOffset);
     Vec2 itemSize(contentWidth, state.itemSize.y);
 
+    // brief 35 Part F: FLIP opt-in. El offset se calcula en ESPACIO DE CONTENIDO
+    // (i*altura, sin scroll ni pos de la lista) para que el SCROLL no dispare la
+    // animación — solo el cambio de índice (insertar/eliminar/reordenar) desliza el
+    // ítem desde su posición anterior. Id estable por CONTENIDO del ítem, así sigue a
+    // su fila al reordenar. (Culling: un ítem que reordena estando fuera de vista puede
+    // deslizar al reaparecer; ítems con label duplicado comparten id — casos límite.)
+    if (animateLayout) {
+      uint32_t flipId = GenerateId("LVFLIP:", (id + ":" + items[i]).c_str());
+      Vec2 flipOff = LayoutFlipOffset(ctx, flipId,
+                                      Vec2(0.0f, i * state.itemSize.y),
+                                      MotionTokens::Navigational, 1.0f);
+      itemPos.y += flipOff.y;
+    }
+
     bool hover = IsMouseOver(ctx, itemPos, itemSize);
     bool isSelected = (i == state.selectedItem);
 
@@ -149,6 +168,10 @@ static bool BeginListViewSingleImpl(const std::string &id, const Vec2 &size,
     } else if (hover) {
       itemBg = panelStyle.headerBackground;
     }
+    // brief 35 Part B: transición suave del fondo del ítem (hover/selección) por color
+    // spring, con id estable por contenido → sin salto al pasar el ratón o seleccionar.
+    itemBg = AnimateFill(
+        ctx, GenerateId("LVITEMC:", (id + ":" + items[i]).c_str()), itemBg);
     ctx->renderer.DrawRectFilled(itemPos, itemSize, itemBg, 0.0f);
 
     // Dibujar indicador de selección
@@ -170,8 +193,12 @@ static bool BeginListViewSingleImpl(const std::string &id, const Vec2 &size,
     }
     Vec2 textPos(itemPos.x + panelStyle.padding.x + listIconSlot,
                  itemPos.y + (state.itemSize.y - textStyle.fontSize) * 0.5f);
+    // Brief 35-A: the row paints its own surface (selection/hover fill), so the
+    // contrast direction is measured against THAT, not the window background.
+    ctx->renderer.PushTextBackdrop(itemBg);
     ctx->renderer.DrawText(textPos, items[i], textStyle.color,
                            textStyle.fontSize);
+    ctx->renderer.PopTextBackdrop();
 
     // Manejar click en el item
     if (hover && leftPressed) {
@@ -244,6 +271,9 @@ static bool BeginListViewMultiImpl(const std::string &id, const Vec2 &size,
 
   uint32_t listViewId = GenerateId("LISTVIEW_MS:", id.c_str());
 
+  // brief 35 Part F: ¿este ListView anima su layout (FLIP)? Flag one-shot opt-in.
+  bool animateLayout = ConsumeNextAnimateLayout();
+
   // Register in widget tree (Phase 1)
   ctx->widgetTree.FindOrCreate(listViewId, ctx->frame, [&]() {
       auto node = std::make_unique<ListViewNode>(listViewId);
@@ -251,7 +281,7 @@ static bool BeginListViewMultiImpl(const std::string &id, const Vec2 &size,
       return node;
   });
 
-  auto &state = ctx->listViewStates[listViewId];
+  auto &state = ctx->GetListState(listViewId);
 
   if (!state.initialized) {
     state.selectedItem = -1;
@@ -328,9 +358,8 @@ static bool BeginListViewMultiImpl(const std::string &id, const Vec2 &size,
   bool leftPressed = ctx->input.IsMousePressed(0);
 
   // Get keyboard modifiers for multi-select
-  SDL_Keymod modState = SDL_GetModState();
-  bool ctrlHeld = (modState & SDL_KMOD_CTRL) != 0;
-  bool shiftHeld = (modState & SDL_KMOD_SHIFT) != 0;
+  bool ctrlHeld = ctx->input.CtrlDown();
+  bool shiftHeld = ctx->input.ShiftDown();
 
   // Aplicar clipping
   Vec2 clipSize(contentWidth, visibleHeight);
@@ -352,6 +381,16 @@ static bool BeginListViewMultiImpl(const std::string &id, const Vec2 &size,
     Vec2 itemPos(listViewPos.x, listViewPos.y + i * state.itemSize.y - state.scrollOffset);
     Vec2 itemSize(contentWidth, state.itemSize.y);
 
+    // brief 35 Part F: FLIP opt-in (mismo criterio que single-select: offset en espacio
+    // de contenido para que el scroll no lo dispare; id estable por contenido).
+    if (animateLayout) {
+      uint32_t flipId = GenerateId("LVFLIP:", (id + ":" + items[i]).c_str());
+      Vec2 flipOff = LayoutFlipOffset(ctx, flipId,
+                                      Vec2(0.0f, i * state.itemSize.y),
+                                      MotionTokens::Navigational, 1.0f);
+      itemPos.y += flipOff.y;
+    }
+
     bool hover = IsMouseOver(ctx, itemPos, itemSize);
     bool isSelected = isItemSelected(i);
 
@@ -362,6 +401,10 @@ static bool BeginListViewMultiImpl(const std::string &id, const Vec2 &size,
     } else if (hover) {
       itemBg = panelStyle.headerBackground;
     }
+    // brief 35 Part B: transición suave del fondo del ítem (hover/selección) por color
+    // spring, con id estable por contenido → sin salto al pasar el ratón o seleccionar.
+    itemBg = AnimateFill(
+        ctx, GenerateId("LVITEMC:", (id + ":" + items[i]).c_str()), itemBg);
     ctx->renderer.DrawRectFilled(itemPos, itemSize, itemBg, 0.0f);
 
     // Dibujar indicador de selección
@@ -383,8 +426,12 @@ static bool BeginListViewMultiImpl(const std::string &id, const Vec2 &size,
     }
     Vec2 textPos(itemPos.x + panelStyle.padding.x + listIconSlot,
                  itemPos.y + (state.itemSize.y - textStyle.fontSize) * 0.5f);
+    // Brief 35-A: the row paints its own surface (selection/hover fill), so the
+    // contrast direction is measured against THAT, not the window background.
+    ctx->renderer.PushTextBackdrop(itemBg);
     ctx->renderer.DrawText(textPos, items[i], textStyle.color,
                            textStyle.fontSize);
+    ctx->renderer.PopTextBackdrop();
 
     // Manejar click en el item
     if (hover && leftPressed) {
@@ -469,8 +516,10 @@ bool BeginTreeView(const std::string &id, const Vec2 &size, std::optional<Vec2> 
   );
   ctx->widgetTree.PushParent(treeNode);
 
-  auto &state = ctx->treeViewStates[treeViewId];
+  auto &state = ctx->GetTreeState(treeViewId);
   ctx->currentTreeViewId = treeViewId;
+  // brief 21: scope TreeNodes by the tree id (paired with widgetTree push/pop).
+  PushID(id.c_str());
 
   if (!state.initialized) {
     Vec2 avail = GetCurrentAvailableSpace(ctx);
@@ -558,8 +607,8 @@ bool BeginTreeView(const std::string &id, const Vec2 &size, std::optional<Vec2> 
   ctx->lastItemPos = ctx->cursorPos;
   ctx->treeViewDepth = 0;
 
-  // Phase C5: reset DFS visit order for this frame
-  ctx->treeVisitOrder[treeViewId].clear();
+  // Phase C5 / brief 22 (fase 7): reset DFS visit order for this frame
+  ctx->GetWidgetState(treeViewId).treeVisitOrder.clear();
 
   // Iniciar layout vertical para apilar los nodos correctamente
   Vec2 contentSize(treeViewSize.x - innerPadding.x * 2.0f,
@@ -574,6 +623,9 @@ void EndTreeView() {
   if (!ctx)
     return;
 
+  // brief 21: pop the scope pushed in BeginTreeView.
+  PopID();
+
   // Pop from widget tree (Phase 1)
   ctx->widgetTree.PopParent();
 
@@ -587,9 +639,11 @@ void EndTreeView() {
 
   // Medir y guardar la altura real del contenido (para scroll del próximo frame)
   if (ctx->currentTreeViewId != 0) {
-    auto it = ctx->treeViewStates.find(ctx->currentTreeViewId);
-    if (it != ctx->treeViewStates.end()) {
-      auto &state = it->second;
+    // brief 22 (fase 7): prueba de existencia sin crear entrada — mira widgetStates
+    // y el unique_ptr ws.tree directamente (GetTreeState crearía el sub-estado).
+    auto wsIt = ctx->widgetStates.find(ctx->currentTreeViewId);
+    if (wsIt != ctx->widgetStates.end() && wsIt->second.tree) {
+      auto &state = *wsIt->second.tree;
       Vec2 innerPadding = ctx->style.panel.padding * 0.5f;
       // contentEndCursor.y está offset por -scrollOffset, sumar de vuelta para obtener la altura real
       float realContentHeight = (contentEndCursor.y + state.scrollOffset) - (state.viewPos.y) + innerPadding.y;
@@ -639,11 +693,12 @@ bool TreeNode(const std::string &id, const std::string &label, uint32_t iconCode
   if (!ctx || ctx->currentTreeViewId == 0)
     return false;
 
-  auto it = ctx->treeViewStates.find(ctx->currentTreeViewId);
-  if (it == ctx->treeViewStates.end())
+  // brief 22 (fase 7): prueba de existencia sin crear entrada (ver EndTreeView).
+  auto wsIt = ctx->widgetStates.find(ctx->currentTreeViewId);
+  if (wsIt == ctx->widgetStates.end() || !wsIt->second.tree)
     return false;
 
-  const auto &state = it->second;
+  const auto &state = *wsIt->second.tree;
   const PanelStyle &panelStyle = ctx->style.panel;
   const TextStyle &textStyle = ctx->style.GetTextStyle(TypographyStyle::Body);
 
@@ -674,24 +729,34 @@ bool TreeNode(const std::string &id, const std::string &label, uint32_t iconCode
   // puede tener hijos)
   bool hasChildren = (isOpen != nullptr);
 
-  // Dibujar fondo del item
-  Color itemBg = Color(0,0,0,0); // Transparente por defecto
-  if (nodeIsSelected) {
-    itemBg = ctx->style.button.background.normal;
-  } else if (hover) {
-    itemBg = panelStyle.headerBackground;
-  }
-  
-  if (itemBg.a > 0.0f) {
-    ctx->renderer.DrawRectFilled(itemPos, itemSize, itemBg, 4.0f); // Usar un poco de corner radius
+  // Fondo del item (pill) estilo WinUI. brief 34: hover/selección = overlay alpha
+  // (SubtleFillColorSecondary) que COMPONE sobre el fondo del árbol, así siempre se ve
+  // (aclara en tema oscuro / oscurece en claro). Antes se usaba panelStyle.headerBackground
+  // opaco, que tras la fase 4 quedaba casi idéntico al fondo del TreeView → hover invisible.
+  // El acento de la selección va en la barra indicadora, no en el fondo (como WinUI).
+  const Color subtleFill = Tokens::FromStyle(ctx->style).subtleFillSecondary;
+  // brief 35 Part B: el fondo (pill) hover/selección entra/sale suave por color spring.
+  // El estado "off" usa la MISMA tinta con alpha 0 → solo cruza el alpha (sin viraje de
+  // RGB). Id estable por nodo (treeview id + id del nodo). reduceMotion→snap.
+  Color itemBgTarget =
+      (nodeIsSelected || hover)
+          ? subtleFill
+          : Color(subtleFill.r, subtleFill.g, subtleFill.b, 0.0f);
+  uint32_t nodeColId = GenerateId(
+      "TNODEC:",
+      (std::to_string(ctx->currentTreeViewId) + ":" + id).c_str());
+  Color itemBg = AnimateFill(ctx, nodeColId, itemBgTarget);
+
+  if (itemBg.a > 0.003f) {
+    ctx->renderer.DrawRectFilled(itemPos, itemSize, itemBg, 4.0f); // pill con corner radius
   }
 
-  // Dibujar indicador de selección
+  // Dibujar indicador de selección (barra de acento, opaca y nítida)
   if (nodeIsSelected) {
-    Vec2 indicatorPos(itemPos.x, itemPos.y);
-    Vec2 indicatorSize(3.0f, itemSize.y);
+    Vec2 indicatorPos(itemPos.x, itemPos.y + itemSize.y * 0.2f);
+    Vec2 indicatorSize(3.0f, itemSize.y * 0.6f);
     ctx->renderer.DrawRectFilled(indicatorPos, indicatorSize,
-                                 ctx->style.button.background.hover, 0.0f);
+                                 ctx->style.accentColor, 1.5f);
   }
 
   // Dibujar botón de expand/collapse si tiene hijos
@@ -790,7 +855,7 @@ bool TreeNodeMulti(const std::string &id, const std::string &label, uint32_t ico
 
   // Record visit order for range select
   uint32_t treeId = ctx->currentTreeViewId;
-  ctx->treeVisitOrder[treeId].push_back(nodeId);
+  ctx->GetWidgetState(treeId).treeVisitOrder.push_back(nodeId);
 
   bool isInSelection = std::find(selectedIds->begin(), selectedIds->end(), nodeId) != selectedIds->end();
   bool tempSelected = isInSelection;
@@ -799,15 +864,16 @@ bool TreeNodeMulti(const std::string &id, const std::string &label, uint32_t ico
   if (!wasClicked) return false;
 
   // Click happened — apply modifier semantics
-  SDL_Keymod km = SDL_GetModState();
-  bool ctrlHeld = (km & SDL_KMOD_CTRL) != 0;
-  bool shiftHeld = (km & SDL_KMOD_SHIFT) != 0;
+  bool ctrlHeld = ctx->input.CtrlDown();
+  bool shiftHeld = ctx->input.ShiftDown();
 
   if (shiftHeld) {
     // Range select from anchor in DFS order
-    auto anchorIt = ctx->treeLastSelectedId.find(treeId);
-    int anchor = (anchorIt != ctx->treeLastSelectedId.end()) ? anchorIt->second : nodeId;
-    const auto& order = ctx->treeVisitOrder[treeId];
+    // brief 22 (fase 7): treeLastSelectedSet==false emula la ausencia en el mapa
+    // original (find()==end() -> ancla = nodeId actual).
+    auto& tws = ctx->GetWidgetState(treeId);
+    int anchor = tws.treeLastSelectedSet ? tws.treeLastSelectedId : nodeId;
+    const auto& order = tws.treeVisitOrder;
     int aIdx = -1, bIdx = -1;
     for (int i = 0; i < static_cast<int>(order.size()); ++i) {
       if (order[i] == anchor) aIdx = i;
@@ -828,11 +894,11 @@ bool TreeNodeMulti(const std::string &id, const std::string &label, uint32_t ico
     } else {
       selectedIds->push_back(nodeId);
     }
-    ctx->treeLastSelectedId[treeId] = nodeId;
+    { auto& tws = ctx->GetWidgetState(treeId); tws.treeLastSelectedId = nodeId; tws.treeLastSelectedSet = true; }
   } else {
     // Replace selection
     selectedIds->assign({nodeId});
-    ctx->treeLastSelectedId[treeId] = nodeId;
+    { auto& tws = ctx->GetWidgetState(treeId); tws.treeLastSelectedId = nodeId; tws.treeLastSelectedSet = true; }
   }
   return true;
 }
@@ -868,7 +934,7 @@ bool BeginTable(const std::string& id, std::vector<TableColumn>& columns,
       return node;
   });
 
-  auto &state = ctx->tableStates[tableId];
+  auto &state = ctx->GetTableState(tableId);
   if (!state.initialized) {
     state.initialized = true;
     if (externalState) {
@@ -1172,6 +1238,8 @@ bool BeginTable(const std::string& id, std::vector<TableColumn>& columns,
   frame.clipPushed = true;
 
   ctx->tableStack.push_back(frame);
+  // brief 21: scope cell content by the table id (paired with tableStack).
+  PushID(id.c_str());
 
   // Set cursor to the first visible row position
   ctx->cursorPos = Vec2(tablePos.x,
@@ -1331,10 +1399,10 @@ bool TableRowSelectable(int rowIndex) {
   }
 
   if (hover && ctx->input.IsMousePressed(0)) {
-    bool ctrl = ctx->input.IsKeyDown(SDL_SCANCODE_LCTRL) ||
-                ctx->input.IsKeyDown(SDL_SCANCODE_RCTRL);
-    bool shift = ctx->input.IsKeyDown(SDL_SCANCODE_LSHIFT) ||
-                 ctx->input.IsKeyDown(SDL_SCANCODE_RSHIFT);
+    bool ctrl = ctx->input.IsKeyDown(UIKey::LeftCtrl) ||
+                ctx->input.IsKeyDown(UIKey::RightCtrl);
+    bool shift = ctx->input.IsKeyDown(UIKey::LeftShift) ||
+                 ctx->input.IsKeyDown(UIKey::RightShift);
 
     if (shift && frame.lastSelectedRow >= 0) {
       // Range select: replace with [anchor..rowIndex]
@@ -1370,6 +1438,8 @@ void EndTable() {
 
   auto frame = ctx->tableStack.back();
   ctx->tableStack.pop_back();
+  // brief 21: pop the scope pushed in BeginTable.
+  PopID();
 
   // Phase C7: pop any pending per-cell clip from the last cell of the last row.
   if (frame.cellClipPushed) {
@@ -1399,7 +1469,7 @@ void EndTable() {
   }
 
   // Draw vertical scrollbar if needed
-  auto &state = ctx->tableStates[frame.id];
+  auto &state = ctx->GetTableState(frame.id);
   // Phase C7: persist anchor row id back to per-table state
   state.lastSelectedRow = frame.lastSelectedRow;
   // Phase C7: use the dataAreaHeight that already excludes h-scrollbar space.
@@ -1435,19 +1505,527 @@ void EndTable() {
   ctx->renderer.DrawRect(frame.position, frame.size, panelStyle.borderColor,
                          panelStyle.cornerRadius);
 
-  // Phase C7: sync horizontal scroll offset back to external state.
-  if (auto it = ctx->tableStates.find(frame.id); it != ctx->tableStates.end()) {
-    // (state was retrieved above; nothing extra needed here — external sync
-    //  happens implicitly the next frame because BeginTable copies from state
-    //  if not initialized; for already-initialized tables we leave external
-    //  scrollOffsetX read-only from user perspective.)
-  }
+  // Phase C7 / brief 22 (fase 7): sync horizontal scroll offset back to external
+  // state. `state` (arriba, GetTableState) es la fuente; no hace falta más aquí —
+  // el sync externo ocurre implícitamente el próximo frame porque BeginTable copia
+  // desde `state` si no está inicializado; para tablas ya inicializadas dejamos el
+  // scrollOffsetX externo de solo lectura desde la perspectiva del usuario.
 
   // Restore cursor state and advance
   ctx->cursorPos = frame.savedCursor;
   ctx->lastItemPos = frame.position;
   ctx->lastItemSize = frame.size;
   AdvanceCursor(ctx, frame.size);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BRIEF 16 — GridView, DataGrid, ExpanderList
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Scrollbar drag bookkeeping for widgets that don't own a state struct (GridView).
+struct ScrollbarDrag {
+  bool dragging = false;
+  Vec2 startMouse{0.0f, 0.0f};
+  float startScroll = 0.0f;
+};
+std::unordered_map<uint32_t, ScrollbarDrag> g_gridScroll;
+
+// Per-DataGrid persistent state (column order/widths + edit/reorder transients).
+struct DataGridLocal {
+  std::vector<int> order;    // display position -> logical column index
+  std::vector<float> widths; // logical column index -> current width
+  TableState table;          // underlying Table state (sort/scroll/frozen/resize)
+  // Inline editing.
+  int editRow = -1;
+  int editLogicalCol = -1;
+  std::string editBuf;
+  bool editStarted = false;  // request focus on the editor next render
+  // Double-click detection.
+  int lastClickRow = -1, lastClickCol = -1;
+  float lastClickTime = -1.0f;
+  // Header drag-to-reorder.
+  int dragFromPos = -1;      // display pos where the press started (-1 = none pending)
+  float dragStartX = 0.0f;
+  bool headerDragging = false;
+  int sortSnapCol = -1;
+  bool sortSnapAsc = true;
+};
+std::unordered_map<uint32_t, DataGridLocal> g_dataGrids;
+
+bool DG_IsTruthy(const std::string &s) {
+  if (s.empty()) return false;
+  char c = static_cast<char>(std::tolower(static_cast<unsigned char>(s[0])));
+  return c == '1' || c == 't' || c == 'y' || c == 'v'; // 1/true/yes/verdadero
+}
+
+} // anonymous namespace
+
+void GridView(const std::string &id, int itemCount, Vec2 itemSize,
+              const std::function<void(int)> &itemBuilder, float gap,
+              float minItemWidth) {
+  UIContext *ctx = GetContext();
+  if (!ctx || itemCount <= 0)
+    return;
+  if (gap < 0.0f) gap = 0.0f;
+
+  uint32_t gridId = GenerateId("GRIDVIEW:", id.c_str());
+  ctx->focusableWidgets.push_back(gridId);
+
+  Vec2 avail = GetCurrentAvailableSpace(ctx);
+  float viewW = avail.x > 0.0f ? avail.x
+                               : ctx->renderer.GetViewportSize().x - ctx->cursorPos.x;
+  float viewH = avail.y > 0.0f ? avail.y : 300.0f;
+  if (viewW < 1.0f) viewW = 1.0f;
+  if (viewH < 1.0f) viewH = 1.0f;
+  Vec2 origin = ctx->cursorPos;
+
+  float cellH = itemSize.y > 0.0f ? itemSize.y : 100.0f;
+  // Same column-count formula as BeginUniformGrid (brief 19).
+  float refW = (minItemWidth > 0.0f) ? minItemWidth : itemSize.x;
+  if (refW < 1.0f) refW = 1.0f;
+
+  auto computeLayout = [&](float widthAvail, int &cols, float &cellW) {
+    cols = static_cast<int>(std::floor((widthAvail + gap) / (refW + gap)));
+    if (cols < 1) cols = 1;
+    if (minItemWidth > 0.0f)
+      cellW = (widthAvail - static_cast<float>(cols - 1) * gap) / static_cast<float>(cols);
+    else
+      cellW = itemSize.x;
+    if (cellW < 1.0f) cellW = 1.0f;
+  };
+
+  int cols = 1;
+  float cellW = refW;
+  computeLayout(viewW, cols, cellW);
+  float rowStride = cellH + gap;
+  int rows = (itemCount + cols - 1) / cols;
+  float totalH = static_cast<float>(rows) * cellH + static_cast<float>(rows - 1) * gap;
+  if (totalH < 0.0f) totalH = 0.0f;
+
+  bool needsBar = totalH > viewH;
+  float contentW = needsBar ? viewW - SCROLLBAR_WIDTH : viewW;
+  if (needsBar) {
+    // Re-flow against the narrower content area so tiles don't slip under the bar.
+    computeLayout(contentW, cols, cellW);
+    rows = (itemCount + cols - 1) / cols;
+    totalH = static_cast<float>(rows) * cellH + static_cast<float>(rows - 1) * gap;
+  }
+
+  float &scroll = ctx->GetWidgetState(gridId).floatVal; // brief 22 (fase 3)
+  uint32_t selId = GenerateId("GRIDSEL:", id.c_str());
+  bool selFresh = ctx->widgetStates.find(selId) == ctx->widgetStates.end();
+  int &sel = ctx->GetWidgetState(selId).intVal;
+  if (selFresh) sel = -1; // preserva default try_emplace(., -1)
+  if (sel >= itemCount) sel = itemCount - 1;
+
+  bool focused = (ctx->focusedWidgetId == gridId);
+  if (focused) {
+    int cur = sel < 0 ? 0 : sel;
+    bool moved = false;
+    if (ctx->input.IsKeyPressed(UIKey::Right)) { cur = std::min(itemCount - 1, cur + 1); moved = true; }
+    if (ctx->input.IsKeyPressed(UIKey::Left))  { cur = std::max(0, cur - 1); moved = true; }
+    if (ctx->input.IsKeyPressed(UIKey::Down))  { if (cur + cols < itemCount) cur += cols; moved = true; }
+    if (ctx->input.IsKeyPressed(UIKey::Up))    { if (cur - cols >= 0) cur -= cols; moved = true; }
+    if (moved) {
+      sel = cur;
+      int r = cur / cols;
+      float top = static_cast<float>(r) * rowStride;
+      float bot = top + cellH;
+      if (top < scroll) scroll = top;
+      else if (bot > scroll + viewH) scroll = bot - viewH;
+    }
+  }
+
+  bool hoverGrid = IsMouseOver(ctx, origin, Vec2(viewW, viewH));
+  if (hoverGrid && needsBar && !ctx->scrollConsumedThisFrame) {
+    float wy = ctx->input.MouseWheelY();
+    if (std::abs(wy) > 0.001f) {
+      scroll -= wy * SCROLL_SPEED;
+      ctx->scrollConsumedThisFrame = true;
+    }
+  }
+  scroll = std::clamp(scroll, 0.0f, std::max(0.0f, totalH - viewH));
+
+  // Background well.
+  Color bg = AdjustListSurfaceBackground(ctx->style.panel.background, ctx->style.isDarkTheme);
+  ctx->renderer.DrawRectFilled(origin, Vec2(viewW, viewH), bg, ctx->style.panel.cornerRadius);
+
+  ctx->renderer.PushClipRect(origin, Vec2(contentW, viewH));
+  int startRow = std::max(0, static_cast<int>(std::floor(scroll / rowStride)));
+  int endRow = std::min(rows, static_cast<int>(std::ceil((scroll + viewH) / rowStride)) + 1);
+
+  Vec2 savedCursor = ctx->cursorPos;
+  PushID(id.c_str());
+  for (int r = startRow; r < endRow; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      int idx = r * cols + c;
+      if (idx >= itemCount) break;
+      float cx = origin.x + static_cast<float>(c) * (cellW + gap);
+      float cy = origin.y + static_cast<float>(r) * rowStride - scroll;
+      Vec2 cellPos(cx, cy);
+      Vec2 cellSize(cellW, cellH);
+
+      bool cellHover = IsMouseOver(ctx, cellPos, cellSize);
+      if (sel == idx) {
+        Color s = ctx->style.button.background.hover; s.a *= 0.30f;
+        ctx->renderer.DrawRectFilled(cellPos, cellSize, s, 4.0f);
+      } else if (cellHover) {
+        Color h = ctx->style.button.background.hover; h.a *= 0.14f;
+        ctx->renderer.DrawRectFilled(cellPos, cellSize, h, 4.0f);
+      }
+      if (cellHover && ctx->input.IsMousePressed(0)) {
+        sel = idx;
+        ctx->focusedWidgetId = gridId;
+      }
+
+      PushID(idx);
+      ctx->cursorPos = cellPos;
+      LayoutConstraints cc{};
+      cc.width = SizeConstraint::Fixed;
+      cc.fixedWidth = cellW;
+      SetNextConstraints(cc);
+      if (itemBuilder) itemBuilder(idx);
+      PopID();
+    }
+  }
+  PopID();
+  ctx->renderer.PopClipRect();
+
+  if (focused)
+    DrawFocusRing(ctx, origin, Vec2(viewW, viewH), ctx->style.panel.cornerRadius);
+
+  if (needsBar) {
+    auto &gd = g_gridScroll[gridId];
+    Vec2 barPos(origin.x + contentW, origin.y);
+    Vec2 barSize(SCROLLBAR_WIDTH, viewH);
+    DrawScrollbar(ctx, barPos, barSize, totalH, viewH, scroll, gd.dragging,
+                  gd.startMouse, gd.startScroll, gd.dragging, true);
+  }
+
+  ctx->cursorPos = savedCursor;
+  ctx->lastItemPos = origin;
+  ctx->lastItemSize = Vec2(viewW, viewH);
+  bool active = hoverGrid && ctx->input.IsMouseDown(0);
+  SetLastItem(gridId, origin, origin + Vec2(viewW, viewH), hoverGrid, active, focused, false);
+  AdvanceCursor(ctx, Vec2(viewW, viewH));
+}
+
+DataGridResult DataGrid(const std::string &id, const std::vector<DataColumn> &cols,
+                        int rowCount,
+                        const std::function<std::string(int, int)> &getCell,
+                        const std::function<void(int, int, const std::string &)> &setCell) {
+  DataGridResult result;
+  UIContext *ctx = GetContext();
+  if (!ctx || cols.empty())
+    return result;
+
+  uint32_t dgId = GenerateId("DATAGRID:", id.c_str());
+  auto &st = g_dataGrids[dgId];
+  int nCols = static_cast<int>(cols.size());
+
+  if (static_cast<int>(st.order.size()) != nCols) {
+    st.order.resize(nCols);
+    for (int i = 0; i < nCols; ++i) st.order[i] = i;
+  }
+  if (static_cast<int>(st.widths.size()) != nCols) {
+    st.widths.resize(nCols);
+    for (int i = 0; i < nCols; ++i) st.widths[i] = cols[i].width;
+  }
+  // Defensive: keep order indices valid even if a stale permutation survives a
+  // column-count change of equal size.
+  for (int o : st.order) {
+    if (o < 0 || o >= nCols) {
+      for (int i = 0; i < nCols; ++i) st.order[i] = i;
+      break;
+    }
+  }
+
+  // Build Table columns in current display order.
+  std::vector<TableColumn> tcols(nCols);
+  for (int p = 0; p < nCols; ++p) {
+    int lc = st.order[p];
+    tcols[p].header = cols[lc].header;
+    tcols[p].width = st.widths[lc];
+    tcols[p].minWidth = 40.0f;
+    tcols[p].sortable = cols[lc].sortable;
+  }
+
+  Vec2 gridPos = ctx->cursorPos;
+  // Snapshot sort so a confirmed reorder can neutralise the sort that Table
+  // toggles on header press (press == sort in Table; drag == reorder for us).
+  st.sortSnapCol = st.table.sortColumn;
+  st.sortSnapAsc = st.table.sortAscending;
+
+  const TextStyle &bodyStyle = ctx->style.GetTextStyle(TypographyStyle::Body);
+  const float ascender = ctx->renderer.GetFontAscender();
+  const float visualCenterOffset = (ascender - 0.7f * 0.5f) * bodyStyle.fontSize;
+
+  if (BeginTable(id, tcols, rowCount, Vec2(0, 0), &st.table)) {
+    // Persist any width change from interactive resize back to logical store.
+    for (int p = 0; p < nCols; ++p) st.widths[st.order[p]] = tcols[p].width;
+
+    if (!ctx->tableStack.empty()) {
+      int startRow = ctx->tableStack.back().startVisibleRow;
+      int endRow = ctx->tableStack.back().endVisibleRow;
+
+      for (int row = startRow; row < endRow && row < rowCount; ++row) {
+        TableNextRow();
+        TableRowSelectable(row); // row selection via Table's selectedRows
+        for (int p = 0; p < nCols; ++p) {
+          TableSetCell(p);
+          int lc = st.order[p];
+          const DataColumn &dc = cols[lc];
+
+          // Exact cell geometry (mirrors TableSetCell's frozen/scroll math).
+          const TableFrameContext &fr = ctx->tableStack.back();
+          bool frozen = (p < fr.frozenColumns);
+          float colX;
+          if (frozen) {
+            colX = fr.position.x;
+            for (int c = 0; c < p; ++c) colX += fr.columnsPtr[c].width;
+          } else {
+            colX = fr.position.x + fr.frozenContentWidth - fr.scrollOffsetX;
+            for (int c = fr.frozenColumns; c < p; ++c) colX += fr.columnsPtr[c].width;
+          }
+          float colW = fr.columnsPtr[p].width;
+          float rowY = fr.position.y + fr.headerHeight +
+                       static_cast<float>(row) * fr.rowHeight - fr.scrollOffset;
+          Vec2 cellPos(colX, rowY);
+          Vec2 cellSz(colW, fr.rowHeight);
+          std::string val = getCell ? getCell(row, lc) : std::string();
+
+          bool isEditingCell = (st.editRow == row && st.editLogicalCol == lc);
+
+          if (dc.type == DataColumn::Type::Bool) {
+            // Bool: interactive checkbox if editable, static glyph otherwise.
+            float box = 16.0f;
+            Vec2 bp(colX + 6.0f, rowY + (fr.rowHeight - box) * 0.5f);
+            bool checked = DG_IsTruthy(val);
+            Color border = InputFieldBorder(ctx, false);
+            if (checked) {
+              Color accent = ctx->style.button.background.normal;
+              ctx->renderer.DrawRectFilled(bp, Vec2(box, box), accent, 3.0f);
+              ctx->renderer.DrawLine(Vec2(bp.x + 3.5f, bp.y + box * 0.55f),
+                                     Vec2(bp.x + box * 0.42f, bp.y + box - 3.5f),
+                                     Color(1, 1, 1, 1), 1.6f);
+              ctx->renderer.DrawLine(Vec2(bp.x + box * 0.42f, bp.y + box - 3.5f),
+                                     Vec2(bp.x + box - 3.0f, bp.y + 3.5f),
+                                     Color(1, 1, 1, 1), 1.6f);
+            } else {
+              ctx->renderer.DrawRect(bp, Vec2(box, box), border, 3.0f);
+            }
+            if (dc.editable) {
+              bool h = IsMouseOver(ctx, bp, Vec2(box, box));
+              if (h && ctx->input.IsMousePressed(0) && setCell) {
+                setCell(row, lc, checked ? "false" : "true");
+                result.editedRow = row;
+                result.editedCol = lc;
+              }
+            }
+          } else if (isEditingCell) {
+            // Inline text editor (fallback for Text/Number/Choice — brief 14
+            // NumberBox/ComboBox not available yet).
+            float pad = 3.0f;
+            Vec2 edPos(colX + pad, rowY + (fr.rowHeight - 26.0f) * 0.5f);
+            TextInput(std::string("##DGEDIT"), &st.editBuf,
+                      std::max(20.0f, colW - 2.0f * pad), false,
+                      std::optional<Vec2>(edPos), nullptr, 0);
+            uint32_t editorId = ctx->lastItem.id;
+            if (st.editStarted) {
+              ctx->focusedWidgetId = editorId;
+              st.editStarted = false;
+            }
+            bool commit = false, cancel = false;
+            if (ctx->input.IsKeyPressed(UIKey::Enter) ||
+                ctx->input.IsKeyPressed(UIKey::KeypadEnter))
+              commit = true;
+            if (ctx->input.IsKeyPressed(UIKey::Escape))
+              cancel = true;
+            if (ctx->lastItem.deactivated) // blur
+              commit = true;
+            if (commit) {
+              if (setCell) setCell(row, lc, st.editBuf);
+              result.editedRow = row;
+              result.editedCol = lc;
+              st.editRow = -1; st.editLogicalCol = -1;
+            } else if (cancel) {
+              st.editRow = -1; st.editLogicalCol = -1;
+              ctx->focusedWidgetId = 0;
+            }
+          } else {
+            // Static text + double-click to begin editing.
+            Vec2 textPos(colX + 6.0f,
+                         rowY + fr.rowHeight * 0.5f - visualCenterOffset);
+            ctx->renderer.DrawText(textPos, val, bodyStyle.color, bodyStyle.fontSize);
+            if (dc.editable) {
+              bool h = IsMouseOver(ctx, cellPos, cellSz);
+              if (h && ctx->input.IsMousePressed(0)) {
+                bool dbl = (st.lastClickRow == row && st.lastClickCol == lc &&
+                            (ctx->time - st.lastClickTime) < 0.40f);
+                st.lastClickRow = row; st.lastClickCol = lc;
+                st.lastClickTime = ctx->time;
+                if (dbl) {
+                  // Commit any edit pending on another cell before switching.
+                  if (st.editRow >= 0 &&
+                      (st.editRow != row || st.editLogicalCol != lc)) {
+                    if (setCell) setCell(st.editRow, st.editLogicalCol, st.editBuf);
+                  }
+                  st.editRow = row; st.editLogicalCol = lc;
+                  st.editBuf = val; st.editStarted = true;
+                }
+              }
+            }
+          }
+        }
+      }
+      // Commit a pending edit whose row scrolled out of view (implicit blur).
+      if (st.editRow >= 0 && (st.editRow < startRow || st.editRow >= endRow)) {
+        if (setCell) setCell(st.editRow, st.editLogicalCol, st.editBuf);
+        st.editRow = -1; st.editLogicalCol = -1;
+      }
+    }
+  }
+  EndTable();
+
+  // ── Header drag-to-reorder (post-EndTable; Table doesn't handle reorder). ──
+  {
+    const float headerH = 28.0f; // matches Table's headerHeight
+    int frozen = std::clamp(st.table.frozenColumns, 0, nCols);
+    float frozenW = 0.0f;
+    for (int c = 0; c < frozen; ++c) frozenW += tcols[c].width;
+    auto colDispX = [&](int p) -> float {
+      if (p < frozen) {
+        float x = gridPos.x;
+        for (int c = 0; c < p; ++c) x += tcols[c].width;
+        return x;
+      }
+      float x = gridPos.x + frozenW - st.table.scrollOffsetX;
+      for (int c = frozen; c < p; ++c) x += tcols[c].width;
+      return x;
+    };
+    float mx = ctx->input.MouseX();
+    float my = ctx->input.MouseY();
+    bool inHeader = (my >= gridPos.y && my <= gridPos.y + headerH);
+
+    if (st.dragFromPos < 0 && inHeader && ctx->input.IsMousePressed(0)) {
+      for (int p = 0; p < nCols; ++p) {
+        float x0 = colDispX(p), x1 = x0 + tcols[p].width;
+        if (mx >= x0 && mx < x1) {
+          // Skip the resize hit zone near the right border (owned by Table).
+          if (std::abs(mx - x1) >= 4.0f) {
+            st.dragFromPos = p;
+            st.dragStartX = mx;
+          }
+          break;
+        }
+      }
+    }
+
+    if (st.dragFromPos >= 0 && ctx->input.IsMouseDown(0)) {
+      if (!st.headerDragging && std::abs(mx - st.dragStartX) > 6.0f)
+        st.headerDragging = true;
+      if (st.headerDragging) {
+        // Insertion indicator: nearest column boundary to the cursor.
+        int target = nCols;
+        for (int p = 0; p < nCols; ++p) {
+          float mid = colDispX(p) + tcols[p].width * 0.5f;
+          if (mx < mid) { target = p; break; }
+        }
+        float lineX = (target < nCols)
+                          ? colDispX(target)
+                          : colDispX(nCols - 1) + tcols[nCols - 1].width;
+        Color accent = ctx->style.button.background.hover;
+        ctx->renderer.DrawLine(Vec2(lineX, gridPos.y),
+                               Vec2(lineX, gridPos.y + headerH), accent, 2.0f);
+        float sx = colDispX(st.dragFromPos);
+        Color tint = accent; tint.a *= 0.18f;
+        ctx->renderer.DrawRectFilled(Vec2(sx, gridPos.y),
+                                     Vec2(tcols[st.dragFromPos].width, headerH), tint, 0.0f);
+      }
+    }
+
+    if (st.dragFromPos >= 0 && !ctx->input.IsMouseDown(0)) {
+      if (st.headerDragging) {
+        int target = nCols;
+        for (int p = 0; p < nCols; ++p) {
+          float mid = colDispX(p) + tcols[p].width * 0.5f;
+          if (mx < mid) { target = p; break; }
+        }
+        int from = st.dragFromPos;
+        if (target > from) target -= 1; // account for removal shift
+        target = std::clamp(target, 0, nCols - 1);
+        if (target != from) {
+          int moved = st.order[from];
+          st.order.erase(st.order.begin() + from);
+          st.order.insert(st.order.begin() + target, moved);
+          // Neutralise the accidental sort toggle from the initial press.
+          st.table.sortColumn = st.sortSnapCol;
+          st.table.sortAscending = st.sortSnapAsc;
+        }
+      }
+      st.headerDragging = false;
+      st.dragFromPos = -1;
+    }
+  }
+
+  // Report sort in the caller's ORIGINAL column space.
+  result.ascending = st.table.sortAscending;
+  if (st.table.sortColumn >= 0 && st.table.sortColumn < nCols)
+    result.sortedColumn = st.order[st.table.sortColumn];
+  else
+    result.sortedColumn = -1;
+  return result;
+}
+
+void ExpanderList(const std::string &id, int itemCount,
+                  const std::function<std::string(int)> &headerFn,
+                  const std::function<void(int)> &bodyFn, bool accordion) {
+  UIContext *ctx = GetContext();
+  if (!ctx || itemCount <= 0)
+    return;
+
+  uint32_t listId = GenerateId("EXPLIST:", id.c_str());
+  int *openIdx = nullptr;
+  if (accordion) {
+    bool openFresh = ctx->widgetStates.find(listId) == ctx->widgetStates.end(); // brief 22 (fase 3)
+    int& oi = ctx->GetWidgetState(listId).intVal;
+    if (openFresh) oi = -1; // preserva default try_emplace(., -1)
+    openIdx = &oi;
+  }
+
+  PushID(id.c_str());
+  for (int i = 0; i < itemCount; ++i) {
+    PushID(i);
+    std::string header = headerFn ? headerFn(i) : std::string();
+
+    uint32_t subId = GenerateId("EXPITEM:", id.c_str(), std::to_string(i).c_str());
+    bool open;
+    if (accordion)
+      open = (*openIdx == i);
+    else
+      open = ctx->GetWidgetState(subId).boolVal; // brief 22 (fase 3)
+
+    bool before = open;
+    // CollapsingHeader toggles `open` on click/keyboard and applies an auto-indent
+    // to following siblings (which our body inherits, then the next header resets).
+    CollapsingHeader(header, &open);
+
+    if (accordion) {
+      if (open && !before) *openIdx = i;
+      else if (!open && before && *openIdx == i) *openIdx = -1;
+    } else {
+      ctx->GetWidgetState(subId).boolVal = open; // brief 22 (fase 3)
+    }
+
+    // Body height animation (brief 10) degrades to snap: show/hide instantly.
+    if (open && bodyFn)
+      bodyFn(i);
+
+    PopID();
+  }
+  PopID();
 }
 
 } // namespace FluentUI

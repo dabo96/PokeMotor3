@@ -16,13 +16,18 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace pk {
 
 namespace {
+// Alto reservado abajo para la barra de estado (la dibuja build() al final del frame).
+constexpr float kStatusBandH = 28.0f;
+
 // Nombre de archivo (sin ruta) de una ruta cualquiera.
 std::string baseName(const std::string& p) {
     const size_t s = p.find_last_of("/\\");
@@ -95,13 +100,19 @@ void TileEditor::ensureLoaded() {
         m_map = c->map;   // copia de trabajo desde el componente de la escena
         std::snprintf(m_status, sizeof(m_status), "Mapa %dx%d cargado", m_map.width(), m_map.height());
     } else {
-        m_map.loadAscii({
-            "TTTTTTTTTTTT", "T..........T", "T..gggggg..T", "T..gGGGGg..T",
-            "T..gGGGGg.wT", "T....P...wwT", "T..gggg..wwT", "T..gggg...wT",
-            "T..........T", "TTTTTTTTTTTT",
-        });
-        std::snprintf(m_status, sizeof(m_status), "Sin mapa en la escena; demo %dx%d", m_map.width(), m_map.height());
+        // Sin entidad-mapa la copia de trabajo queda VACÍA: pintar aquí un mapa de demo
+        // haría creer que hay mundo donde no lo hay (y "Guardar" no tendría dónde volcarlo).
+        m_map.assign(0, 0, {}, IVec2(0, 0));
+        std::snprintf(m_status, sizeof(m_status),
+                      "Sin mapa en la escena: créalo con Entidad → Crear mapa de tiles");
     }
+    syncSizeBuffers();   // los campos del control "Redimensionar" reflejan el mapa cargado
+}
+
+// Vuelca el tamaño actual del mapa a los buffers de texto del control de redimensionar.
+void TileEditor::syncSizeBuffers() {
+    m_mapW = static_cast<double>(m_map.width());
+    m_mapH = static_cast<double>(m_map.height());
 }
 
 void TileEditor::floodFill(int x, int y, TileType from, TileType to) {
@@ -130,8 +141,20 @@ void TileEditor::save() {
         return;
     }
     // (1) Vuelca SOLO los tipos del mapa al componente; los overrides visuales por celda
-    // (que pone el inspector del juego) se preservan al no tocarlos.
+    // (que pone el inspector del juego) se preservan al no tocarlos. PERO si el mapa se
+    // redimensionó, su ancho cambió y los overrides (clave = y*width+x) apuntarían a celdas
+    // equivocadas: los remapeamos al ancho nuevo y descartamos los que quedaron fuera.
+    const int oldW = c->map.width(), oldH = c->map.height();
     c->map = m_map;
+    const int newW = m_map.width(), newH = m_map.height();
+    if (oldW > 0 && (oldW != newW || oldH != newH) && !c->overrides.empty()) {
+        std::unordered_map<int, TileXform> remapped;
+        for (const auto& kv : c->overrides) {
+            const int x = kv.first % oldW, y = kv.first / oldW;
+            if (x < newW && y < newH) remapped[y * newW + x] = kv.second;
+        }
+        c->overrides = std::move(remapped);
+    }
 
     // (2) Persiste la ESCENA a disco: a su ruta actual, o a una por defecto bajo el proyecto
     // si aún no se ha guardado (SceneManager recuerda la ruta para próximas veces).
@@ -155,10 +178,34 @@ void TileEditor::save() {
 void TileEditor::reload() {
     if (const TileMapComponent* c = mapComp()) {
         m_map = c->map;
+        syncSizeBuffers();
         std::snprintf(m_status, sizeof(m_status), "Mapa recargado de la escena");
     } else {
         std::snprintf(m_status, sizeof(m_status), "No hay mapa en la escena");
     }
+}
+
+// Redimensiona la copia de trabajo del mapa según los buffers de texto (ancho×alto). Conserva
+// lo pintado en la esquina 0,0; celdas nuevas = tipo por defecto. Se persiste al pulsar
+// "Guardar" (que también remapea los overrides visuales si cambió el ancho).
+void TileEditor::resizeMap() {
+    // El NumberBox ya clampa a [1,512]; la comprobación se mantiene por si el valor llega
+    // de otra vía (recarga, escena con un mapa raro).
+    const int w = static_cast<int>(m_mapW);
+    const int h = static_cast<int>(m_mapH);
+    if (w < 1 || h < 1 || w > 512 || h > 512) {
+        std::snprintf(m_status, sizeof(m_status), "Tamaño inválido (1..512). Sin cambios.");
+        syncSizeBuffers();   // restaura los campos al tamaño real
+        return;
+    }
+    if (w == m_map.width() && h == m_map.height()) {
+        std::snprintf(m_status, sizeof(m_status), "El mapa ya es %dx%d.", w, h);
+        return;
+    }
+    m_map.resize(w, h);
+    syncSizeBuffers();
+    std::snprintf(m_status, sizeof(m_status),
+                  "Mapa redimensionado a %dx%d. Pulsa Guardar para persistir.", w, h);
 }
 
 void TileEditor::build(int width, int height) {
@@ -185,8 +232,10 @@ void TileEditor::build(int width, int height) {
     FluentUI::EndStatusBar();
 }
 
-// Pantalla "Pintar mapa": toolbar de pinceles + guardar/recargar del MAPA, paleta y lienzo.
+// Pantalla "Pintar mapa": toolbar de pinceles + guardar/recargar del MAPA, y un Splitter
+// paleta | lienzo (el divisor se arrastra; ya no hay un x0=150 fijo para el lienzo).
 void TileEditor::buildMapScreen(int width, int height) {
+    using FluentUI::Vec2;
     auto* c = FluentUI::GetContext();
 
     // --- Toolbar: herramienta activa + guardar/recargar ---
@@ -203,12 +252,48 @@ void TileEditor::buildMapScreen(int width, int height) {
     FluentUI::EndToolbar();
     m_tool = static_cast<Tool>(tool);
 
-    // Borde inferior real de la toolbar (EndToolbar dejó ahí el cursor): la paleta y
-    // el lienzo se colocan justo debajo, sin solaparla.
-    const float top = c ? c->cursorPos.y : 40.0f;
+    // Borde inferior real de la toolbar (EndToolbar dejó ahí el cursor): el área de
+    // trabajo empieza justo debajo y llega hasta encima de la barra de estado.
+    const float top  = c ? c->cursorPos.y : 40.0f;
+    const float midH = static_cast<float>(height) - top - kStatusBandH;
+    if (!c || midH <= 0.0f) return;
 
-    drawPalette(top, width, height);
-    drawCanvas(top, width, height);
+    c->cursorPos = Vec2(0.0f, top);
+    if (FluentUI::BeginSplitter("tiles_mapSplit", true, &m_ratioPalette,
+                                Vec2(static_cast<float>(width), midH))) {
+        // --- Pane izquierdo: tamaño del mapa (en flujo) + paleta del pincel ---
+        const Vec2 paneOrigin = c->cursorPos;
+        const Vec2 paneSize   = c->layoutStack.empty() ? Vec2(0.0f, 0.0f)
+                                                       : c->layoutStack.back().availableSpace;
+        // Los campos reflejan el tamaño actual (syncSizeBuffers); "Redimensionar" aplica a
+        // la copia de trabajo (conserva lo pintado) y "Guardar" lo persiste.
+        if (FluentUI::BeginExpander("mapSize", "Mapa", FluentUI::Icons::LayoutGrid, &m_mapSizeOpen)) {
+            FluentUI::NumberBox("Ancho", &m_mapW, 1.0, 512.0, 1.0, "%.0f");
+            FluentUI::NumberBox("Alto",  &m_mapH, 1.0, 512.0, 1.0, "%.0f");
+            if (FluentUI::Button("Redimensionar")) resizeMap();
+            FluentUI::EndExpander();
+        }
+        drawPalette(remainingPane(paneOrigin, paneSize));
+
+        FluentUI::SplitterPanel();
+
+        // --- Pane derecho: el lienzo ocupa el pane entero ---
+        const Vec2 canvasOrigin = c->cursorPos;
+        const Vec2 canvasSize   = c->layoutStack.empty() ? Vec2(0.0f, 0.0f)
+                                                         : c->layoutStack.back().availableSpace;
+        drawCanvas(FluentUI::Rect(canvasOrigin, canvasSize));
+
+        FluentUI::EndSplitter();
+    }
+}
+
+// Rect libre del pane actual: desde donde quedó el cursor tras los widgets en flujo hasta
+// el borde inferior del pane.
+FluentUI::Rect TileEditor::remainingPane(FluentUI::Vec2 paneOrigin, FluentUI::Vec2 paneSize) const {
+    auto* c = FluentUI::GetContext();
+    const FluentUI::Vec2 pos = c ? c->cursorPos : paneOrigin;
+    const float used = pos.y - paneOrigin.y;
+    return FluentUI::Rect(pos, FluentUI::Vec2(paneSize.x, std::max(0.0f, paneSize.y - used)));
 }
 
 // Pantalla "Configurar tileset": acciones + inspector del tipo + lista (izq) + atlas (der).
@@ -228,43 +313,70 @@ void TileEditor::buildTilesetScreen(int width, int height) {
     FluentUI::SameLine(8.0f);
     if (FluentUI::Button("+ Tipo", FluentUI::Vec2(80.0f, 24.0f))) addNewType();
     FluentUI::SameLine(6.0f);
+    if (FluentUI::Button("+ Grupo", FluentUI::Vec2(84.0f, 24.0f))) addNewGroup();
+    FluentUI::SameLine(6.0f);
     if (FluentUI::Button("- Borrar", FluentUI::Vec2(84.0f, 24.0f))) removeSelectedType();
     FluentUI::EndToolbar();
 
-    const float top = c ? c->cursorPos.y : 40.0f;
+    const float top  = c ? c->cursorPos.y : 40.0f;
+    const float midH = static_cast<float>(height) - top - kStatusBandH;
+    if (!c || midH <= 0.0f) return;
 
-    // --- Inspector del tipo seleccionado: nombre + flags (columna izquierda) ---
-    // OJO con el espaciado vertical: TextInput dibuja su etiqueta ("Nombre") en una línea
-    // PROPIA encima de la caja, así que ocupa ~52 px en total (etiqueta + caja). Las casillas
-    // van bien por debajo para no solaparse con la caja de texto.
-    const float ix = 12.0f, iy = top + 10.0f;
-    if (c)
-        c->renderer.DrawText(FluentUI::Vec2(ix, iy), "Tipo seleccionado",
-                             FluentUI::Color::FromHex("#9aa0a6"), 12.0f);
-    // editType() devuelve una referencia editable a los campos del tipo; TextInput/Checkbox
-    // los modifican EN SITIO (el cambio queda en memoria; "Guardar tileset" lo persiste).
-    TileTypeDef& d = TileSet::instance().editType(m_selType);
-    FluentUI::TextInput("Nombre", &d.name, 210.0f, false, FluentUI::Vec2(ix, iy + 22.0f));
-    FluentUI::Checkbox("Pisable",                     &d.walkable,  FluentUI::Vec2(ix, iy + 86.0f));
-    FluentUI::Checkbox("Dispara encuentros (hierba)", &d.encounter, FluentUI::Vec2(ix, iy + 116.0f));
+    using FluentUI::Vec2;
+    c->cursorPos = Vec2(0.0f, top);
+    if (FluentUI::BeginSplitter("tiles_setSplit", true, &m_ratioTypes,
+                                Vec2(static_cast<float>(width), midH))) {
+        // --- Pane izquierdo: inspector del tipo (en flujo) + lista de tipos ---
+        const Vec2 paneOrigin = c->cursorPos;
+        const Vec2 paneSize   = c->layoutStack.empty() ? Vec2(0.0f, 0.0f)
+                                                       : c->layoutStack.back().availableSpace;
+        // Proyecto sin tileset todavía (no hay tileset.json): ni inspector ni lista, solo el
+        // aviso. Sin este corte, editType() daría de alta un tipo "Tile" fantasma nada más
+        // abrir la ventana — el motor ya no crea contenido por su cuenta.
+        if (n == 0) {
+            FluentUI::Label("Este proyecto aún no tiene tipos de tile.",
+                            std::nullopt, FluentUI::TypographyStyle::Subtitle);
+            FluentUI::Label("Pulsa «+ Tipo» para crear el primero y asígnale una celda de la imagen.",
+                            std::nullopt, FluentUI::TypographyStyle::Caption);
+        } else {
+        // editType() devuelve una referencia editable a los campos del tipo; los widgets los
+        // modifican EN SITIO (el cambio queda en memoria; "Guardar tileset" lo persiste).
+        TileTypeDef& d = TileSet::instance().editType(m_selType);
+        if (FluentUI::BeginExpander("typeInsp", "Tipo seleccionado",
+                                    FluentUI::Icons::Settings, &m_typeInspOpen)) {
+            FluentUI::TextInput("Nombre", &d.name);
+            // Grupo (vacío = tile suelto). Teclear el mismo nombre en varios tipos los agrupa;
+            // el grupo solo organiza la lista y permite fijar "pisable" de golpe.
+            FluentUI::TextInput("Grupo", &d.group);
+            FluentUI::ToggleSwitch("Pisable", &d.walkable, "Sí", "No");
+            FluentUI::ToggleSwitch("Dispara encuentros (hierba)", &d.encounter, "Sí", "No");
+            FluentUI::EndExpander();
+        }
+        drawTypeList(remainingPane(paneOrigin, paneSize));
+        }
 
-    const float listW = 300.0f;
-    drawTypeList(iy + 152.0f - 6.0f, 10.0f, listW, height);   // drawTypeList dibuja desde top+6
+        FluentUI::SplitterPanel();
 
-    // Tamaño de tile (px): controla cómo se trocea la imagen. Presets en la cabecera del
-    // atlas (a la derecha del título "Imagen: …"). El grid se rededuce solo al cambiarlo.
-    const float hx = static_cast<float>(width) - 230.0f;
-    if (c)
-        c->renderer.DrawText(FluentUI::Vec2(hx, top + 7.0f), "Tile px:",
-                             FluentUI::Color::FromHex("#9aa0a6"), 13.0f);
-    if (FluentUI::Button("8",  FluentUI::Vec2(30.0f, 22.0f), FluentUI::Vec2(hx + 58.0f,  top + 3.0f)))
-        TileSet::instance().setTileSize(8);
-    if (FluentUI::Button("16", FluentUI::Vec2(34.0f, 22.0f), FluentUI::Vec2(hx + 92.0f,  top + 3.0f)))
-        TileSet::instance().setTileSize(16);
-    if (FluentUI::Button("32", FluentUI::Vec2(34.0f, 22.0f), FluentUI::Vec2(hx + 130.0f, top + 3.0f)))
-        TileSet::instance().setTileSize(32);
+        // --- Pane derecho: cabecera del atlas (imagen + tamaño de tile) + rejilla ---
+        const Vec2 atlasOrigin = c->cursorPos;
+        const Vec2 atlasSize   = c->layoutStack.empty() ? Vec2(0.0f, 0.0f)
+                                                        : c->layoutStack.back().availableSpace;
+        const TileSet& ts = TileSet::instance();
+        char title[128];
+        std::snprintf(title, sizeof(title), "Imagen: %s   (%dx%d celdas)",
+                      baseName(ts.texture()).c_str(), ts.columns(), ts.rows());
+        FluentUI::Label(title, std::nullopt, FluentUI::TypographyStyle::Caption);
+        // Tamaño de tile (px): controla cómo se trocea la imagen; el grid se re-deduce solo.
+        // Es una elección entre opciones excluyentes → SegmentedControl, no tres botones.
+        const int px = ts.tileWidth();
+        int sel = (px == 8) ? 0 : (px == 32) ? 2 : 1;
+        if (FluentUI::SegmentedControl("tilepx",
+                std::vector<std::string>{ "8 px", "16 px", "32 px" }, &sel))
+            TileSet::instance().setTileSize(sel == 0 ? 8 : sel == 2 ? 32 : 16);
+        drawAtlasPanel(remainingPane(atlasOrigin, atlasSize));
 
-    drawAtlasPanel(top, 10.0f + listW + 12.0f, width, height);
+        FluentUI::EndSplitter();
+    }
 }
 
 // Añade un tipo nuevo (con valores por defecto) y lo deja seleccionado para configurarlo.
@@ -274,6 +386,23 @@ void TileEditor::addNewType() {
     m_selType = TileSet::instance().addType(nd);
     std::snprintf(m_status, sizeof(m_status),
                   "Tipo añadido (#%d): renómbralo y asígnale una celda.", m_selType);
+}
+
+// Añade un tipo nuevo YA dentro de un grupo nuevo (nombre único "Grupo N"). Para sumar más
+// tiles al grupo: crea/selecciona otros tipos y escribe el mismo nombre en el campo "Grupo".
+void TileEditor::addNewGroup() {
+    const std::vector<std::string> existing = TileSet::instance().groupOrder();
+    std::string gname;
+    for (int n = 1; ; ++n) {                        // primer "Grupo N" que no exista
+        gname = "Grupo " + std::to_string(n);
+        if (std::find(existing.begin(), existing.end(), gname) == existing.end()) break;
+    }
+    TileTypeDef nd;
+    nd.name  = "Nuevo";
+    nd.group = gname;
+    m_selType = TileSet::instance().addType(nd);
+    std::snprintf(m_status, sizeof(m_status),
+                  "Grupo '%s' creado. Añade más tiles poniéndoles este mismo grupo.", gname.c_str());
 }
 
 // Borra el tipo seleccionado. El mapa guarda ÍNDICES, así que hay que remapear la copia de
@@ -348,48 +477,128 @@ void TileEditor::saveTileset() {
     }
 }
 
-void TileEditor::drawPalette(float top, int /*width*/, int /*height*/) {
+// Paleta del pincel (columna izquierda de "Pintar mapa"): clusterizada por grupos igual que
+// la lista de "Configurar tileset" (cabecera de grupo + miembros indentados; los sueltos al
+// final). El clic fija el tipo a pintar (m_activeType). Es solo una VISTA: no reordena m_types.
+void TileEditor::drawPalette(const FluentUI::Rect& r) {
     auto* c = FluentUI::GetContext();
-    if (!c) return;
+    if (!c || r.size.x <= 0.0f || r.size.y <= 0.0f) return;
     const FluentUI::Color text = FluentUI::Color::FromHex("#e6e8ec");
     const FluentUI::Color acc  = FluentUI::Color::FromHex("#4a9eff");
+    const FluentUI::Color head = FluentUI::Color::FromHex("#c8b06a");   // cabecera de grupo
 
-    const float px = 10.0f, py = top + 6.0f, sw = 22.0f, gap = 6.0f;
+    const float sw = 22.0f, gap = 6.0f, rowH = sw + gap, headH = 18.0f, spacer = 3.0f;
+    const float px = r.pos.x + 10.0f;                             // margen izquierdo del pane
     const float mx = c->input.MouseX(), my = c->input.MouseY();
     const bool  pressed = c->input.IsMousePressed(0);
+    const float vpTop = r.pos.y + 6.0f;                           // viewport de la paleta
+    const float vpBot = r.pos.y + r.size.y;
+    const float vpH   = std::max(0.0f, vpBot - vpTop);
+    const float vpR   = r.pos.x + r.size.x - 10.0f;               // borde derecho del pane
 
     const TileSet& ts    = TileSet::instance();
     void*          atlas = atlasHandle();   // miniaturas reales del PNG (o nullptr → color)
     const int      cols  = ts.columns(), rows = ts.rows();
-    for (int i = 0; i < ts.count(); ++i) {
-        const FluentUI::Vec2 pos(px, py + i * (sw + gap));
-        const TileProps& p = tileProps(static_cast<TileType>(i));
+    const std::vector<std::string> groups = ts.groupOrder();
+
+    // --- Altura total del contenido (para clamp del scroll): mismo criterio que drawTypeList,
+    //     respetando grupos plegados (compartidos con la lista de config).
+    auto membersOf = [&](const std::string& g) {
+        int n = 0; for (int i = 0; i < ts.count(); ++i) if (ts.at(i).group == g) ++n; return n;
+    };
+    int  looseCount = 0;
+    for (int i = 0; i < ts.count(); ++i) if (ts.at(i).group.empty()) ++looseCount;
+    const bool anyLoose = looseCount > 0;
+    float contentH = 0.0f;
+    for (const std::string& g : groups)
+        contentH += headH + (m_collapsedGroups.count(g) ? 0.0f : membersOf(g) * rowH) + spacer;
+    if (anyLoose && !groups.empty()) contentH += headH;
+    contentH += looseCount * rowH;
+
+    const bool  overVp    = mx >= r.pos.x && mx <= vpR && my >= vpTop && my <= vpBot;
+    const float maxScroll = std::max(0.0f, contentH - vpH);
+    if (overVp) { const float w = c->input.MouseWheelY(); if (w != 0.0f) m_paletteScroll -= w * 48.0f; }
+    m_paletteScroll = std::clamp(m_paletteScroll, 0.0f, maxScroll);
+
+    c->renderer.PushClipRect(FluentUI::Vec2(r.pos.x, vpTop),
+                             FluentUI::Vec2(vpR - r.pos.x, vpH));
+    float y = vpTop - m_paletteScroll;
+
+    // Dibuja una miniatura seleccionable (tile) en 'y' y avanza el cursor. 'indent' cuelga a
+    // los miembros de su cabecera de grupo. Se saltan las offscreen.
+    auto drawTile = [&](int i, float indent) {
+        const float ry = y;
+        y += rowH;
+        if (ry + sw < vpTop || ry > vpBot) return;
+        const FluentUI::Vec2 pos(px + indent, ry);
+        const TileTypeDef& d = ts.at(i);
         if (atlas) {
             FluentUI::Vec2 uv0, uv1;
-            cellUV(ts.at(i).cell, cols, rows, uv0, uv1);
+            cellUV(d.cell, cols, rows, uv0, uv1);
             c->renderer.DrawImage(pos, FluentUI::Vec2(sw, sw), atlas, uv0, uv1);
         } else {
             c->renderer.DrawRectFilled(pos, FluentUI::Vec2(sw, sw),
-                                       FluentUI::Color(p.color.x, p.color.y, p.color.z, 1.0f), 3.0f);
+                                       FluentUI::Color(d.color.x, d.color.y, d.color.z, 1.0f), 3.0f);
         }
         if (i == m_activeType)
             c->renderer.DrawRect(FluentUI::Vec2(pos.x - 2.0f, pos.y - 2.0f),
                                  FluentUI::Vec2(sw + 4.0f, sw + 4.0f), acc, 3.0f);
-        c->renderer.DrawText(FluentUI::Vec2(pos.x + sw + 8.0f, pos.y + 4.0f),
-                             ts.at(i).name.c_str(), text, 13.0f);
-
-        const bool over = mx >= pos.x && mx <= pos.x + 120.0f && my >= pos.y && my <= pos.y + sw;
+        c->renderer.DrawText(FluentUI::Vec2(pos.x + sw + 8.0f, pos.y + 4.0f), d.name.c_str(), text, 13.0f);
+        const bool over = overVp && mx >= px && mx <= vpR && my >= ry && my <= ry + sw;
         if (over && pressed) m_activeType = i;
+    };
+
+    // 1) Grupos: cabecera clicable (pliega/despliega, estado compartido con la config) +
+    //    miembros indentados (si no está plegado).
+    for (const std::string& g : groups) {
+        const float hy = y;
+        y += headH;
+        const bool collapsed = m_collapsedGroups.count(g) > 0;
+        if (!(hy + 16.0f < vpTop || hy > vpBot)) {
+            const std::string label = std::string(collapsed ? "> " : "v ") + g;
+            c->renderer.DrawText(FluentUI::Vec2(px, hy + 1.0f), label.c_str(), head, 12.0f);
+            const bool overHed = overVp && mx >= px && mx <= vpR && my >= hy && my <= hy + 16.0f;
+            if (overHed && pressed) {
+                if (collapsed) m_collapsedGroups.erase(g);
+                else           m_collapsedGroups.insert(g);
+            }
+        }
+        if (!collapsed)
+            for (int i = 0; i < ts.count(); ++i)
+                if (ts.at(i).group == g) drawTile(i, 10.0f);
+        y += spacer;
+    }
+
+    // 2) Tipos sueltos: cabecera "Sueltos" solo si además hay grupos.
+    if (anyLoose && !groups.empty()) {
+        const float hy = y;
+        y += headH;
+        if (!(hy + 16.0f < vpTop || hy > vpBot))
+            c->renderer.DrawText(FluentUI::Vec2(px, hy + 1.0f), "Sueltos", head, 12.0f);
+    }
+    for (int i = 0; i < ts.count(); ++i)
+        if (ts.at(i).group.empty()) drawTile(i, 0.0f);
+
+    c->renderer.PopClipRect();
+
+    if (maxScroll > 0.0f) {
+        const float barX = vpR - 4.0f;
+        c->renderer.DrawRectFilled(FluentUI::Vec2(barX, vpTop), FluentUI::Vec2(3.0f, vpH),
+                                   FluentUI::Color(1.0f, 1.0f, 1.0f, 0.06f), 1.5f);
+        const float thumbH = std::max(24.0f, vpH * vpH / contentH);
+        const float thumbY = vpTop + (m_paletteScroll / maxScroll) * (vpH - thumbH);
+        c->renderer.DrawRectFilled(FluentUI::Vec2(barX, thumbY), FluentUI::Vec2(3.0f, thumbH),
+                                   FluentUI::Color(1.0f, 1.0f, 1.0f, 0.22f), 1.5f);
     }
 }
 
-void TileEditor::drawCanvas(float top, int width, int height) {
+void TileEditor::drawCanvas(const FluentUI::Rect& r) {
     auto* c = FluentUI::GetContext();
     if (!c || m_map.width() <= 0 || m_map.height() <= 0) return;
 
-    const float x0 = 150.0f, y0 = top + 4.0f;
-    const float availW = static_cast<float>(width)  - x0 - 12.0f;
-    const float availH = static_cast<float>(height) - y0 - 32.0f;   // deja sitio a la statusbar
+    const float x0 = r.pos.x + 8.0f, y0 = r.pos.y + 4.0f;
+    const float availW = r.size.x - 16.0f;
+    const float availH = r.size.y - 8.0f;
     if (availW <= 0.0f || availH <= 0.0f) return;
     float ts = std::min(availW / m_map.width(), availH / m_map.height());
     if (ts < 4.0f) ts = 4.0f;
@@ -469,24 +678,63 @@ void TileEditor::drawCanvas(float top, int width, int height) {
 // Lista vertical de tipos (miniatura real del atlas + nombre + celda/flags). Clic
 // selecciona el tipo a configurar (m_selType). Es la columna izquierda de la pantalla
 // de tileset; el atlas de la derecha asigna la celda al tipo aquí seleccionado.
-void TileEditor::drawTypeList(float top, float x, float listW, int height) {
+void TileEditor::drawTypeList(const FluentUI::Rect& r) {
     auto* c = FluentUI::GetContext();
-    if (!c) return;
+    if (!c || r.size.x <= 0.0f || r.size.y <= 0.0f) return;
+    const float top   = r.pos.y;
+    const float x     = r.pos.x + 10.0f;
+    const float listW = std::max(0.0f, r.size.x - 26.0f);
     const FluentUI::Color text = FluentUI::Color::FromHex("#e6e8ec");
     const FluentUI::Color sub  = FluentUI::Color::FromHex("#9aa0a6");
     const FluentUI::Color acc  = FluentUI::Color::FromHex("#4a9eff");
+    const FluentUI::Color head  = FluentUI::Color::FromHex("#c8b06a");  // cabecera de grupo
+    const FluentUI::Color walk  = FluentUI::Color::FromHex("#7fc77f");  // chip "pisable"
+    const FluentUI::Color block = FluentUI::Color::FromHex("#e06a6a");  // chip "no pisable"
 
-    const float py = top + 6.0f, sw = 28.0f, gap = 10.0f;
+    const float sw = 28.0f, gap = 10.0f, rowH = sw + gap, headH = 22.0f, spacer = 4.0f;
     const float mx = c->input.MouseX(), my = c->input.MouseY();
     const bool  pressed = c->input.IsMousePressed(0);
+    const float vpTop = top + 6.0f;                                    // viewport de la lista
+    const float vpBot = r.pos.y + r.size.y;                       // borde inferior del pane
+    const float vpH   = std::max(0.0f, vpBot - vpTop);
+    const float vpR   = x + listW + 6.0f;                              // borde derecho del viewport
 
     const TileSet& ts    = TileSet::instance();
     void*          atlas = atlasHandle();
     const int      cols  = ts.columns(), rows = ts.rows();
-    for (int i = 0; i < ts.count(); ++i) {
-        const float ry = py + i * (sw + gap);
-        if (ry > height - 36.0f) break;                  // no invadir la statusbar
-        const FluentUI::Vec2 pos(x + 4.0f, ry);
+    const std::vector<std::string> groups = ts.groupOrder();
+
+    // --- Altura total del contenido (para clamp del scroll): cabecera + miembros (si no está
+    //     plegado) + respiro por grupo, más los sueltos. Es barato de recomputar cada frame.
+    auto membersOf = [&](const std::string& g) {
+        int n = 0; for (int i = 0; i < ts.count(); ++i) if (ts.at(i).group == g) ++n; return n;
+    };
+    int  looseCount = 0;
+    for (int i = 0; i < ts.count(); ++i) if (ts.at(i).group.empty()) ++looseCount;
+    const bool anyLoose = looseCount > 0;
+    float contentH = 0.0f;
+    for (const std::string& g : groups)
+        contentH += headH + (m_collapsedGroups.count(g) ? 0.0f : membersOf(g) * rowH) + spacer;
+    if (anyLoose && !groups.empty()) contentH += headH;
+    contentH += looseCount * rowH;
+
+    // --- Scroll con la rueda cuando el cursor está sobre el viewport de la lista. ---
+    const bool  overVp    = mx >= r.pos.x && mx <= vpR && my >= vpTop && my <= vpBot;
+    const float maxScroll = std::max(0.0f, contentH - vpH);
+    if (overVp) { const float w = c->input.MouseWheelY(); if (w != 0.0f) m_typeScroll -= w * 48.0f; }
+    m_typeScroll = std::clamp(m_typeScroll, 0.0f, maxScroll);
+
+    c->renderer.PushClipRect(FluentUI::Vec2(r.pos.x, vpTop),
+                             FluentUI::Vec2(vpR - r.pos.x, vpH));
+    float y = vpTop - m_typeScroll;   // y en PANTALLA del inicio del contenido (desplazado)
+
+    // Dibuja una fila de tipo (miniatura + nombre + celda/flags) en 'y' y avanza el cursor.
+    // 'indent' cuelga a los miembros de un grupo bajo su cabecera. Se saltan las offscreen.
+    auto drawTypeRow = [&](int i, float indent) {
+        const float ry = y;
+        y += rowH;
+        if (ry + sw < vpTop || ry > vpBot) return;    // fuera del viewport: no dibujar
+        const FluentUI::Vec2 pos(x + 4.0f + indent, ry);
         const TileTypeDef& d = ts.at(i);
         if (atlas) {
             FluentUI::Vec2 uv0, uv1;
@@ -506,31 +754,91 @@ void TileEditor::drawTypeList(float top, float x, float listW, int height) {
                       d.encounter ? "  -  hierba" : "");
         c->renderer.DrawText(FluentUI::Vec2(pos.x + sw + 10.0f, pos.y + 17.0f), info, sub, 11.0f);
 
-        const bool over = mx >= x && mx <= x + listW && my >= ry && my <= ry + sw;
+        const bool over = overVp && mx >= x && mx <= x + listW && my >= ry && my <= ry + sw;
         if (over && pressed) m_selType = i;
+    };
+
+    // 1) Grupos: cabecera clicable (pliega/despliega como dropdown) + chip de colisión + los
+    //    miembros indentados debajo (si no está plegado).
+    for (const std::string& g : groups) {
+        const float hy = y;
+        y += headH;
+        const bool collapsed = m_collapsedGroups.count(g) > 0;
+        if (!(hy + 20.0f < vpTop || hy > vpBot)) {    // cabecera visible
+            bool allWalk = true;                      // estado del chip = ¿todos pisables?
+            for (int i = 0; i < ts.count(); ++i)
+                if (ts.at(i).group == g && !ts.at(i).walkable) { allWalk = false; break; }
+
+            // Marcador de plegado (ASCII, seguro en el atlas de la fuente) + nombre del grupo.
+            const std::string label = std::string(collapsed ? "> " : "v ") + g;
+            c->renderer.DrawText(FluentUI::Vec2(x, hy + 2.0f), label.c_str(), head, 13.0f);
+
+            const char*           tag   = allWalk ? "pisable" : "no pisable";
+            const FluentUI::Color tcol  = allWalk ? walk : block;
+            const float           chipW = allWalk ? 58.0f : 76.0f;
+            const float           chipX = x + listW - chipW - 2.0f;
+            const FluentUI::Vec2  chipPos(chipX, hy);
+            c->renderer.DrawRectFilled(chipPos, FluentUI::Vec2(chipW, 18.0f),
+                                       FluentUI::Color(tcol.r, tcol.g, tcol.b, 0.12f), 4.0f);
+            c->renderer.DrawRect(chipPos, FluentUI::Vec2(chipW, 18.0f), tcol, 4.0f);
+            c->renderer.DrawText(FluentUI::Vec2(chipX + 8.0f, hy + 3.0f), tag, tcol, 11.0f);
+
+            // Clics: el chip fija "pisable" de todo el grupo; el resto de la cabecera pliega.
+            const bool overTag = overVp && mx >= chipX && mx <= chipX + chipW && my >= hy && my <= hy + 18.0f;
+            const bool overHed = overVp && mx >= x && mx < chipX - 6.0f && my >= hy && my <= hy + 18.0f;
+            if (pressed && overTag)      TileSet::instance().setGroupWalkable(g, !allWalk);
+            else if (pressed && overHed) {
+                if (collapsed) m_collapsedGroups.erase(g);
+                else           m_collapsedGroups.insert(g);
+            }
+        }
+        if (!collapsed)
+            for (int i = 0; i < ts.count(); ++i)
+                if (ts.at(i).group == g) drawTypeRow(i, 14.0f);
+        y += spacer;
+    }
+
+    // 2) Tipos sueltos: cabecera "Sueltos" solo si además hay grupos (si no, la lista es igual
+    //    que antes). Los sueltos no se pliegan.
+    if (anyLoose && !groups.empty()) {
+        const float hy = y;
+        y += headH;
+        if (!(hy + 20.0f < vpTop || hy > vpBot))
+            c->renderer.DrawText(FluentUI::Vec2(x, hy + 2.0f), "Sueltos", head, 13.0f);
+    }
+    for (int i = 0; i < ts.count(); ++i)
+        if (ts.at(i).group.empty()) drawTypeRow(i, 0.0f);
+
+    c->renderer.PopClipRect();
+
+    // Barra de scroll (indicador, sin arrastre): solo si el contenido no cabe.
+    if (maxScroll > 0.0f) {
+        const float barX = vpR - 4.0f;
+        c->renderer.DrawRectFilled(FluentUI::Vec2(barX, vpTop), FluentUI::Vec2(3.0f, vpH),
+                                   FluentUI::Color(1.0f, 1.0f, 1.0f, 0.06f), 1.5f);
+        const float thumbH = std::max(24.0f, vpH * vpH / contentH);
+        const float thumbY = vpTop + (m_typeScroll / maxScroll) * (vpH - thumbH);
+        c->renderer.DrawRectFilled(FluentUI::Vec2(barX, thumbY), FluentUI::Vec2(3.0f, thumbH),
+                                   FluentUI::Color(1.0f, 1.0f, 1.0f, 0.22f), 1.5f);
     }
 }
 
 // Atlas del tileset recortado en su rejilla (cols×rows). Clic en una celda = asignar
 // esa celda al tipo seleccionado (m_selType). Resalta la celda ya asignada. Es la
 // columna derecha de la pantalla de tileset.
-void TileEditor::drawAtlasPanel(float top, float x, int width, int height) {
+void TileEditor::drawAtlasPanel(const FluentUI::Rect& r) {
     auto* c = FluentUI::GetContext();
     if (!c) return;
     void*          atlas = atlasHandle();
     const TileSet& ts    = TileSet::instance();
     const int      cols  = ts.columns(), rows = ts.rows();
 
-    // Título: qué imagen es el atlas actual + su rejilla deducida.
-    char title[128];
-    std::snprintf(title, sizeof(title), "Imagen: %s   (%dx%d celdas)",
-                  baseName(ts.texture()).c_str(), cols, rows);
-    c->renderer.DrawText(FluentUI::Vec2(x, top + 4.0f), title,
-                         FluentUI::Color::FromHex("#e6e8ec"), 13.0f);
-
-    const float y0     = top + 26.0f;   // deja sitio al título
-    const float availW = static_cast<float>(width)  - x - 12.0f;
-    const float availH = static_cast<float>(height) - y0 - 32.0f;
+    // El título ("Imagen: … (NxM celdas)") y el selector de tamaño de tile los dibuja
+    // buildTilesetScreen como widgets en flujo; aquí solo va la rejilla del atlas.
+    const float x      = r.pos.x + 8.0f;
+    const float y0     = r.pos.y + 4.0f;
+    const float availW = r.size.x - 16.0f;
+    const float availH = r.size.y - 8.0f;
     if (availW <= 0.0f || availH <= 0.0f || cols < 1 || rows < 1) return;
 
     if (!atlas) {

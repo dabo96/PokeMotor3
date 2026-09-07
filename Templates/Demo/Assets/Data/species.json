@@ -1,6 +1,8 @@
 {
+  "_comment": "Especies. 'sprite' es la imagen que usa el combate; si se omite, el motor la deduce por convencion: Assets/Models/Sprites/<id a 3 digitos>.png. Hoy solo existe 001.png, por eso todas apuntan ahi: al anadir el arte real basta cambiar esta ruta (sin recompilar). Las claves que empiezan por '_' se ignoran al cargar.",
   "Charmander": {
     "id": 4,
+    "sprite": "Assets/Models/Sprites/001.png",
     "type1": "Fire",
     "baseStats": { "hp": 39, "attack": 52, "defense": 43, "spAttack": 60, "spDefense": 50, "speed": 65 },
     "learnset": [
@@ -17,6 +19,7 @@
   },
   "Charmeleon": {
     "id": 5,
+    "sprite": "Assets/Models/Sprites/001.png",
     "type1": "Fire",
     "baseStats": { "hp": 58, "attack": 64, "defense": 58, "spAttack": 80, "spDefense": 65, "speed": 80 },
     "learnset": [
@@ -33,6 +36,7 @@
   },
   "Bulbasaur": {
     "id": 1,
+    "sprite": "Assets/Models/Sprites/001.png",
     "type1": "Grass",
     "type2": "Poison",
     "baseStats": { "hp": 45, "attack": 49, "defense": 49, "spAttack": 65, "spDefense": 65, "speed": 45 },
@@ -50,6 +54,7 @@
   },
   "Ivysaur": {
     "id": 2,
+    "sprite": "Assets/Models/Sprites/001.png",
     "type1": "Grass",
     "type2": "Poison",
     "baseStats": { "hp": 60, "attack": 62, "defense": 63, "spAttack": 80, "spDefense": 80, "speed": 60 },
@@ -67,6 +72,7 @@
   },
   "Rattata": {
     "id": 19,
+    "sprite": "Assets/Models/Sprites/001.png",
     "type1": "Normal",
     "baseStats": { "hp": 30, "attack": 56, "defense": 35, "spAttack": 25, "spDefense": 35, "speed": 72 },
     "learnset": [
@@ -82,6 +88,7 @@
   },
   "Pidgey": {
     "id": 16,
+    "sprite": "Assets/Models/Sprites/001.png",
     "type1": "Normal",
     "type2": "Flying",
     "baseStats": { "hp": 40, "attack": 45, "defense": 40, "spAttack": 35, "spDefense": 35, "speed": 56 },

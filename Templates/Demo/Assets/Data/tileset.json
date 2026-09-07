@@ -1,5 +1,6 @@
 {
-  "texture": "Assets/Textures/tileset.png",
+  "_comment": "Sin imagen: los tiles se dibujan con el color de cada tipo. Asigna una en el editor de tiles (Configurar tileset → Cambiar imagen).",
+  "texture": "",
   "tileSize": 32,
   "types": [
     { "name": "Camino",      "cell": 0, "walkable": true,  "encounter": false, "color": [0.78, 0.71, 0.55, 1.0] },

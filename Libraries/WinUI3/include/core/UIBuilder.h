@@ -1,6 +1,7 @@
 #pragma once
 #include "Math/Vec2.h"
 #include "Math/Color.h"
+#include "Math/Rect.h"
 #include "UI/Layout.h"
 #include "Theme/Style.h"
 #include <string>
@@ -12,6 +13,29 @@ namespace FluentUI {
 
 // Forward declarations
 struct UIContext;
+// brief 14: MenuEntry defined in UI/Widgets.h. Forward declared so the
+// menuFlyout sugar compiles without pulling Widgets.h into this header.
+struct MenuEntry;
+// brief 19: responsive breakpoint enum (defined in UI/Widgets.h). Opaque enum
+// declaration (fixed underlying type int) so the sugar signatures below compile
+// without pulling the full Widgets.h into this header.
+enum class Breakpoint;
+// brief 15: severidad de InfoBar/Toast (definida en UI/FeedbackWidgets.h). Enum
+// opaco con tipo subyacente fijo para declarar las firmas de azúcar de feedback
+// sin incluir el header de widgets aquí.
+enum class InfoSeverity : int;
+// brief 16: collection types (defined in UI/Widgets.h).
+struct DataColumn;
+struct DataGridResult;
+// brief 13/14: app-shell + signature-control types (defined in UI/Widgets.h and
+// UI/NavigationWidgets.h). Forward declared so the sugar signatures below compile
+// without pulling the full headers in.
+struct CommandItem;
+struct NavItem;
+struct NavFrame;
+struct TitleBarResult;
+enum class NavDisplayMode;
+enum class DialogResult;
 
 class UIBuilder {
 public:
@@ -113,11 +137,27 @@ public:
     void contextMenu(const std::string& id, std::function<void(UIBuilder&)> content);
     void modal(const std::string& id, const std::string& title, bool* open,
                const Vec2& size, std::function<void(UIBuilder&)> content);
+    // brief 14: generic anchored popup. Open/close it with OpenFlyout/CloseFlyout;
+    // `content` is built only while the flyout is open.
+    void flyout(const std::string& id, const Rect& anchorRect,
+                std::function<void(UIBuilder&)> content);
+    void menuFlyout(const std::string& id, const Rect& anchorRect,
+                    const std::vector<MenuEntry>& entries);
 
     // --- Grid layout ---
     void grid(const std::string& id, int columns, int itemCount,
               std::function<void(UIBuilder&, int index)> cellContent,
               float rowHeight = 0.0f);
+
+    // --- Layout primitives (brief 19) ---
+    void wrapPanel(const std::string& id, std::function<void(UIBuilder&)> content,
+                   float hGap = 8.0f, float vGap = 8.0f);
+    void uniformGrid(const std::string& id, int columns, int itemCount,
+                     std::function<void(UIBuilder&, int index)> cellContent,
+                     float gap = 8.0f);
+    void canvas(const std::string& id, const Vec2& size,
+                std::function<void(UIBuilder&)> content);
+    void adaptiveLayout(std::function<void(UIBuilder&, Breakpoint)> build);
 
     // --- Table/DataGrid ---
     void table(const std::string& id, std::vector<struct TableColumn>& columns,
@@ -141,6 +181,15 @@ public:
     void setNextSize(float w, float h);
     void setNextConstraints(const LayoutConstraints& c);
 
+    // --- Feedback & estado (brief 15) ---
+    bool infoBar(const std::string& id, InfoSeverity severity,
+                 const std::string& title, const std::string& message,
+                 bool closable = true, const std::string& actionText = "");
+    void progressRing(const std::string& id, float size = 32.0f, float progress = -1.0f);
+    void badge(int count, bool dot = false, std::optional<Vec2> anchorTopRight = {});
+    void skeleton(const Vec2& size, float cornerRadius = 4.0f);
+    void skeletonText(int lines, float lineHeight = 16.0f, float lastLineFraction = 0.6f);
+
     // --- Style overrides (Phase 6) ---
     void pushStyle(const Style& override);
     void popStyle();
@@ -157,6 +206,94 @@ public:
     // --- DPI helpers (Phase 4) ---
     float dpiScale() const;
     float scaled(float value) const;  // Returns value * dpiScale
+
+    // ─── BRIEF 16: Collections (sugar) ──────────────────────────────────────
+    void gridView(const std::string& id, int itemCount, const Vec2& itemSize,
+                  std::function<void(UIBuilder&, int index)> itemBuilder,
+                  float gap = 8.0f, float minItemWidth = 0.0f);
+    DataGridResult dataGrid(const std::string& id, const std::vector<DataColumn>& cols,
+                            int rowCount,
+                            std::function<std::string(int row, int col)> getCell,
+                            std::function<void(int row, int col, const std::string&)> setCell);
+    int pagination(const std::string& id, int pageCount, int* currentPage = nullptr);
+    void expanderList(const std::string& id, int itemCount,
+                      std::function<std::string(int)> headerFn,
+                      std::function<void(UIBuilder&, int)> bodyFn,
+                      bool accordion = false);
+    int flipView(const std::string& id, int itemCount,
+                 std::function<void(UIBuilder&, int index)> itemBuilder,
+                 int* currentIndex = nullptr);
+
+    // ─── BRIEF 13: App shell & navegación (sugar) ──────────────────────────
+    /// NavigationView con modo y footer explícitos. @return key seleccionada.
+    std::string navigationView(const std::string& id,
+                               const std::vector<NavItem>& items,
+                               std::string* selectedKey, NavDisplayMode mode,
+                               const std::vector<NavItem>& footerItems);
+    /// Conveniencia: modo Expanded, sin footer.
+    std::string navigationView(const std::string& id,
+                               const std::vector<NavItem>& items,
+                               std::string* selectedKey);
+    void commandBar(const std::string& id,
+                    const std::vector<CommandItem>& primary,
+                    const std::vector<CommandItem>& secondary = {});
+    int breadcrumbBar(const std::string& id,
+                      const std::vector<std::string>& crumbs);
+    // Atajo del window-chrome (brief 30). `content` nullptr = barra básica (título
+    // + caption buttons); si pasas un callback, compones la barra tú mismo. Para
+    // configurar altura / desactivar caption buttons usa la función libre TitleBar().
+    TitleBarResult titleBar(const std::string& id, const std::string& title,
+                            uint32_t icon = 0,
+                            std::function<void()> content = nullptr);
+    // ─── BRIEF 14: Signature controls (sugar) ───────────────────────────────
+    bool toggleSwitch(const std::string& label, bool* value,
+                      const std::string& onText = "", const std::string& offText = "");
+    // Expander: builds `content` only while expanded (EndExpander handled here).
+    void expander(const std::string& id, const std::string& header,
+                  std::function<void(UIBuilder&)> content,
+                  uint32_t icon = 0, bool* expanded = nullptr);
+    int splitButton(const std::string& label, uint32_t icon,
+                    std::function<void()> onPrimary,
+                    const std::vector<CommandItem>& menu);
+    void dropDownButton(const std::string& label, uint32_t icon,
+                        const std::vector<CommandItem>& menu);
+    bool numberBox(const std::string& label, double* value,
+                   double min = -1e308, double max = 1e308, double step = 1.0,
+                   const char* format = "%.0f");
+    bool teachingTip(const std::string& id, const Rect& targetRect,
+                     const std::string& title, const std::string& body,
+                     const std::string& actionText = "");
+    DialogResult contentDialog(const std::string& id, bool* open,
+                               const std::string& title,
+                               std::function<void(UIBuilder&)> body,
+                               const std::string& primaryText = "OK",
+                               const std::string& secondaryText = "",
+                               const std::string& closeText = "Cancel");
+    bool rating(const std::string& id, int* value, int maxStars = 5,
+                bool allowHalf = false);
+
+    // ─── BRIEF 17: Texto y contenido rico (sugar) ───────────────────────────
+    void selectableText(const std::string& id, const std::string& text,
+                        float fontSize = 0, bool wrap = true);
+    bool hyperlink(const std::string& text, const std::string& url = "",
+                   float fontSize = 0);
+    std::string autoSuggestBox(const std::string& id, std::string* text,
+                               const std::function<std::vector<std::string>(const std::string&)>& suggestionsFn,
+                               const std::string& placeholder = "");
+    bool tokenizingTextBox(const std::string& id, std::vector<std::string>* tokens,
+                           const std::string& placeholder = "",
+                           const std::function<std::vector<std::string>(const std::string&)>& suggestionsFn = {});
+    bool passwordBox(const std::string& id, std::string* value,
+                     const std::string& placeholder = "");
+    void markdownView(const std::string& id, const std::string& markdown,
+                      float maxWidth = 0);
+
+    // --- Text quality tuning panel (briefs 35-A / 35-B / 35-C) ---
+    // Live controls for the text pipeline: gamma/contrast curve, subpixel AA and
+    // vertical grid fitting. Everything it changes is a uniform or a per-batch
+    // parameter, so moving a slider re-renders on the next frame WITHOUT any
+    // pipeline/shader recreation. Drop it into a debug page while calibrating.
+    void textQualityPanel();
 
     // --- Context access ---
     UIContext* context() { return ctx; }

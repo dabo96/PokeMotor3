@@ -3,19 +3,45 @@
 #include "Animation.h"
 #include "Math/Color.h"
 #include "Math/Vec2.h"
+#include "Math/Rect.h"
 #include "InputState.h"
 #include "Renderer.h"
 #include "RippleEffect.h"
 #include "core/WidgetTree.h"
 #include "core/DockSystem.h"
-#include <SDL3/SDL.h>
+#include "core/UIEvent.h" // WindowHandle (brief 20; no SDL in the public header)
 #include "Theme/Style.h"
 #include <map>
+#include <unordered_map>
+#include <memory>
 #include <functional>
 #include <cstdarg>
+#include <mutex>
 
 
 namespace FluentUI {
+
+class RenderBackend;
+struct SharedResourcePool;
+class PlatformBackend; // brief 26: platform seam reachable from widgets via GetPlatform(ctx)
+
+// ─── brief 13: regiones de hit-test de la TitleBar custom ─────────────────────
+// El widget TitleBar() (hilo de UI) publica aquí la zona arrastrable (caption) y
+// las exclusiones (caption buttons + contenido interactivo). El callback de
+// the platform hit-test registrado por FluentApp las lee — y ese callback puede
+// ejecutarse en el hilo de la cola de eventos del SO — de ahí el mutex. Las
+// coordenadas están en el espacio del viewport del renderer, que coincide con el
+// de the window size (= el de the hit-test `area`), así que el callback no
+// necesita convertir DPI. `active` se reinicia cada frame en NewFrame().
+struct TitleBarHitRegions {
+  std::mutex mutex;
+  bool active = false;          ///< Un TitleBar() se construyó este frame.
+  Rect caption;                 ///< Rect arrastrable (mover ventana).
+  std::vector<Rect> exclusions; ///< Sub-rects NO arrastrables dentro del caption.
+  std::vector<Rect> forcedDrag; ///< Sub-rects que fuerzan arrastre (anulan una exclusión).
+  float resizeBorder = 6.0f;    ///< Grosor (px) de los bordes de redimensión.
+  bool resizable = true;        ///< Habilita zonas RESIZE_* en los bordes.
+};
 
 // Logging system
 enum class LogLevel { Debug, Info, Warning, Error };
@@ -69,6 +95,62 @@ struct LayoutStack {
   // vertical layout. Reset on each layout pop. Auto-resets when another header
   // at the same level is rendered.
   float collapseIndent = 0.0f;
+  // brief 19 (WrapPanel): when true the layout flows children left→right like a
+  // horizontal layout (isVertical is false) but AdvanceCursor wraps to a new line
+  // when the next slot reaches the right edge. Orthogonal to isVertical; existing
+  // Vertical/Horizontal/Grid stacks leave this false so their behaviour is
+  // unchanged. The per-row bookkeeping lives in the parallel wrapStack entry.
+  bool isWrap = false;
+  // brief 18.5: captured from ctx->layoutDirection when this (horizontal) layout
+  // is pushed. When true, AdvanceCursor flows children right→left from the right
+  // edge of the container instead of left→right. Vertical layouts ignore it.
+  bool rtl = false;
+};
+
+// brief 19: per-WrapPanel bookkeeping, pushed/popped in lockstep with the
+// WrapPanel's LayoutStack (which has isWrap = true). AdvanceCursor reads/writes
+// the top entry when the current layout stack is a wrap layout.
+struct WrapFrameContext {
+  Vec2 origin{0.0f, 0.0f};   // container origin (cursor at BeginWrapPanel)
+  float left = 0.0f;         // left edge children wrap back to (contentStart.x)
+  float availWidth = 0.0f;   // usable content width before wrapping
+  float hGap = 8.0f;         // horizontal gap between items on a row
+  float vGap = 8.0f;         // vertical gap between rows
+  float rowHeight = 0.0f;    // tallest item in the current (open) row
+  float maxWidth = 0.0f;     // widest row reached so far (for final size)
+  float totalHeight = 0.0f;  // accumulated height of all rows incl. current
+  Vec2 savedCursor{0.0f, 0.0f};
+  Vec2 savedLastItemPos{0.0f, 0.0f};
+  Vec2 savedLastItemSize{0.0f, 0.0f};
+};
+
+// brief 19: per-UniformGrid bookkeeping. Cells share an identical width; each
+// cell receives a Fixed-width constraint and the cursor advances cell-by-cell,
+// wrapping every `columns` children. Height is auto (tallest item per row).
+struct UniformGridFrameContext {
+  Vec2 origin{0.0f, 0.0f};
+  int columns = 1;
+  float cellWidth = 0.0f;
+  float gap = 8.0f;
+  int currentCell = 0;
+  float rowHeight = 0.0f;    // tallest item in current row
+  float totalHeight = 0.0f;  // committed height of completed rows
+  Vec2 savedCursor{0.0f, 0.0f};
+  Vec2 savedLastItemPos{0.0f, 0.0f};
+  Vec2 savedLastItemSize{0.0f, 0.0f};
+};
+
+// brief 19: per-Canvas bookkeeping. Children are placed by explicit coordinates
+// (their pos param, resolved against the canvas origin) rather than the flow
+// cursor. A throwaway vertical LayoutStack is pushed so any AdvanceCursor calls
+// from children mutate it instead of the parent layout.
+struct CanvasFrameContext {
+  uint32_t id = 0;
+  Vec2 origin{0.0f, 0.0f};
+  Vec2 size{0.0f, 0.0f};
+  Vec2 savedCursor{0.0f, 0.0f};
+  Vec2 savedLastItemPos{0.0f, 0.0f};
+  Vec2 savedLastItemSize{0.0f, 0.0f};
 };
 
 struct TabContentFrame {
@@ -86,7 +168,7 @@ struct DragWidgetState {
   float dragStartValue = 0.0f;
   float dragStartMouseX = 0.0f;
   std::string editText;
-  uint64_t lastClickTime = 0;  // For double-click detection (SDL_GetTicks)
+  uint64_t lastClickTime = 0;  // For double-click detection (the OS timer)
   // Phase B4: drag threshold — small movements after mouse-down don't change the value.
   // Set to true once total mouse movement exceeds the threshold; cleared on release.
   bool dragThresholdPassed = false;
@@ -190,16 +272,42 @@ struct TableFrameContext {
   bool cellClipPushed = false;       // Whether TableSetCell has a pending clip to pop
 };
 
+// ─── brief 15 (Feedback): cola de toasts ──────────────────────────────────────
+// Instancia viva de un toast en la cola global del contexto. Definida aquí (y no
+// en UI/FeedbackWidgets.h) para que la cola sobreviva entre frames dentro de
+// UIContext. El struct no depende de FeedbackWidgets.h salvo InfoSeverity, que se
+// declara aquí como enum opaco (tipo completo: tamaño conocido = int) y se define
+// con sus enumeradores en UI/FeedbackWidgets.h. Gestionada por ShowToast() /
+// RenderToasts(). Ver brief 15.
+enum class InfoSeverity : int; // definición real (enumeradores) en UI/FeedbackWidgets.h
+struct ToastInstance {
+  uint64_t id = 0;                 // id único incremental (apilado/animación estable)
+  std::string title;
+  std::string message;
+  InfoSeverity severity{};         // value-init = Informational (0)
+  float durationSec = 4.0f;        // tiempo visible antes de auto-descartarse
+  std::string actionText;          // texto del botón de acción opcional
+  std::function<void()> onAction;  // callback al pulsar la acción
+  float age = 0.0f;                // tiempo visible acumulado (pausado por hover)
+  float enterAnim = 0.0f;          // 0→1 progreso de entrada (fade/slide; sin brief 10)
+  float exitAnim = 1.0f;           // 1→0 progreso de salida (fade) tras descartarse
+  bool dismissed = false;          // marcado para salir (por tiempo, acción o cierre)
+};
+
 struct UIContext {
   Renderer renderer;
-  // Backend que dibuja ESTE contexto. Lo crea Create*Context y lo libera
-  // Destroy*Context. GetBackend() devuelve el backend del contexto ACTUAL, para que
-  // varias ventanas (cada una con su propio contexto) no compartan un backend global.
-  RenderBackend* backend = nullptr;
   InputState input;
   Style style;
-  SDL_Window *window =
-      nullptr; // Referencia a la ventana para obtener posición del mouse
+  WindowHandle window =
+      nullptr; // Ventana (handle opaco; cast a native window handle en el .cpp de plataforma)
+
+  // brief 08: the render backend this context renders with (so multi-window code
+  // can extract the shared GL context / Vulkan shared device from a parent ctx).
+  RenderBackend *backend = nullptr;
+  // brief 08 Part C: per-device shared resource pool. The main context owns it;
+  // secondary windows reference it (not owned). null when not shared.
+  SharedResourcePool *sharedResources = nullptr;
+  bool ownsSharedResources = false; // true only for the device-owner context
 
   // Sistema de callbacks y eventos
   using WidgetCallback = std::function<void()>;
@@ -225,22 +333,75 @@ struct UIContext {
   Vec2 lastItemPos{0.0f, 0.0f};
   Vec2 lastItemSize{0.0f, 0.0f};
 
+  // ─── brief 15 (Feedback): cola global de toasts ────────────────────────────
+  // Encolada por ShowToast() y consumida/renderizada por RenderToasts() (una vez
+  // por frame, capa Overlay). Vive aquí para persistir el estado de animación y
+  // el temporizador de auto-descarte entre frames. Ver ToastInstance (arriba).
+  std::vector<ToastInstance> toasts;
+  uint64_t nextToastId = 1;
+
   bool initialized = false;
 
-  // Sistema de animaciones para widgets
-  std::unordered_map<uint32_t, AnimatedValue<Color>> colorAnimations;
-  std::unordered_map<uint32_t, AnimatedValue<float>> floatAnimations;
+  // brief 22 (fase 2): los antiguos mapas paralelos colorAnimations/floatAnimations
+  // se fundieron en WidgetState.colorAnim[]/floatAnim[] (ver GetWidgetState).
+  // brief 22 (fase 9): en la práctica solo floatAnim[0] se usa (StaggeredAppear) y lo
+  // conduce activeFloatAnimIds; colorAnim[] quedó sin usuarios y su driver/vector se
+  // retiró (los campos del struct se conservan como reserva, ver WidgetState).
 
-  // Perf 2.2: Track active animation IDs to avoid iterating all entries
-  std::vector<uint32_t> activeColorAnimIds;
+  // brief 10 Part B: global motion tokens (durationScale / reduceMotion / enabled).
+  // Read via the free function MotionDuration(). Hosts can mutate it at runtime
+  // (e.g. honor the OS "reduce animations" preference — see InitMotionFromOS()).
+  MotionConfig motion;
+
+  // brief 10 Part C: spring-based interactive animations (interruptible).
+  // brief 22 (fase 2): fundidos en WidgetState.springColor[] (button bg/fg/border
+  // ocupan springColor[0..2]); los conduce activeSpringColorIds (raw widget ids; el
+  // driver recorre los 4 slots del WidgetState hallado).
+  // brief 22 (fase 9): springFloat[] quedó sin usuarios y su driver/vector se retiró
+  // (los campos del struct se conservan como reserva, ver WidgetState).
+
+  // brief 10 Part D: presence tracker for managed overlays (enter/exit fade+scale).
+  // Immediate-mode can't observe "stopped emitting" from inside NewFrame (the next
+  // build hasn't run yet), so instead of inferring it from the retained tree's grace
+  // period, the overlay system drives it explicitly: it calls BeginPresence(id,
+  // active=open) EVERY frame. enterT animates 0→1 on appear and 1→0 on exit; the
+  // entry self-erases once it has fully faded out. See BeginPresence() below.
+  struct PresenceState {
+    AnimatedValue<float> enterT{0.0f}; // 0=hidden, 1=shown
+    bool everActive = false;
+    bool exiting = false;
+  };
+  // brief 22 (fase 2): presenceStates fundido en WidgetState.presence. BeginPresence
+  // usa GetWidgetState(id).presence; el "no existe entrada" se emula con
+  // presence.everActive==false y el erase con reset a PresenceState{}.
+
+  // brief 10 Part E: FLIP (First-Last-Invert-Play) layout animation state, keyed by
+  // a stable per-item id. prevPos is the item's last on-screen position; when it
+  // moves, `offset` is nudged by the delta and springs back to 0 so the item slides.
+  // Opt-in & explicit: a list/container that wants animated reordering calls
+  // LayoutFlipOffset(id, newPos) and adds the returned offset to its draw position.
+  struct FlipState {
+    Vec2 prevPos{0.0f, 0.0f};
+    bool valid = false;
+    SpringValue<Vec2> offset;
+  };
+  // brief 22 (fase 2): flipStates fundido en WidgetState.flip. LayoutFlipOffset usa
+  // GetWidgetState(id).flip.
+
+  // Perf 2.2: Track active animation IDs to avoid iterating all entries.
+  // brief 22 (fase 9): se retiraron activeColorAnimIds y activeSpringFloatIds (y sus
+  // Notify*): quedaron huérfanos tras la migración fases 2-8 (ningún widget usa
+  // WidgetState.colorAnim[]/springFloat[] ni notificaba esos ids). Sobreviven los
+  // tres vectores que SÍ se pueblan/usan: floatAnim (StaggeredAppear), springColor
+  // (Button bg/fg/border) y ripple (Button.AddRipple; su Notify sigue disponible).
   std::vector<uint32_t> activeFloatAnimIds;
   std::vector<uint32_t> activeRippleIds;
+  // brief 10 Part C: active spring ids (parallel to the tween vectors above).
+  std::vector<uint32_t> activeSpringColorIds;
+  // brief 35 Part A: ids con algún springFloat[] activo (driver en Context.cpp).
+  std::vector<uint32_t> activeSpringFloatIds;
 
   // Perf 2.2: Notify that an animation became active
-  void NotifyColorAnimActive(uint32_t id) {
-    for (auto aid : activeColorAnimIds) if (aid == id) return;
-    activeColorAnimIds.push_back(id);
-  }
   void NotifyFloatAnimActive(uint32_t id) {
     for (auto aid : activeFloatAnimIds) if (aid == id) return;
     activeFloatAnimIds.push_back(id);
@@ -249,11 +410,29 @@ struct UIContext {
     for (auto aid : activeRippleIds) if (aid == id) return;
     activeRippleIds.push_back(id);
   }
+  // brief 10 Part C: notify that a spring became active this frame.
+  void NotifySpringColorActive(uint32_t id) {
+    for (auto aid : activeSpringColorIds) if (aid == id) return;
+    activeSpringColorIds.push_back(id);
+  }
+  // brief 35 Part A: driver de springFloat[] reactivado (se retiró en brief 22
+  // fase 9 por quedar sin usuarios). Necesario para todo float animado no-color
+  // (thumb de ToggleSwitch/Slider, progreso de Checkbox, indicador deslizante,
+  // ProgressBar, etc.). Mismo patrón swap-pop que activeSpringColorIds.
+  void NotifySpringFloatActive(uint32_t id) {
+    for (auto aid : activeSpringFloatIds) if (aid == id) return;
+    activeSpringFloatIds.push_back(id);
+  }
+
+  // brief 10 Part G: true when any CPU-side animation is still running, so the host
+  // loop can block on events (idle) instead of spinning. Union of the five active
+  // vectors plus the retained tree's animation flag. Defined in Context.cpp.
+  bool AnyAnimationActive() const;
 
   // Sistema de ripple effects
-  std::unordered_map<uint32_t, RippleEffect> rippleEffects;
+  // brief 22 (fase 2): rippleEffects fundido en WidgetState.ripple (raw widget id).
 
-  std::unordered_map<uint32_t, bool> boolStates;
+  // brief 22 (fase 3): estado bool primitivo fundido en WidgetState.boolVal (raw widget id).
   // Id del único ComboBox que puede estar abierto a la vez (0 = ninguno). Al
   // abrir uno se cierra cualquier otro automáticamente.
   uint32_t openComboId = 0;
@@ -273,20 +452,19 @@ struct UIContext {
   uint32_t openMenuId = 0;
   Vec2 openMenuDropdownPos;
   Vec2 openMenuDropdownSize;
-  std::unordered_map<uint32_t, float> floatStates;
-  std::unordered_map<uint32_t, int> intStates;
-  std::unordered_map<uint32_t, std::string> stringStates;
-  std::unordered_map<uint32_t, size_t> caretPositions;
-  std::unordered_map<uint32_t, size_t> selectionAnchors; // Selection anchor (start of selection)
-  std::unordered_map<uint32_t, float> textScrollOffsets;
+  // brief 22 (fase 3): estados float/int/string primitivos fundidos en
+  // WidgetState.floatVal/intVal/stringVal (raw widget id).
+  // brief 22 (fase 4): caretPositions/selectionAnchors/textScrollOffsets fundidos
+  // en WidgetState.text->{caret,anchor,scrollOffset} (ver GetTextState).
 
   // Per-TextInput multi-click tracking (double/triple-click word/line selection)
+  // brief 22 (fase 4): la instancia por-widget vive en TextEditState::clickInfo;
+  // el struct se conserva aquí porque TextEditState lo referencia por valor.
   struct TextClickInfo {
-    uint64_t lastClickTime = 0;  // SDL_GetTicks of last click
+    uint64_t lastClickTime = 0;  // the OS timer of last click
     Vec2 lastClickPos{0, 0};
     int clickCount = 0;          // 1 = single, 2 = double, 3 = triple
   };
-  std::unordered_map<uint32_t, TextClickInfo> textClickInfo;
 
   // Pending callback for the next TextInput call (consumed once).
   // Use std::any-like opaque pointer to avoid pulling Widgets.h here.
@@ -316,7 +494,8 @@ struct UIContext {
       redoStack.clear();
     }
   };
-  std::unordered_map<uint32_t, TextUndoState> textUndoStates;
+  // brief 22 (fase 4): la pila undo/redo por-widget vive en TextEditState::undo;
+  // el struct se conserva aquí porque TextEditState lo referencia por valor.
 
   struct PanelState {
     Vec2 position{0.0f, 0.0f};
@@ -348,7 +527,7 @@ struct UIContext {
     float dragStartScroll = 0.0f;
   };
 
-  std::unordered_map<uint32_t, PanelState> panelStates;
+  // brief 22 (fase 5): panelStates migrado a widgetStates (ws.panel) — GetPanelState(id).
 
   struct ScrollViewState {
     Vec2 scrollOffset{0.0f, 0.0f};
@@ -366,7 +545,7 @@ struct UIContext {
                                // restaurar cursor)
   };
 
-  std::unordered_map<uint32_t, ScrollViewState> scrollViewStates;
+  // brief 22 (fase 5): scrollViewStates migrado a widgetStates (ws.scroll) — GetScrollState(id).
 
   struct TabViewState {
     int activeTab = 0;
@@ -386,7 +565,7 @@ struct UIContext {
     float totalTabsWidth = 0.0f;  // Total width of all tabs (calculated each frame)
   };
 
-  std::unordered_map<uint32_t, TabViewState> tabViewStates;
+  // brief 22 (fase 5): tabViewStates migrado a widgetStates (ws.tabs) — GetTabState(id).
 
   struct TooltipState {
     std::string text;
@@ -411,7 +590,7 @@ struct UIContext {
     std::vector<Renderer::ClipRect> savedClipStack;
   };
 
-  std::unordered_map<uint32_t, ModalState> modalStates;
+  // brief 22 (fase 6): modalStates fundido en widgetStates (ws.modal) — GetModalState(id).
   std::vector<uint32_t> modalStack;  // Track active modal IDs for EndModal
   uint32_t activeModalId = 0; // Modal abierto (0 = ninguno): bloquea el fondo
   bool insideModal = false;   // true entre BeginModal/EndModal (contenido exento)
@@ -431,9 +610,40 @@ struct UIContext {
     size_t savedLayoutStackSize = 0;
   };
 
-  std::unordered_map<uint32_t, ContextMenuState> contextMenuStates;
+  // brief 22 (fase 6): contextMenuStates fundido en widgetStates (ws.ctxMenu) — GetCtxMenuState(id).
   uint32_t activeContextMenuId = 0; // ID del context menu activo
   bool insideContextMenu = false;  // true entre BeginContextMenu/EndContextMenu
+
+  // === Flyout state (brief 14) ===
+  // Estado del Flyout genérico (popup anclado con contenido arbitrario). v1
+  // single-open como ComboBox: solo uno abierto a la vez (activeFlyoutId).
+  struct FlyoutState {
+    bool open = false;
+    Vec2 position{0.0f, 0.0f};      // Top-left dibujado en pantalla (frame anterior)
+    Vec2 measuredSize{0.0f, 0.0f};  // Tamaño total de la card medido el frame anterior
+    Rect anchor;                    // anchorRect del último BeginFlyout
+    // Estado del padre guardado para restaurar en EndFlyout.
+    Vec2 savedCursorPos{0.0f, 0.0f};
+    Vec2 savedLastItemPos{0.0f, 0.0f};
+    Vec2 savedLastItemSize{0.0f, 0.0f};
+    std::vector<Renderer::ClipRect> savedClipStack;
+    size_t savedLayoutStackSize = 0;
+  };
+  // brief 22 (fase 6): flyoutStates fundido en widgetStates (ws.flyout) — GetFlyoutState(id).
+  uint32_t activeFlyoutId = 0;   // Flyout abierto (0 = ninguno): captura input
+  // Bugfix: id del scope Begin/EndFlyout en curso, independiente de activeFlyoutId.
+  // CloseFlyout() puede poner activeFlyoutId=0 DENTRO del scope (al elegir una fila /
+  // dismiss), así que EndFlyout debe desenrollar (restaurar clip/opacity/layout) según
+  // este campo, no según activeFlyoutId, o si no la UI queda recortada a nada.
+  uint32_t flyoutScopeId = 0;
+  bool insideFlyout = false;     // true entre BeginFlyout/EndFlyout (contenido exento)
+  // Bugfix: un flyout que se abre (transición cerrado→abierto) puede colocarse BAJO
+  // el cursor (p.ej. el TeachingTip se recorta sobre su ancla). Como los botones
+  // disparan en el flanco de mouse-down (IsMousePressed), el MISMO click que lo abre
+  // se filtraría a un control del flyout dibujado bajo el ratón y lo cerraría al
+  // instante. Este flag (sólo el frame de apertura) traga ese click para el contenido
+  // del flyout. Se pone en OpenFlyout y se limpia al inicio de cada frame (NewFrame).
+  bool flyoutOpenedThisFrame = false;
 
   struct ListViewState {
     int selectedItem = -1;
@@ -452,7 +662,7 @@ struct UIContext {
     std::vector<int> selectedItems;
   };
 
-  std::unordered_map<uint32_t, ListViewState> listViewStates;
+  // brief 22 (fase 7): listViewStates migrado a widgetStates (ws.list) — GetListState(id).
 
   struct TreeViewState {
     Vec2 itemSize{0.0f, 24.0f};
@@ -473,15 +683,16 @@ struct UIContext {
     float dragStartScroll = 0.0f;
   };
 
-  std::unordered_map<uint32_t, TreeViewState> treeViewStates;
+  // brief 22 (fase 7): treeViewStates migrado a widgetStates (ws.tree) — GetTreeState(id).
   std::unordered_map<std::string, bool> treeNodeStates; // Map id -> isOpen
+  // brief 22 (fase 7): treeNodeStates SE QUEDA — su clave es std::string
+  // (TREENODE:<treeId>:<id>), no uint32_t, así que no cabe en WidgetState.
 
-  // Phase C5: per-tree visit order and selection anchor for range-select.
-  std::unordered_map<uint32_t, std::vector<int>> treeVisitOrder;
-  std::unordered_map<uint32_t, int> treeLastSelectedId;
+  // Phase C5 / brief 22 (fase 7): el orden de visita DFS y el ancla de selección
+  // de rango viven ahora en WidgetState.treeVisitOrder / .treeLastSelectedId
+  // (ver GetWidgetState).
 
-  // DragFloat / DragInt widget state
-  std::unordered_map<uint32_t, DragWidgetState> dragStates;
+  // brief 22 (fase 8): dragStates migrado a widgetStates (ws.drag) — GetDragState(id).
 
   struct SplitterState {
     float ratio = 0.5f;
@@ -505,9 +716,8 @@ struct UIContext {
     bool eyedropperActive = false;
   };
 
-  std::unordered_map<uint32_t, ColorPickerState> colorPickerStates;
-
-  std::unordered_map<uint32_t, SplitterState> splitterStates;
+  // brief 22 (fase 8): colorPickerStates/splitterStates migrados a widgetStates
+  // (ws.colorPicker / ws.splitter) — GetColorPickerState(id) / GetSplitterState(id).
 
   struct SplitterFrameContext {
     uint32_t id;
@@ -552,6 +762,10 @@ struct UIContext {
   };
 
   MenuBarState menuBarState;
+  // Vertical offset for the top menu bar. Default 0 keeps it pinned to the top;
+  // hosts that draw a custom TitleBar() above the menu bar set this to the title
+  // bar height so BeginMenuBar() lays out just below it (see examples/App).
+  float menuBarOffsetY = 0.0f;
 
   struct MenuState {
     std::string id;
@@ -564,7 +778,7 @@ struct UIContext {
     bool initialized = false;
   };
 
-  std::unordered_map<uint32_t, MenuState> menuStates;
+  // brief 22 (fase 6): menuStates fundido en widgetStates (ws.menu) — GetMenuState(id).
   uint32_t activeMenuId = 0; // ID del menú desplegable activo
 
   // Issue 12: Smart text cache with last-access tracking
@@ -610,6 +824,21 @@ struct UIContext {
   std::vector<LayoutStack> layoutStack;
   std::vector<Vec2> offsetStack;
   std::vector<TabContentFrame> tabFrameStack;
+
+  // brief 19: layout-primitive stacks (parallel bookkeeping for WrapPanel /
+  // UniformGrid / Canvas). Each is pushed in its Begin* and popped in End*.
+  std::vector<WrapFrameContext> wrapStack;
+  std::vector<UniformGridFrameContext> uniformGridStack;
+  std::vector<CanvasFrameContext> canvasStack;
+
+  // brief 21: ID scope stack. Each entry is a seed hash derived from the enclosing
+  // scope + a discriminant (container id / item index / pointer). GenerateId mixes
+  // the top-of-stack seed with the local label hash so duplicate labels in
+  // different scopes no longer collide in widget state. With the stack empty the
+  // seed is the djb2 base (5381) -> byte-identical IDs to pre-brief-21 behaviour,
+  // so persisted per-frame state is preserved.
+  std::vector<uint32_t> idStack;
+  uint32_t CurrentIdSeed() const { return idStack.empty() ? 5381u : idStack.back(); }
 
   // Deferred rendering for Menu dropdowns (to ensure they appear on top)
   struct DeferredMenuItem {
@@ -671,16 +900,21 @@ struct UIContext {
   std::vector<DeferredMenuItem> currentMenuItems;
 
   // ComboBox change tracking (deferred dropdowns notify change next frame)
-  std::unordered_map<uint32_t, bool> comboBoxChanged;
+  // brief 22 (fase 3): flag de cambio fundido en WidgetState.comboChanged (raw widget id).
 
   bool anyTooltipHoveredThisFrame = false;
 
   // Mouse cursor management
+  // Cursor id order MUST match PlatformBackend::SetCursor's neutral mapping.
   enum class CursorType { Arrow, IBeam, Hand, ResizeH, ResizeV, ResizeNESW, ResizeNWSE };
   CursorType desiredCursor = CursorType::Arrow;
   CursorType currentCursor = CursorType::Arrow;
-  SDL_Cursor* systemCursors[7] = {};
-  bool cursorsInitialized = false;
+
+  // brief 26 de-SDL: the platform this context is driven by (set by FluentApp; the
+  // owned window's SDLPlatform, or a host's NullPlatform). Widgets reach OS services
+  // through GetPlatform(ctx), which falls back to a shared NullPlatform when unset
+  // (headless tests) so a null platform never crashes the UI.
+  PlatformBackend* platform = nullptr;
 
   // Scroll consumed flag - reset each frame in NewFrame()
   bool scrollConsumedThisFrame = false;
@@ -689,13 +923,23 @@ struct UIContext {
   bool mouseOverAnyWidget = false;           // Set by IsMouseOver during current frame's widget rendering
   bool mouseOverAnyWidgetLastFrame = false;  // Previous frame's value, safe to query during event processing
 
-  // GC for state maps — Issue 11: amortized rotation
-  std::unordered_map<uint32_t, uint32_t> lastSeenFrame;
-  static constexpr uint32_t GC_MAP_COUNT = 13;     // Total maps to GC
-  static constexpr uint32_t GC_ROTATE_INTERVAL = 10; // GC one map every N frames
-  uint32_t gcMapIndex = 0;                           // Current map being GC'd
+  // GC del estado por-widget. brief 22 (fase 9): retirado el GC rotatorio amortizado
+  // (con sus 13→0 mapas paralelos), el mapa lastSeenFrame, GC_MAP_COUNT y gcMapIndex.
+  // El único GC es ahora el del mapa unificado widgetStates (NewFrame): recorre las
+  // entradas cada GC_ROTATE_INTERVAL frames y borra las no vistas en ese ventana de
+  // retención (GetWidgetState refresca WidgetState.lastFrameSeen). El valor 10 iguala
+  // el viejo threshold GC_MAP_COUNT(1) * GC_ROTATE_INTERVAL(10), sin cambio de retención.
+  static constexpr uint32_t GC_ROTATE_INTERVAL = 10; // cadencia + ventana de retención (frames)
 
   uint32_t lastGeneratedId = 0;
+
+  // Nº de secuencia por frame para widgets SIN identidad propia (sin label ni id de
+  // usuario) que aun así necesitan estado persistente. Se resetea en NewFrame, así
+  // que la n-ésima llamada del frame recibe siempre el mismo id mientras el orden de
+  // construcción no cambie. Lo usa Badge(): antes derivaba su estado de
+  // lastGeneratedId, que NO cambia entre badges consecutivos (los widgets a los que
+  // se anclan no generan id), así que varios badges compartían un mismo estado.
+  uint32_t anonWidgetSeq = 0;
 
   // --- Performance counters (Phase C) ---
   PerformanceCounters perfCounters;
@@ -750,6 +994,66 @@ struct UIContext {
   // --- DPI Scaling (Phase 4) ---
   float dpiScale = 1.0f;  // Display scale factor (1.0 = 100%, 1.5 = 150%, 2.0 = 200%)
 
+  // ======================================================================
+  // === brief 18 — OS integration (drag-drop, IME, RTL) ==================
+  // ======================================================================
+
+  // brief 18.7: OS drag-and-drop sinks. When the OS drops files or text on this
+  // window, FluentApp dispatches them here (per-window, since each context owns
+  // its own InputState). dropPos is in window coordinates (same space as the
+  // mouse / widget rects). Wire these from app code to react to dropped paths.
+  std::function<void(const std::vector<std::string>&, Vec2)> onFilesDropped;
+  std::function<void(const std::string&, Vec2)> onTextDropped;
+
+  // brief 18.4: per-field IME ownership. The text field that currently holds the
+  // caret claims IME each frame so OS text-input start/stop and the
+  // candidate-window area (the IME area) follow focus instead of being
+  // globally on. 0 = no field owns IME. See EnsureTextInputFocus().
+  uint32_t imeOwnerId = 0;
+
+  // brief 18.5: layout direction. RTL mirrors horizontal containers' X axis,
+  // default text alignment and directional icons. Mirror via IsRTL().
+  enum class LayoutDirection : uint8_t { LTR, RTL };
+  LayoutDirection layoutDirection = LayoutDirection::LTR;
+  bool IsRTL() const { return layoutDirection == LayoutDirection::RTL; }
+
+  // brief 13: zonas de hit-test publicadas por TitleBar() y leídas por el callback
+  // de the platform hit-test (ver TitleBarHitRegions arriba). active se limpia en
+  // NewFrame y lo re-fija el widget cada frame.
+  TitleBarHitRegions titleBarHit;
+
+  // brief 30: captura activa solo dentro del `content` de una TitleBar componible.
+  // SetLastItem() apila aquí el bbox de cada widget cuando active==true; al cerrar,
+  // TitleBar() cruza esos ids con focusableWidgets[focusStart..] para excluir del
+  // arrastre solo los interactivos (labels/iconos y huecos quedan arrastrables).
+  struct TitleBarCapture {
+    bool active = false;
+    uint32_t id = 0;                               ///< id de la titlebar (clave del cache de spacers).
+    size_t focusStart = 0;                         ///< focusableWidgets.size() al abrir el content.
+    std::vector<std::pair<uint32_t, Rect>> items;  ///< (id, bbox) de cada SetLastItem en scope.
+    std::vector<Rect> manualExclude, manualDrag;   ///< de TitleBarDragExclude / TitleBarDragRegion.
+    float contentStartX = 0.0f, contentRight = 0.0f; ///< límites horizontales del área de contenido.
+    int   spacerCount = 0;                         ///< nº de TitleBarSpacer() este frame.
+    float flexAdded = 0.0f;                        ///< px flexibles inyectados por los spacers este frame.
+  };
+  TitleBarCapture titleBarCapture;
+
+  // brief 32: captura genérica de rects de widgets interactivos dentro de un
+  // scope (mismo mecanismo que TitleBarCapture pero reutilizable). La usa la Card
+  // clicable para auto-excluir de su activación los botones/toggles internos: al
+  // cerrar, se cruzan los ids capturados con focusableWidgets[focusStart..] para
+  // quedarse solo con los interactivos. SetLastItem apila aquí cuando active==true
+  // (coste cero fuera de un scope). Guardar/restaurar permite anidamiento.
+  struct InteractiveCapture {
+    bool active = false;
+    size_t focusStart = 0;                         ///< focusableWidgets.size() al abrir.
+    std::vector<std::pair<uint32_t, Rect>> items;  ///< (id, bbox) de cada SetLastItem en scope.
+  };
+  InteractiveCapture interactiveCapture;
+  // Cache por-titlebar para el spacer flexible (medición con 1 frame de retardo):
+  // id -> (ancho natural del contenido sin flex, nº de spacers).
+  std::unordered_map<uint32_t, std::pair<float, int>> titleBarSpacerCache;
+
   // --- Phase B1: Last item published state ---
   // Each widget that returns a bool (button, textInput, slider, drag, checkbox, etc.)
   // publishes its state into lastItem before returning. The free functions IsItemActivated /
@@ -768,9 +1072,8 @@ struct UIContext {
     bool deactivatedAfterEdit = false; // Deactivated AND edits happened during the active span
   };
   LastItemData lastItem;
-  // Internal tracking: id → was-active-last-frame, plus edited-since-activation flag.
-  std::unordered_map<uint32_t, bool> prevActiveItems;     // id → active last frame
-  std::unordered_map<uint32_t, bool> editedSinceActivate; // id → edits seen during current active span
+  // brief 22 (fase 8): prevActiveItems/editedSinceActivate migrados a WidgetState
+  // (ws.prevActive / ws.editedSinceActivate) — ver SetLastItem en Context.cpp.
 
   // Global statics moved from Widgets.cpp
   int treeViewDepth = 0;
@@ -783,33 +1086,131 @@ struct UIContext {
   std::vector<size_t> menuItemStartIndexStack;
 
   // Table/DataGrid state
-  std::unordered_map<uint32_t, TableInternalState> tableStates;
+  // brief 22 (fase 7): tableStates migrado a widgetStates (ws.table) — GetTableState(id).
   std::vector<TableFrameContext> tableStack;
+
+  // ─── brief 22: estado unificado por-widget (FASE 1, aditiva) ────────────────
+  // Objetivo del brief 22 (Opción B): fundir los ~35 mapas paralelos
+  // unordered_map<uint32_t,X> en UN solo unordered_map<uint32_t, WidgetState>.
+  // Esta fase 1 SOLO añade la infraestructura: el struct, el mapa (que queda
+  // vacío hasta las fases 2-8) y los accesores. Los mapas viejos y el GC
+  // rotatorio siguen intactos; cero cambio de comportamiento. Se define aquí,
+  // al final de UIContext, para que TODOS los sub-structs que referencia por
+  // valor / unique_ptr (PanelState … TableInternalState, PresenceState,
+  // FlipState, TextClickInfo, TextUndoState) ya sean tipos completos.
+
+  // Estado de edición de texto (se materializa en la fase 4). El centinela de
+  // `anchor` ("sin selección") es SIZE_MAX — idéntico al que usa hoy
+  // selectionAnchors (ver InputWidgets.cpp: try_emplace(id, SIZE_MAX)).
+  struct TextEditState {
+    size_t caret = 0;
+    size_t anchor = SIZE_MAX;   // "sin selección" (== centinela de selectionAnchors)
+    float scrollOffset = 0.0f;
+    TextClickInfo clickInfo;    // multi-click (double/triple) tracking
+    TextUndoState undo;         // pilas undo/redo
+  };
+
+  // Estado unificado de un widget. Los sub-estados pesados son lazy (unique_ptr
+  // null hasta que se usan) para no inflar cada entrada. Los arrays de animación
+  // tienen 4 slots porque AnimSlot(id, slot) alcanza slot=3 en el código real
+  // (InputWidgets.cpp usa AnimSlot(wid, 3)); AnimSlot(id, 0..3) → [0..3].
+  struct WidgetState {
+    // comunes / primitivos (fases 3, 8)
+    bool boolVal = false;
+    float floatVal = 0.0f;
+    int intVal = 0;
+    std::string stringVal;
+    bool comboChanged = false;
+    bool prevActive = false;
+    bool editedSinceActivate = false;
+    // brief 22 (fase 7): TreeView range-select. Antes eran los mapas paralelos
+    // treeVisitOrder[id] (orden DFS de nodos visitados este frame) y
+    // treeLastSelectedId[id] (ancla de rango). treeLastSelectedSet emula la
+    // prueba de existencia .find() del mapa original: false == "sin ancla aún"
+    // (el default 0 de treeLastSelectedId no basta porque un nodeId puede ser 0).
+    std::vector<int> treeVisitOrder;
+    int treeLastSelectedId = 0;
+    bool treeLastSelectedSet = false;
+    // animaciones inline (fase 2): replican AnimSlot(id, 0..3).
+    // brief 22 (fase 9): floatAnim[0] (StaggeredAppear) y springColor[0..2] (Button)
+    // están en uso y se conducen por activeFloatAnimIds/activeSpringColorIds. colorAnim[]
+    // y springFloat[] quedaron sin usuarios tras la migración; sus vectores/drivers se
+    // retiraron. Se conservan los campos como reserva (coste ínfimo) por si un widget
+    // futuro los reengancha con su Notify*/driver; hoy nunca se actualizan.
+    AnimatedValue<Color> colorAnim[4];   // (reserva — sin driver, ver fase 9)
+    AnimatedValue<float> floatAnim[4];
+    SpringValue<Color> springColor[4];
+    SpringValue<float> springFloat[4];   // (reserva — sin driver, ver fase 9)
+    RippleEffect ripple;
+    PresenceState presence;
+    FlipState flip;
+    // sub-estados pesados, lazy (fases 4-8) via unique_ptr (null hasta usarse)
+    std::unique_ptr<TextEditState> text;
+    std::unique_ptr<PanelState> panel;
+    std::unique_ptr<ScrollViewState> scroll;
+    std::unique_ptr<TabViewState> tabs;
+    std::unique_ptr<ModalState> modal;
+    std::unique_ptr<ContextMenuState> ctxMenu;
+    std::unique_ptr<FlyoutState> flyout;
+    std::unique_ptr<MenuState> menu;   // brief 22 (fase 6): MenuBar dropdown state
+    std::unique_ptr<ListViewState> list;
+    std::unique_ptr<TreeViewState> tree;
+    std::unique_ptr<TableInternalState> table;
+    std::unique_ptr<ColorPickerState> colorPicker;
+    std::unique_ptr<SplitterState> splitter;
+    std::unique_ptr<DragWidgetState> drag;
+    uint32_t lastFrameSeen = 0;
+  };
+
+  std::unordered_map<uint32_t, WidgetState> widgetStates;
+
+  // brief 22 (fase 9) — nota sobre la "doble verdad" con el WidgetNode del árbol:
+  // WidgetNode (core/WidgetNode.h) tiene sus PROPIAS animaciones inline
+  // (bgColorAnim/opacityAnim/enterT/scaleAnim/posSpring/prevBounds) conducidas por
+  // WidgetTree::UpdateAnimations. Son DISJUNTAS de las de WidgetState: ningún archivo
+  // de src/UI/*.cpp escribe los campos de animación del WidgetNode (solo WidgetNode.h
+  // los actualiza internamente), mientras que las animaciones que los widgets sí usan
+  // (springColor de Button, floatAnim de StaggeredAppear, ripple, presence, flip) viven
+  // en WidgetState. Verificado por grep: no hay ningún widget que escriba AMBOS para el
+  // mismo dato, así que NO existe doble-verdad real y no se fusiona nada (ver notes).
+
+  // Accesores (definidos out-of-line en src/Core/Context.cpp donde los tipos
+  // están completos). GetWidgetState SIEMPRE crea la entrada y refresca
+  // lastFrameSeen = frame. Cada Get*State asegura su unique_ptr (make_unique si
+  // es null) y devuelve la referencia al sub-estado.
+  WidgetState& GetWidgetState(uint32_t id);
+  TextEditState& GetTextState(uint32_t id);
+  PanelState& GetPanelState(uint32_t id);
+  ScrollViewState& GetScrollState(uint32_t id);
+  TabViewState& GetTabState(uint32_t id);
+  ModalState& GetModalState(uint32_t id);
+  ContextMenuState& GetCtxMenuState(uint32_t id);
+  FlyoutState& GetFlyoutState(uint32_t id);
+  MenuState& GetMenuState(uint32_t id);
+  ListViewState& GetListState(uint32_t id);
+  TreeViewState& GetTreeState(uint32_t id);
+  TableInternalState& GetTableState(uint32_t id);
+  ColorPickerState& GetColorPickerState(uint32_t id);
+  SplitterState& GetSplitterState(uint32_t id);
+  DragWidgetState& GetDragState(uint32_t id);
 };
 
 // Selects which RenderBackend the factory instantiates. Defaults to OpenGL so
 // existing code is unaffected. Call SetPreferredBackend(RenderBackendType::Vulkan)
 // before CreateContext()/CreateStandaloneContext() to use the Vulkan backend; in
 // that case the `existingContext` argument is a VulkanSharedContext* (or nullptr
-// for standalone) instead of an SDL_GLContext.
+// for standalone) instead of an GL context.
 enum class RenderBackendType { OpenGL, Vulkan };
 void SetPreferredBackend(RenderBackendType type);
 RenderBackendType GetPreferredBackend();
 
-UIContext *CreateContext(SDL_Window *window, void* existingGLContext = nullptr);
+UIContext *CreateContext(WindowHandle window, void* existingGLContext = nullptr);
 // Convenience overload: pick the backend and create the context in one call, so
 // the backend choice and its matching `existingContext` handle can't get out of
 // sync. For Vulkan pass a VulkanSharedContext* (shared mode) or nullptr
-// (standalone); for OpenGL pass an SDL_GLContext or nullptr.
-UIContext *CreateContext(SDL_Window *window, RenderBackendType backend, void* existingContext = nullptr);
+// (standalone); for OpenGL pass an GL context or nullptr.
+UIContext *CreateContext(WindowHandle window, RenderBackendType backend, void* existingContext = nullptr);
 UIContext *GetContext();
-
-// Returns the active RenderBackend (the one CreateContext built/adopted), or
-// nullptr if no context exists. The host engine needs this in Vulkan shared
-// mode to hand the per-frame command buffer to the backend via
-// SetFrameCommandBuffer() from inside its render pass.
-RenderBackend *GetBackend();
-
 void DestroyContext();
 
 // Wrap a host-owned GPU texture (e.g. an engine-rendered viewport) so it can be
@@ -823,22 +1224,80 @@ void* RegisterExternalTexture(void* nativeView, void* sampler = nullptr, int lay
 // Release a handle returned by RegisterExternalTexture (frees only the wrapper).
 void DestroyExternalTexture(void* handle);
 
+// brief 26 de-SDL: reach the platform backend from anywhere with a UIContext.
+// Returns ctx->platform when set, else a shared process-wide NullPlatform so callers
+// (widgets, headless tests) never dereference null. Never returns nullptr.
+PlatformBackend* GetPlatform(UIContext* ctx);
+
 // Multi-context support (Phase 4: Multi-Window)
 // SetCurrentContext swaps which context is used by NewFrame/Render/widgets
 void SetCurrentContext(UIContext* ctx);
 // Create a standalone context (not the global singleton) for secondary windows
 // outBackend receives the created backend pointer (for cleanup)
-UIContext* CreateStandaloneContext(SDL_Window* window, RenderBackend** outBackend = nullptr);
-// Overload: pick the backend and pass its matching existingContext, so secondary
-// windows can use Vulkan shared mode (existingContext = VulkanSharedContext*) or
-// OpenGL (existingContext = SDL_GLContext / nullptr). Mirrors CreateContext().
-UIContext* CreateStandaloneContext(SDL_Window* window, RenderBackendType backend,
-                                   void* existingContext, RenderBackend** outBackend = nullptr);
-// Destroy a standalone context (does not touch the global singleton)
+UIContext* CreateStandaloneContext(WindowHandle window, RenderBackend** outBackend = nullptr);
+// brief 08: create a secondary-window context that SHARES the GPU device and
+// resource pool of `shareFrom` (the main context). In OpenGL it reuses the same
+// GL context; in Vulkan it creates only a surface/swapchain over shareFrom's
+// device. The font atlas/MSDF/textures are not duplicated. `shareFrom` must be a
+// live context created by CreateContext(). Falls back to an isolated context if
+// shareFrom is null or its backend can't be shared.
+UIContext* CreateStandaloneContext(WindowHandle window, UIContext* shareFrom,
+                                   RenderBackend** outBackend = nullptr);
+// Destroy a standalone context (does not touch the global singleton). Frees the
+// backend but never the shared resource pool (owned by the main context).
 void DestroyStandaloneContext(UIContext* ctx, RenderBackend* backend);
+
+// brief 18.5: RTL layout direction control. SetLayoutDirection(RTL) mirrors the
+// X axis of horizontal/grid containers (see AdvanceCursor) and directional icons
+// (see MirrorDirectionalIcon). Complex bidi text shaping (Arabic/Indic via
+// HarfBuzz) is out of scope — see brief 18 "Fuera de alcance".
+void SetLayoutDirection(UIContext::LayoutDirection dir);
+UIContext::LayoutDirection GetLayoutDirection();
+bool IsLayoutRTL();
 
 void NewFrame(float deltaTime = 0.016f);
 void Render();
+
+// brief 10 Part B: motion-duration policy. Returns base * g_ctx->motion.durationScale,
+// or 0 when reduceMotion / !enabled. Returns base unchanged when there is no context.
+// Also declared in Animation.h (forward) so AnimatedValue/SpringValue can call it
+// without including Context.h (the Animation.h ↔ Context.h cycle).
+float MotionDuration(float base);
+// ─── brief 10 Part D — presence (enter/exit transitions) ─────────────────────
+// Result of BeginPresence: t is the 0..1 presence factor (fade/scale), shouldDraw
+// is false once a closed overlay has fully faded out (caller skips drawing and
+// teardown), exiting is true while fading out.
+struct PresenceResult { float t; bool shouldDraw; bool exiting; };
+// Drive a managed overlay's enter/exit transition. Call EVERY frame with active =
+// "is the overlay logically open". On the rising edge enterT animates 0→1
+// (Decelerate); when active turns false it animates 1→0 (Accelerate) and shouldDraw
+// stays true until the fade completes, so the overlay can keep re-drawing itself
+// during the exit. Wrap the overlay's draw in renderer.PushOpacity(result.t).
+PresenceResult BeginPresence(UIContext* ctx, uint32_t nodeId, bool active,
+                             float enterResponse = 0.20f, float exitResponse = 0.14f);
+
+// brief 10 Part E: FLIP helper. Pass a stable per-item id and the item's freshly
+// computed top-left for this frame; returns the visual offset to ADD to the draw
+// position so the item slides from its previous position to the new one. The first
+// call for an id returns (0,0) and just records the position. Opt-in: containers
+// that want animated reorder/insert call this per visible child.
+Vec2 LayoutFlipOffset(UIContext* ctx, uint32_t itemId, const Vec2& currentPos,
+                      float response = 0.32f, float dampingRatio = 0.85f);
+
+// brief 10 Part F: stagger. StaggerDelaySeconds maps a child index to an entrance
+// delay (index * staggerMs, capped so the last child still starts within capMs).
+float StaggerDelaySeconds(int index, float staggerMs, float capMs = 120.0f);
+// Per-item staggered entrance factor [0..1]. On an item's first appearance it starts
+// a Decelerate tween 0→1 delayed by StaggerDelaySeconds(index, staggerMs); returns
+// the current factor each frame (multiply into the item's opacity via PushOpacity,
+// and/or use as a slide/scale factor). Backed by WidgetState.floatAnim[0] (brief 22).
+float StaggeredAppear(UIContext* ctx, uint32_t itemId, int index, float staggerMs,
+                      float enterResponse = 0.22f);
+
+// brief 10 Part B: seed g_ctx->motion.reduceMotion from the OS accessibility flag
+// (Windows: SPI_GETCLIENTAREAANIMATION). No-op / default false on other platforms.
+// Safe to call once after CreateContext(); FluentApp::run() calls it for you.
+void InitMotionFromOS();
 
 /// Returns true if the mouse was over any FluentUI widget last frame.
 /// Host app should skip 3D picking / viewport interaction when this returns true.

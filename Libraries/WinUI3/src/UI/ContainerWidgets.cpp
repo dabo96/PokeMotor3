@@ -2,10 +2,12 @@
 #include "UI/WidgetHelpers.h"
 #include "UI/Icons.h"
 #include "Theme/FluentTheme.h"
+#include "Theme/Material.h"
 #include "core/Animation.h"
 #include "core/Context.h"
 #include "core/Renderer.h"
 #include "core/Elevation.h"
+#include "core/UIKey.h"
 #include "core/WidgetNodes.h"
 #include <algorithm>
 #include <cmath>
@@ -35,7 +37,7 @@ bool BeginPanel(const std::string &id, uint32_t iconCodepoint, const Vec2 &desir
 
   uint32_t panelId = GenerateId("PANEL:", id.c_str());
 
-  // Register in widget tree (Phase 1 — coexists with old panelStates map)
+  // Register in widget tree (Phase 1)
   auto* panelNode = static_cast<PanelNode*>(
       ctx->widgetTree.FindOrCreate(panelId, ctx->frame, [&]() {
           auto node = std::make_unique<PanelNode>(panelId);
@@ -45,7 +47,7 @@ bool BeginPanel(const std::string &id, uint32_t iconCodepoint, const Vec2 &desir
   );
   ctx->widgetTree.PushParent(panelNode);
 
-  auto &state = ctx->panelStates[panelId];
+  auto &state = ctx->GetPanelState(panelId);
   const PanelStyle &panelStyle = ctx->GetEffectivePanelStyle();
   float titleHeight =
       panelStyle.headerText.fontSize + panelStyle.padding.y * 2.0f;
@@ -179,27 +181,24 @@ bool BeginPanel(const std::string &id, uint32_t iconCodepoint, const Vec2 &desir
   Vec2 drawSize = state.minimized ? Vec2(state.size.x, titleHeight) : state.size;
   bool isVisible = (state.position.x + state.size.x > 0 && state.position.x < viewportSize.x &&
                     state.position.y + drawSize.y > 0 && state.position.y < viewportSize.y);
-
-  // Marca TODA el área del panel como "ratón sobre la UI" (mouseOverAnyWidget →
-  // WantCaptureMouse). El drag/resize/título usan PointInRect, que NO marca; sin
-  // esto, clicar el fondo o el título de un panel —o un panel reubicado por el
-  // usuario— se filtraría al picking de la app anfitriona. Arreglo de raíz para
-  // cualquier panel, esté donde esté. (IsMouseOver respeta overlays activos.)
-  IsMouseOver(ctx, state.position, drawSize);
-
+  
   if (isVisible) {
+    // Brief 07: the panel/card body (fill, corner, elevation) comes from a
+    // data-driven material instead of reading PanelStyle fields ad hoc. Identical
+    // result to before (z=Card, fill=panel.background, radius=panel.cornerRadius).
+    FluentMaterial panelMat = ResolvePanelMaterial(panelStyle, WidgetState::Rest);
     // Dibujo del panel
     if (!state.minimized && panelStyle.shadowOpacity > 0.0f) {
       // Sombra por elevación: un panel/card flota en z=Card. shadowOpacity del
       // tema actúa de interruptor (los temas "flat" lo ponen a 0).
       ctx->renderer.DrawElevationShadow(state.position, drawSize,
-                                        panelStyle.cornerRadius, Elevation::Z::Card);
+                                        panelMat.radius, panelMat.elevationZ);
     }
-    Color bg = panelStyle.background;
-    if (state.useAcrylic) ctx->renderer.DrawRectAcrylic(state.position, drawSize, bg, panelStyle.cornerRadius, state.acrylicOpacity);
-    else ctx->renderer.DrawRectFilled(state.position, drawSize, bg, panelStyle.cornerRadius);
-    
-    ctx->renderer.DrawRectFilled(state.position, titleSize, panelStyle.headerBackground, panelStyle.cornerRadius);
+    Color bg = panelMat.fill;
+    if (state.useAcrylic) ctx->renderer.DrawRectAcrylic(state.position, drawSize, bg, panelMat.radius, state.acrylicOpacity);
+    else ctx->renderer.DrawRectFilled(state.position, drawSize, bg, panelMat.radius);
+
+    ctx->renderer.DrawRectFilled(state.position, titleSize, panelStyle.headerBackground, panelMat.radius);
     {
       float titleIconSize = panelStyle.headerText.fontSize;
       float titleIconGap = 6.0f;
@@ -293,6 +292,10 @@ bool BeginPanel(const std::string &id, uint32_t iconCodepoint, const Vec2 &desir
     BeginVertical(ctx->style.spacing, Vec2(std::max(0.0f, cw - sbReserve), 0.0f), Vec2(0,0));
     frameCtx.layoutPushed = true;
     ctx->panelStack.push_back(frameCtx);
+    // brief 21: scope child widgets by the panel id so identical labels in
+    // different panels get distinct ids (no "##" suffix needed). Pushed only on
+    // the content-rendering path (BeginPanel returned true → EndPanel will run).
+    PushID(id.c_str());
   } else if (!state.useAbsolutePos && reserveLayoutSpace) {
     AdvanceCursor(ctx, state.minimized ? Vec2(state.size.x, titleHeight) : state.size);
   }
@@ -309,9 +312,14 @@ void EndPanel() {
 
   PanelFrameContext frameCtx = ctx->panelStack.back();
   ctx->panelStack.pop_back();
-  auto it = ctx->panelStates.find(frameCtx.id);
-  if (it == ctx->panelStates.end()) return;
-  auto &state = it->second;
+  // brief 21: pop the scope pushed in BeginPanel (paired with panelStack).
+  PopID();
+  // brief 22 (fase 5): el estado de panel vive en widgetStates (ws.panel). El
+  // guard original probaba existencia SIN crear; se preserva con find() para no
+  // crear una entrada espuria si End* corre sin su Begin* pareado.
+  auto wsIt = ctx->widgetStates.find(frameCtx.id);
+  if (wsIt == ctx->widgetStates.end() || !wsIt->second.panel) return;
+  auto &state = *wsIt->second.panel;
 
   if (!ctx->offsetStack.empty()) ctx->offsetStack.pop_back();
   if (frameCtx.layoutPushed) {
@@ -401,8 +409,7 @@ bool CollapsingHeader(const std::string &label, bool *open,
   uint32_t id = GenerateId("COLLAPSE:", label.c_str());
   ctx->focusableWidgets.push_back(id);
 
-  auto entry = ctx->boolStates.try_emplace(id, false);
-  bool &storedOpen = entry.first->second;
+  bool &storedOpen = ctx->GetWidgetState(id).boolVal; // brief 22 (fase 3)
   bool isOpen = open ? *open : storedOpen;
 
   const TextStyle &labelStyle = ctx->style.GetTextStyle(TypographyStyle::BodyStrong);
@@ -453,8 +460,8 @@ bool CollapsingHeader(const std::string &label, bool *open,
 
   // Keyboard activation when focused.
   if (ctx->focusedWidgetId == id &&
-      (ctx->input.IsKeyPressed(SDL_SCANCODE_SPACE) ||
-       ctx->input.IsKeyPressed(SDL_SCANCODE_RETURN))) {
+      (ctx->input.IsKeyPressed(UIKey::Space) ||
+       ctx->input.IsKeyPressed(UIKey::Enter))) {
     clicked = true;
   }
 
@@ -479,8 +486,9 @@ bool CollapsingHeader(const std::string &label, bool *open,
     DrawFocusRing(ctx, widgetPos, finalSize, panelStyle.cornerRadius);
   }
 
-  // Chevron at left.
-  uint32_t chevronCp = isOpen ? Icons::ChevronDown : Icons::ChevronRight;
+  // Chevron at left. brief 18.5: in RTL a collapsed header points left.
+  uint32_t chevronCp = isOpen ? Icons::ChevronDown
+                              : MirrorDirectionalIcon(ctx, Icons::ChevronRight);
   DrawWidgetIcon(ctx, widgetPos, finalSize, chevronCp,
                  labelStyle.color, chevronSize, padX, iconGap);
 
@@ -538,7 +546,7 @@ bool BeginScrollView(const std::string &id, const Vec2 &size,
   );
   ctx->widgetTree.PushParent(scrollNode);
 
-  auto &state = ctx->scrollViewStates[scrollViewId];
+  auto &state = ctx->GetScrollState(scrollViewId);
 
   // Resolve {0,0} size from available space (like Splitter does)
   Vec2 resolvedSize = size;
@@ -643,9 +651,11 @@ void EndScrollView() {
 
   ScrollViewFrameContext frameCtx = ctx->scrollViewStack.back();
   ctx->scrollViewStack.pop_back();
-  auto it = ctx->scrollViewStates.find(frameCtx.id);
-  if (it == ctx->scrollViewStates.end()) return;
-  auto &state = it->second;
+  // brief 22 (fase 5): estado de scrollview en widgetStates (ws.scroll). Guard de
+  // existencia sin crear (find), preservando la semántica original.
+  auto wsIt = ctx->widgetStates.find(frameCtx.id);
+  if (wsIt == ctx->widgetStates.end() || !wsIt->second.scroll) return;
+  auto &state = *wsIt->second.scroll;
 
   if (!ctx->layoutStack.empty()) {
     auto &stack = ctx->layoutStack.back();
@@ -728,7 +738,7 @@ static bool BeginTabViewImpl(const std::string &id, int *activeTab,
   );
   ctx->widgetTree.PushParent(tabNode);
 
-  auto &state = ctx->tabViewStates[tabViewId];
+  auto &state = ctx->GetTabState(tabViewId);
 
   if (!state.initialized) {
     state.activeTab = activeTab ? *activeTab : 0;
@@ -839,17 +849,34 @@ static bool BeginTabViewImpl(const std::string &id, int *activeTab,
   if (needsScroll)
     ctx->renderer.PushClipRect(Vec2(tabAreaStartX, tabViewPos.y), Vec2(tabAreaWidth, tabHeight));
 
+  // brief 35 Part D: posición (x, en espacio de contenido sin el scroll del tab bar) y
+  // ancho objetivo del subrayado de la pestaña activa, capturados en el bucle y
+  // dibujados deslizando tras él (spring en el estado del contenedor).
+  float indTargetX = 0.0f, indTargetW = 0.0f;
+  bool indFound = false;
+
+  // El hit-test de los tabs se limita al área visible del tab bar: un tab
+  // parcialmente recortado sigue teniendo su rect completo bajo las flechas de
+  // scroll, y sin este filtro el click en la flecha también seleccionaba el tab
+  // que quedaba debajo (doble acción: scroll + selección).
+  bool mouseInTabArea = IsMouseOver(ctx, Vec2(tabAreaStartX, tabViewPos.y),
+                                    Vec2(tabAreaWidth, tabHeight));
   float currentX = tabAreaStartX - state.tabBarScrollX;
   for (size_t i = 0; i < tabLabels.size(); ++i) {
     Vec2 labelSize = MeasureTextCached(ctx, tabLabels[i], tabTextStyle.fontSize);
     Vec2 tSize(tabWidths[i], tabHeight);
     Vec2 tPos(currentX, tabViewPos.y);
     bool visible = (tPos.x + tSize.x > tabAreaStartX) && (tPos.x < tabAreaStartX + tabAreaWidth);
-    bool hover = visible && IsMouseOver(ctx, tPos, tSize);
+    bool hover = visible && mouseInTabArea && IsMouseOver(ctx, tPos, tSize);
     bool active = (int)i == state.activeTab;
     if (active) {
         ctx->renderer.DrawRectFilled(tPos, tSize, tabViewBg, 0);
-        ctx->renderer.DrawLine(tPos + Vec2(0, tSize.y - 2), tPos + Vec2(tSize.x, tSize.y - 2), ctx->style.button.background.normal, 3.0f);
+        // brief 35 Part D: el subrayado ya NO se pinta aquí; se registra su posición
+        // objetivo (en espacio de contenido, sin el scroll del tab bar) y se dibuja
+        // deslizando tras el bucle. Así cambiar de pestaña desliza y el scroll no laggea.
+        indFound = true;
+        indTargetX = tPos.x + state.tabBarScrollX;
+        indTargetW = tSize.x;
     }
     if (hover && ctx->input.IsMousePressed(0)) {
         state.activeTab = (int)i;
@@ -865,6 +892,34 @@ static bool BeginTabViewImpl(const std::string &id, int *activeTab,
     ctx->renderer.DrawText(tPos + Vec2(panelStyle.padding.x + tabIconSlot, (tabHeight - labelSize.y) * 0.5f),
                            tabLabels[i], tabColor, tabTextStyle.fontSize);
     currentX += tSize.x + 4.0f;
+  }
+
+  // brief 35 Part D: subrayado deslizante de la pestaña activa. Posición/ancho en el
+  // WidgetState del CONTENEDOR (springFloat[0]=x, [1]=ancho); al cambiar de pestaña
+  // VIAJA desde la anterior en vez de aparecer. Primer frame SetImmediate. El scroll del
+  // tab bar se aplica 1:1 al dibujar (no pasa por el spring) para que no laggee. Se
+  // dibuja aún dentro del clip del tab bar (antes del PopClipRect). Token Navigational.
+  if (indFound) {
+    uint32_t tabIndId = GenerateId("TABINDICATOR:", id.c_str());
+    auto &ind = ctx->GetWidgetState(tabIndId);
+    auto &xS = ind.springFloat[0];
+    auto &wS = ind.springFloat[1];
+    if (!xS.IsInitialized()) {
+      xS.Configure(MotionTokens::Navigational, 1.0f);
+      xS.SetImmediate(indTargetX);
+    }
+    if (!wS.IsInitialized()) {
+      wS.Configure(MotionTokens::Navigational, 1.0f);
+      wS.SetImmediate(indTargetW);
+    }
+    xS.SetTarget(indTargetX);
+    wS.SetTarget(indTargetW);
+    if (xS.IsAnimating() || wS.IsAnimating())
+      ctx->NotifySpringFloatActive(tabIndId);
+    float uy = tabViewPos.y + tabHeight - 2.0f;
+    float drawX = xS.Get() - state.tabBarScrollX;
+    ctx->renderer.DrawLine(Vec2(drawX, uy), Vec2(drawX + wS.Get(), uy),
+                           ctx->style.button.background.normal, 3.0f);
   }
 
   if (needsScroll)
@@ -889,12 +944,21 @@ static bool BeginTabViewImpl(const std::string &id, int *activeTab,
   BeginVertical(ctx->style.spacing, layoutSize, Vec2(0,0));
   
   ctx->tabFrameStack.push_back({tabViewId, contentPos, contentSize, ctx->cursorPos});
+  // brief 21: scope tab content by tabview id AND the active tab index, so the
+  // same label used on two different tabs gets distinct ids. Two pushes → two
+  // pops in EndTabView (paired with tabFrameStack).
+  PushID(id.c_str());
+  PushID(state.activeTab);
   return true;
 }
 
 void EndTabView() {
   UIContext *ctx = GetContext();
   if (!ctx || ctx->tabFrameStack.empty()) return;
+
+  // brief 21: pop the (id, activeTab) scope pushed in BeginTabViewImpl.
+  PopID();
+  PopID();
 
   // Pop from widget tree (Phase 1)
   ctx->widgetTree.PopParent();
@@ -906,9 +970,15 @@ void EndTabView() {
   if (!ctx->offsetStack.empty()) ctx->offsetStack.pop_back();
 
   // Measure content BEFORE popping clip rect
-  auto it = ctx->tabViewStates.find(frame.tabViewId);
-  if (it != ctx->tabViewStates.end()) {
-    auto &st = it->second;
+  // brief 22 (fase 5): estado de tabview en widgetStates (ws.tabs). Guard de
+  // existencia sin crear (find), preservando la semántica original; el puntero
+  // se reutiliza en el segundo bloque (dibujo de scrollbar) más abajo.
+  auto wsIt = ctx->widgetStates.find(frame.tabViewId);
+  UIContext::TabViewState* stPtr = (wsIt != ctx->widgetStates.end() && wsIt->second.tabs)
+                            ? wsIt->second.tabs.get()
+                            : nullptr;
+  if (stPtr) {
+    auto &st = *stPtr;
     float measuredH = endCursor.y - frame.contentStartCursor.y;
     st.contentSize = Vec2(frame.contentAreaSize.x, std::max(frame.contentAreaSize.y, measuredH));
   }
@@ -919,8 +989,8 @@ void EndTabView() {
   // Position at the right edge of the parent's visible area (clip rect),
   // not the TabView's content area — this ensures the scrollbar is always
   // visible even when the TabView is wider than its parent container.
-  if (it != ctx->tabViewStates.end()) {
-    auto &st = it->second;
+  if (stPtr) {
+    auto &st = *stPtr;
     if (st.contentSize.y > frame.contentAreaSize.y) {
       float sbWidth = S(6.0f);
       // Use parent clip's right edge if available, otherwise fall back to content area
@@ -966,7 +1036,7 @@ bool BeginSplitter(const std::string& id, bool vertical, float* ratio, const Vec
   if (!ctx) return false;
 
   uint32_t splitId = GenerateId("SPLITTER:", id.c_str());
-  auto& state = ctx->splitterStates[splitId];
+  auto& state = ctx->GetSplitterState(splitId);
 
   // Initialize ratio from caller pointer, clamp and write back if out of range
   if (ratio) {
@@ -1054,7 +1124,17 @@ bool BeginSplitter(const std::string& id, bool vertical, float* ratio, const Vec
   Vec2 mousePos(ctx->input.MouseX(), ctx->input.MouseY());
   bool leftDown = ctx->input.IsMouseDown(0);
   bool leftPressed = ctx->input.IsMousePressed(0);
-  bool hoveringDivider = PointInRect(mousePos, dividerPos, dividerSize);
+  // Zona de PROXIMIDAD: el splitter es invisible en reposo y solo aparece (y se
+  // agarra) cuando el mouse está CERCA del borde, no solo sobre los 6px del divisor.
+  // Estilo editor moderno (VS/Blender). El margen amplía la zona en el eje
+  // transversal a cada lado del divisor.
+  float grabMargin = S(5.0f);
+  Vec2 hoverPos = vertical ? Vec2(dividerPos.x - grabMargin, dividerPos.y)
+                           : Vec2(dividerPos.x, dividerPos.y - grabMargin);
+  Vec2 hoverSize = vertical
+      ? Vec2(dividerSize.x + grabMargin * 2.0f, dividerSize.y)
+      : Vec2(dividerSize.x, dividerSize.y + grabMargin * 2.0f);
+  bool hoveringDivider = PointInRect(mousePos, hoverPos, hoverSize);
 
   if (state.isDragging) {
     if (!leftDown) {
@@ -1084,19 +1164,34 @@ bool BeginSplitter(const std::string& id, bool vertical, float* ratio, const Vec
     ctx->desiredCursor = vertical ? UIContext::CursorType::ResizeH : UIContext::CursorType::ResizeV;
   }
 
-  // --- Draw divider ---
+  // --- Draw divider (splitter "fantasma": invisible en reposo, aparece al acercarse) ---
   const PanelStyle& panelStyle = ctx->style.panel;
-  Color divColor = hoveringDivider || state.isDragging
-      ? ctx->style.button.background.normal
-      : Color(panelStyle.background.r * 1.3f, panelStyle.background.g * 1.3f,
-              panelStyle.background.b * 1.3f, 1.0f);
+  const bool dark = ctx->style.isDarkTheme;
+  const bool showHandle = hoveringDivider || state.isDragging;
+  // Estados: (1) reposo/lejos → se pinta con panel.background, se funde con los
+  // panes = "no hay nada". (2) cerca → barra de contraste (aparece el handle).
+  // (3) arrastrando → acento. La geometría del divisor (6px) no cambia; solo su
+  // color, así que los panes no saltan al aparecer/desaparecer el handle.
+  Color divColor;
+  if (state.isDragging) {
+    divColor = ctx->style.button.background.normal;      // acento al arrastrar
+  } else if (hoveringDivider) {
+    float f = dark ? 1.35f : 0.82f;                       // contraste al acercarse
+    divColor = Color(std::min(panelStyle.background.r * f, 1.0f),
+                     std::min(panelStyle.background.g * f, 1.0f),
+                     std::min(panelStyle.background.b * f, 1.0f), 1.0f);
+  } else {
+    divColor = panelStyle.background;                     // reposo: invisible (se funde)
+  }
   ctx->renderer.DrawRectFilled(dividerPos, dividerSize, divColor, 0);
 
-  // Draw a small grip indicator in the center of the divider
-  {
+  // Grip (3 marcas en el centro) SOLO cuando el handle está visible (cerca/arrastrando).
+  if (showHandle) {
     Vec2 gripCenter = dividerPos + dividerSize * 0.5f;
     float gripLen = std::min(vertical ? dividerSize.y : dividerSize.x, 30.0f);
-    Color gripColor(1.0f, 1.0f, 1.0f, 0.3f);
+    Color gripColor = state.isDragging
+        ? Color(1.0f, 1.0f, 1.0f, 0.9f)
+        : (dark ? Color(1.0f, 1.0f, 1.0f, 0.55f) : Color(0.0f, 0.0f, 0.0f, 0.40f));
     if (vertical) {
       for (int i = -1; i <= 1; ++i) {
         float cx = gripCenter.x + i * 1.5f;
@@ -1131,6 +1226,15 @@ bool BeginSplitter(const std::string& id, bool vertical, float* ratio, const Vec
   frameCtx.layoutPushed = true;
 
   ctx->splitterStack.push_back(frameCtx);
+
+  // Confirmar el DIVISOR (dibujado arriba) con el clip del PADRE antes de empujar
+  // el clip de la primera región. PushClipRect NO vacía el batch, así que sin este
+  // flush el scissor de la región recorta RETROACTIVAMENTE el divisor pendiente —
+  // que cae FUERA (a la derecha) de la primera región → se recorta por completo y
+  // el divisor NUNCA se ve. Mismo bug/patrón que las cards (FlushBatch antes de
+  // PushClipRect). El fondo de los panes sí se veía porque el texto que va después
+  // fuerza un flush con el clip ya cambiado; el divisor no tiene nada que lo salve.
+  ctx->renderer.FlushBatch();
 
   // Clip and layout for first region
   ctx->renderer.PushClipRect(firstPos, firstSize);

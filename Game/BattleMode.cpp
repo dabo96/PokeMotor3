@@ -15,13 +15,20 @@
 
 namespace pk {
 
-BattleMode::BattleMode(std::string foeName, int foeId)
-    : m_foeName(std::move(foeName)), m_foeId(foeId) {}
+BattleMode::BattleMode(std::string foeName, int foeId, std::string foeSprite)
+    : m_foeName(std::move(foeName)), m_foeId(foeId), m_foeSprite(std::move(foeSprite)) {}
 
 void BattleMode::onEnter(GameContext& ctx) {
     LOG_INFO("=== COMBATE: ¡%s salvaje! Pulsa Enter/Espacio para volver. ===",
              m_foeName.c_str());
-    if (ctx.assets) m_foeTex = ctx.assets->loadTexture("Assets/Models/Sprites/001.png");
+    if (ctx.assets && !m_foeSprite.empty()) {
+        m_foeTex = ctx.assets->loadTexture(m_foeSprite);
+        // loadTexture nunca falla (devuelve la blanca): avisamos para que se note que
+        // falta el arte de esa especie en vez de dibujar un cuadro blanco en silencio.
+        if (m_foeTex == ctx.assets->whiteTexture())
+            LOG_WARN("Combate: falta el sprite '%s' de %s (revisa species.json).",
+                     m_foeSprite.c_str(), m_foeName.c_str());
+    }
 }
 
 void BattleMode::handleInput(GameContext& ctx) {

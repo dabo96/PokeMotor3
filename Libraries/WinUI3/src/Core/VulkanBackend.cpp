@@ -11,8 +11,12 @@
 #include "core/VulkanBackend.h"
 #include "core/EmbeddedShadersVulkan.h"
 #include "core/Context.h"
+#ifdef FLUENTUI_HAS_SDL
+// SDL is used ONLY by the standalone (owned-window) device/surface path. Embedded
+// hosts (SDL=OFF) drive Vulkan through an external device/surface (VulkanSharedContext).
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#endif
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
@@ -66,9 +70,103 @@ VulkanBackend::~VulkanBackend() { Shutdown(); }
 // Init
 // ───────────────────────────────────────────────────────────────────────────
 bool VulkanBackend::Init(void* windowHandle, void* existingContext) {
-    window = static_cast<SDL_Window*>(windowHandle);
+    window = windowHandle; // opaque native window handle (SDL_Window* or HWND)
 
     if (existingContext) {
+        auto* shared0 = static_cast<VulkanSharedContext*>(existingContext);
+        if (shared0->ownSwapchain) {
+            // ── Shared-device, own-swapchain mode (brief 08 Part B) ──
+            // Secondary OS-window: reuse the main UI backend's device/instance/
+            // queue, but create our OWN surface/swapchain/render pass/sync and
+            // present. We do NOT own the device — never destroy it.
+            if (!shared0->instance || !shared0->physicalDevice || !shared0->device ||
+                !shared0->graphicsQueue) {
+                Log(LogLevel::Error, "Vulkan: shared-device window missing required handles "
+                    "(instance/physicalDevice/device/graphicsQueue)");
+                return false;
+            }
+            ownsDevice = false;
+            sharedMode = false;
+            ownSwapchainOnSharedDevice = true;
+            resourceOwner_ = shared0->ownerBackend  // gap #4: owner backend for adopting resources
+                                 ? static_cast<VulkanBackend*>(shared0->ownerBackend) : nullptr;
+            useDynamicRendering = false; // we render into our own swapchain render pass
+            instance         = reinterpret_cast<VkInstance>(shared0->instance);
+            physicalDevice   = reinterpret_cast<VkPhysicalDevice>(shared0->physicalDevice);
+            device           = reinterpret_cast<VkDevice>(shared0->device);
+            graphicsQueue    = reinterpret_cast<VkQueue>(shared0->graphicsQueue);
+            queueFamilyIndex = shared0->queueFamilyIndex;
+            wideLinesSupported = false; // can't assume the owner enabled the feature
+
+            VKDBG("Vulkan: SHARED-DEVICE window mode (own swapchain on shared device)");
+            if (!CreateSurfaceForWindow()) { Shutdown(); return false; }
+            // The shared graphics queue family must be able to present to our surface.
+            VkBool32 canPresent = VK_FALSE;
+            vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, queueFamilyIndex, surface, &canPresent);
+            if (!canPresent) {
+                Log(LogLevel::Error, "Vulkan: shared queue family %u cannot present to the "
+                    "secondary window surface", queueFamilyIndex);
+                Shutdown(); return false;
+            }
+            if (!CreateSwapchain())              { Shutdown(); return false; } // + render pass + framebuffers
+            // gap #4 Phase 1: adopt the owner's device-level shader modules + pipeline
+            // layouts instead of recreating them (format-independent, safe to share
+            // across windows on the same VkDevice). Pipelines stay per-window for now
+            // (Phase 2 shares those after a render-pass compatibility check).
+            {
+                VulkanBackend* owner = resourceOwner_; // gap #4 (set above)
+                if (owner && owner->vertModule != VK_NULL_HANDLE &&
+                    owner->layoutTex != VK_NULL_HANDLE) {
+                    vertModule    = owner->vertModule;
+                    basicFrag     = owner->basicFrag;
+                    textFrag      = owner->textFrag;
+                    msdfFrag      = owner->msdfFrag;
+                    // Brief 35-B: same VkDevice → the owner's dualSrcBlend decision
+                    // holds for us too (the feature is enabled per-device).
+                    dualSrcBlendSupported = owner->dualSrcBlendSupported;
+                    msdfSubpixelFrag = owner->msdfSubpixelFrag;
+                    imageFrag     = owner->imageFrag;
+                    sdfVertModule = owner->sdfVertModule;
+                    sdfFrag       = owner->sdfFrag;
+                    texSetLayout  = owner->texSetLayout;
+                    layoutNoTex   = owner->layoutNoTex;
+                    layoutTex     = owner->layoutTex;
+                    ownsShaderResources = false; // adopted → Shutdown must NOT free these
+                    // Phase 2: adopt the owner's UI pipelines too IF our render pass is
+                    // compatible with the one they were built against (same color format +
+                    // sample count). This is the common path in multi-window on one device
+                    // (same swapchain format); otherwise build our own (layouts adopted).
+                    bool pipesCompatible = owner->pipeBasic != VK_NULL_HANDLE &&
+                                           colorFormat == owner->colorFormat &&
+                                           sampleCount == owner->sampleCount;
+                    if (pipesCompatible) {
+                        pipeBasic = owner->pipeBasic; pipeText = owner->pipeText;
+                        pipeMSDF  = owner->pipeMSDF;  pipeImage = owner->pipeImage;
+                        pipeLines = owner->pipeLines; pipeSDF  = owner->pipeSDF;
+                        pipeMSDFSubpixel = owner->pipeMSDFSubpixel; // brief 35-B
+                        ownsPipelines = false;
+                        VKDBG("Vulkan: gap#4 adopted owner shaders + layouts + PIPELINES");
+                    } else {
+                        VKDBG("Vulkan: gap#4 adopted shaders/layouts; pipelines incompatible -> building own");
+                        if (!CreatePipelines(/*createLayouts=*/false)) { Shutdown(); return false; }
+                    }
+                } else {
+                    if (!CreateShaderModules())      { Shutdown(); return false; }
+                    if (!CreatePipelines())          { Shutdown(); return false; }
+                }
+            }
+            if (!CreateDynamicBuffers())         { Shutdown(); return false; }
+            if (!CreateSamplerAndDescriptorInfra()) { Shutdown(); return false; }
+            // #5: best-effort real acrylic (own swapchain → capturable backdrop).
+            if (!CreateAcrylicResources()) {
+                Log(LogLevel::Warning, "Vulkan: acrylic resources failed — using flat fallback");
+                DestroyAcrylicResources();
+            }
+            if (!CreateSyncAndCommands())        { Shutdown(); return false; } // command + upload pools, frame sync
+            Log(LogLevel::Info, "Vulkan backend initialized (shared device, own swapchain)");
+            return true;
+        }
+
         // ── Shared mode: reuse the engine's Vulkan objects ──
         auto* shared = static_cast<VulkanSharedContext*>(existingContext);
         const bool dyn = shared->dynamicRendering;
@@ -173,6 +271,12 @@ bool VulkanBackend::Init(void* windowHandle, void* existingContext) {
     if (!CreateDynamicBuffers())    { Shutdown(); return false; }
     VKDBG("CreateSamplerAndDescriptorInfra...");
     if (!CreateSamplerAndDescriptorInfra()) { Shutdown(); return false; }
+    // #5: real acrylic is best-effort — on failure SupportsAcrylic() stays false
+    // and the Renderer uses the flat fallback. Never aborts backend init.
+    if (!CreateAcrylicResources()) {
+        Log(LogLevel::Warning, "Vulkan: acrylic resources failed — using flat fallback");
+        DestroyAcrylicResources();
+    }
     VKDBG("CreateSyncAndCommands...");
     if (!CreateSyncAndCommands())   { Shutdown(); return false; }
 
@@ -196,6 +300,7 @@ bool VulkanBackend::CreateInstanceAndDevice() {
     // only if it succeeds; otherwise go straight to the native Win32 path.
     bool useSdlSurface = false;
     std::vector<const char*> exts;
+#ifdef FLUENTUI_HAS_SDL
     if (SDL_Vulkan_LoadLibrary(nullptr)) {
         uint32_t sdlExtCount = 0;
         const char* const* sdlExts = SDL_Vulkan_GetInstanceExtensions(&sdlExtCount);
@@ -204,6 +309,7 @@ bool VulkanBackend::CreateInstanceAndDevice() {
             useSdlSurface = true;
         }
     }
+#endif
     if (!useSdlSurface) {
 #if defined(_WIN32)
         exts = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
@@ -221,25 +327,7 @@ bool VulkanBackend::CreateInstanceAndDevice() {
     VK_FAIL(vkCreateInstance(&ici, nullptr, &instance), "create instance");
     VKDBG(useSdlSurface ? "  instance ok (SDL surface path)" : "  instance ok (native Win32 path)");
 
-    if (useSdlSurface) {
-        if (!SDL_Vulkan_CreateSurface(window, instance, nullptr, &surface)) {
-            Log(LogLevel::Error, "Vulkan: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
-            return false;
-        }
-    } else {
-#if defined(_WIN32)
-        HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(
-            SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
-        if (!hwnd) {
-            Log(LogLevel::Error, "Vulkan: could not obtain HWND for native surface");
-            return false;
-        }
-        VkWin32SurfaceCreateInfoKHR wci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-        wci.hinstance = GetModuleHandle(nullptr);
-        wci.hwnd = hwnd;
-        VK_FAIL(vkCreateWin32SurfaceKHR(instance, &wci, nullptr, &surface), "create Win32 surface");
-#endif
-    }
+    if (!CreateSurfaceForWindow()) return false;
 
     VKDBG("  surface ok");
     if (!PickPhysicalDevice()) return false;
@@ -250,6 +338,10 @@ bool VulkanBackend::CreateInstanceAndDevice() {
     vkGetPhysicalDeviceFeatures(physicalDevice, &supported);
     VkPhysicalDeviceFeatures enabled{};
     if (supported.wideLines) { enabled.wideLines = VK_TRUE; wideLinesSupported = true; }
+    // Brief 35-B: dual-source blending for subpixel (ClearType-style) text. Must be
+    // requested at device creation; without it the shader may not even declare an
+    // Index-1 output, so the whole subpixel path stays off.
+    if (supported.dualSrcBlend) { enabled.dualSrcBlend = VK_TRUE; dualSrcBlendSupported = true; }
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -269,6 +361,50 @@ bool VulkanBackend::CreateInstanceAndDevice() {
     vkGetDeviceQueue(device, queueFamilyIndex, 0, &graphicsQueue);
     VKDBG("  device + queue ok");
     return true;
+}
+
+// Create a VkSurfaceKHR for `window` against the (own or shared) instance. Mirrors
+// the surface mechanism choice used at instance creation: SDL when SDL has Vulkan
+// support, otherwise the native Win32 path. Used by both the standalone device
+// path and the shared-device secondary-window path (brief 08 Part B).
+bool VulkanBackend::CreateSurfaceForWindow() {
+#ifdef FLUENTUI_HAS_SDL
+    bool useSdlSurface = false;
+    if (SDL_Vulkan_LoadLibrary(nullptr)) {
+        uint32_t sdlExtCount = 0;
+        const char* const* sdlExts = SDL_Vulkan_GetInstanceExtensions(&sdlExtCount);
+        if (sdlExts && sdlExtCount > 0) useSdlSurface = true;
+    }
+
+    if (useSdlSurface) {
+        if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(window), instance, nullptr, &surface)) {
+            Log(LogLevel::Error, "Vulkan: SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+            return false;
+        }
+        return true;
+    }
+#endif
+#if defined(_WIN32)
+#ifdef FLUENTUI_HAS_SDL
+    HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+        SDL_GetWindowProperties(static_cast<SDL_Window*>(window)), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+#else
+    // No SDL: a native host passes the HWND directly as the opaque window handle.
+    HWND hwnd = static_cast<HWND>(window);
+#endif
+    if (!hwnd) {
+        Log(LogLevel::Error, "Vulkan: could not obtain HWND for native surface");
+        return false;
+    }
+    VkWin32SurfaceCreateInfoKHR wci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    wci.hinstance = GetModuleHandle(nullptr);
+    wci.hwnd = hwnd;
+    VK_FAIL(vkCreateWin32SurfaceKHR(instance, &wci, nullptr, &surface), "create Win32 surface");
+    return true;
+#else
+    Log(LogLevel::Error, "Vulkan: no surface mechanism available for window");
+    return false;
+#endif
 }
 
 bool VulkanBackend::PickPhysicalDevice() {
@@ -485,11 +621,22 @@ bool VulkanBackend::CreateShaderModules() {
     basicFrag  = MakeShaderModule(ShadersVK::Basic_Frag, ShadersVK::Basic_FragSize);
     textFrag   = MakeShaderModule(ShadersVK::Text_Frag,  ShadersVK::Text_FragSize);
     msdfFrag   = MakeShaderModule(ShadersVK::MSDF_Frag,  ShadersVK::MSDF_FragSize);
+    // Brief 35-B: only when dualSrcBlend was actually enabled on this device —
+    // VUID-RuntimeSpirv-Fragment-06427 forbids an Index-1 output otherwise.
+    if (dualSrcBlendSupported) {
+        msdfSubpixelFrag = MakeShaderModule(ShadersVK::MSDFSubpixel_Frag,
+                                            ShadersVK::MSDFSubpixel_FragSize);
+        if (!msdfSubpixelFrag) dualSrcBlendSupported = false;
+    }
     imageFrag  = MakeShaderModule(ShadersVK::Image_Frag, ShadersVK::Image_FragSize);
-    return vertModule && basicFrag && textFrag && msdfFrag && imageFrag;
+    sdfVertModule = MakeShaderModule(ShadersVK::SDFRect_Vert, ShadersVK::SDFRect_VertSize);
+    sdfFrag       = MakeShaderModule(ShadersVK::SDFRect_Frag, ShadersVK::SDFRect_FragSize);
+    return vertModule && basicFrag && textFrag && msdfFrag && imageFrag &&
+           sdfVertModule && sdfFrag;
 }
 
-bool VulkanBackend::CreatePipelines() {
+bool VulkanBackend::CreatePipelines(bool createLayouts) {
+  if (createLayouts) {
     // Descriptor set layout: one combined image sampler at binding 0 (fragment).
     VkDescriptorSetLayoutBinding b{};
     b.binding = 0;
@@ -517,17 +664,29 @@ bool VulkanBackend::CreatePipelines() {
     plTex.pushConstantRangeCount = 1;
     plTex.pPushConstantRanges = &pcr;
     VK_FAIL(vkCreatePipelineLayout(device, &plTex, nullptr, &layoutTex), "create layoutTex");
+  } // createLayouts (gap #4: skipped when a secondary window adopted the owner's layouts)
 
     pipeBasic = MakePipeline(basicFrag, layoutNoTex, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false);
     pipeText  = MakePipeline(textFrag,  layoutTex,   VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false);
     pipeMSDF  = MakePipeline(msdfFrag,  layoutTex,   VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false);
+    // Brief 35-B: subpixel text pipeline (same layout, SRC1 blend factors). A
+    // failure here degrades to grayscale instead of failing the whole init.
+    if (dualSrcBlendSupported && msdfSubpixelFrag) {
+        pipeMSDFSubpixel = MakePipeline(msdfSubpixelFrag, layoutTex,
+                                        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false,
+                                        /*dualSource=*/true);
+        if (!pipeMSDFSubpixel)
+            Log(LogLevel::Warning, "Vulkan: subpixel text pipeline failed — using grayscale text");
+    }
     pipeImage = MakePipeline(imageFrag, layoutTex,   VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false);
     pipeLines = MakePipeline(basicFrag, layoutNoTex, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, wideLinesSupported);
-    return pipeBasic && pipeText && pipeMSDF && pipeImage && pipeLines;
+    pipeSDF   = MakeSDFPipeline(); // SDF uses layoutNoTex (no texture, push constants only)
+    return pipeBasic && pipeText && pipeMSDF && pipeImage && pipeLines && pipeSDF;
 }
 
 VkPipeline VulkanBackend::MakePipeline(VkShaderModule frag, VkPipelineLayout layout,
-                                       VkPrimitiveTopology topology, bool dynamicLineWidth) {
+                                       VkPrimitiveTopology topology, bool dynamicLineWidth,
+                                       bool dualSource) {
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -583,6 +742,15 @@ VkPipeline VulkanBackend::MakePipeline(VkShaderModule frag, VkPipelineLayout lay
     cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
     cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    // Brief 35-B: the subpixel text pipeline takes its blend factors from the
+    // shader's SECOND output (per-channel coverage), so each LCD stripe blends
+    // independently. Mirrors glBlendFuncSeparate(SRC1_COLOR, ONE_MINUS_SRC1_COLOR, …).
+    if (dualSource) {
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC1_COLOR;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC1_ALPHA;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    }
     cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
@@ -634,6 +802,118 @@ VkPipeline VulkanBackend::MakePipeline(VkShaderModule frag, VkPipelineLayout lay
     return pipe;
 }
 
+// Instanced SDF pipeline (brief 01). Two vertex bindings: binding 0 = per-vertex
+// unit quad (vec2); binding 1 = per-instance SDFInstance. Uses layoutNoTex.
+VkPipeline VulkanBackend::MakeSDFPipeline() {
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = sdfVertModule;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = sdfFrag;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription binds[2]{};
+    binds[0].binding = 0;
+    binds[0].stride = sizeof(float) * 2;          // aQuad
+    binds[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    binds[1].binding = 1;
+    binds[1].stride = sizeof(SDFInstance);
+    binds[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+
+    VkVertexInputAttributeDescription attrs[8]{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32_SFLOAT,       0};
+    attrs[1] = {1, 1, VK_FORMAT_R32G32_SFLOAT,       offsetof(SDFInstance, cx)};
+    attrs[2] = {2, 1, VK_FORMAT_R32G32_SFLOAT,       offsetof(SDFInstance, hx)};
+    attrs[3] = {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(SDFInstance, radius)};
+    attrs[4] = {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(SDFInstance, fillR)};
+    attrs[5] = {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(SDFInstance, borderR)};
+    attrs[6] = {6, 1, VK_FORMAT_R32_SFLOAT,          offsetof(SDFInstance, revealIntensity)};
+    attrs[7] = {7, 1, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(SDFInstance, borderR2)}; // brief 34 Parte E
+
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 2;
+    vi.pVertexBindingDescriptions = binds;
+    vi.vertexAttributeDescriptionCount = 8;
+    vi.pVertexAttributeDescriptions = attrs;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = sampleCount;
+
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_FALSE;
+    ds.depthWriteEnable = VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynci{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynci.dynamicStateCount = 2;
+    dynci.pDynamicStates = dynStates;
+
+    VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpci.stageCount = 2;
+    gpci.pStages = stages;
+    gpci.pVertexInputState = &vi;
+    gpci.pInputAssemblyState = &ia;
+    gpci.pViewportState = &vp;
+    gpci.pRasterizationState = &rs;
+    gpci.pMultisampleState = &ms;
+    gpci.pDepthStencilState = &ds;
+    gpci.pColorBlendState = &cb;
+    gpci.pDynamicState = &dynci;
+    gpci.layout = layoutNoTex;
+    gpci.subpass = 0;
+
+    VkPipelineRenderingCreateInfo prci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkFormat colorFmt = colorFormat;
+    if (useDynamicRendering) {
+        prci.colorAttachmentCount    = 1;
+        prci.pColorAttachmentFormats = &colorFmt;
+        prci.depthAttachmentFormat   = depthFormat;
+        prci.stencilAttachmentFormat = stencilFormat;
+        gpci.pNext = &prci;
+        gpci.renderPass = VK_NULL_HANDLE;
+    } else {
+        gpci.renderPass = renderPass;
+    }
+
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe) != VK_SUCCESS) {
+        Log(LogLevel::Error, "Vulkan: failed to create SDF graphics pipeline");
+        return VK_NULL_HANDLE;
+    }
+    return pipe;
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Buffers / memory
 // ───────────────────────────────────────────────────────────────────────────
@@ -676,6 +956,26 @@ bool VulkanBackend::CreateDynamicBuffers() {
                           ring[i].ebo, ring[i].eboMem)) return false;
         VK_FAIL(vkMapMemory(device, ring[i].vboMem, 0, kVertexBytesPerSlot, 0, &ring[i].vboMapped), "map vbo");
         VK_FAIL(vkMapMemory(device, ring[i].eboMem, 0, kIndexBytesPerSlot, 0, &ring[i].eboMapped), "map ebo");
+    }
+
+    // Static unit-quad geometry for the SDF pipeline (brief 01). Host-visible and
+    // filled once; tiny so the upload cost is negligible.
+    {
+        const float quadVerts[8] = {
+            -1.0f, -1.0f,   1.0f, -1.0f,   1.0f, 1.0f,   -1.0f, 1.0f
+        };
+        const uint32_t quadIdx[6] = { 0, 1, 2, 0, 2, 3 };
+        if (!CreateBuffer(sizeof(quadVerts), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, hostProps,
+                          sdfQuadVbo, sdfQuadVboMem)) return false;
+        if (!CreateBuffer(sizeof(quadIdx), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, hostProps,
+                          sdfQuadIbo, sdfQuadIboMem)) return false;
+        void* p = nullptr;
+        VK_FAIL(vkMapMemory(device, sdfQuadVboMem, 0, sizeof(quadVerts), 0, &p), "map sdf quad vbo");
+        std::memcpy(p, quadVerts, sizeof(quadVerts));
+        vkUnmapMemory(device, sdfQuadVboMem);
+        VK_FAIL(vkMapMemory(device, sdfQuadIboMem, 0, sizeof(quadIdx), 0, &p), "map sdf quad ibo");
+        std::memcpy(p, quadIdx, sizeof(quadIdx));
+        vkUnmapMemory(device, sdfQuadIboMem);
     }
     return true;
 }
@@ -802,6 +1102,37 @@ void VulkanBackend::TransitionImageLayout(VkCommandBuffer cmd, VkImage image,
         b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+        // → render-target write (dynamic rendering offscreen pass). oldLayout is
+        // UNDEFINED (fresh / contents discarded) or SHADER_READ_ONLY (re-bound).
+        b.srcAccessMask = (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                              ? VK_ACCESS_SHADER_READ_BIT : 0;
+        b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+        srcStage = (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                       ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                       : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+               newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        // Offscreen render done → make it samplable.
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+               newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        // CopyTexture source.
+        b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+               newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     } else { // UNDEFINED -> SHADER_READ_ONLY (empty atlas)
         b.srcAccessMask = 0;
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -900,6 +1231,22 @@ void* VulkanBackend::CreateTexture(int width, int height, const void* data, bool
     return t;
 }
 
+// Brief 24: Vulkan implements render targets (brief 05), save/restore, copy,
+// external-texture wrapping and the instanced SDF pipeline. ReadPixel has no
+// framebuffer readback yet, so it's omitted. Acrylic (#5) is a RUNTIME capability:
+// reported only while `acrylicReady` (own swapchain to capture the backdrop).
+uint32_t VulkanBackend::Capabilities() const {
+    uint32_t caps = static_cast<uint32_t>(RenderCap::RenderTargets)
+                  | static_cast<uint32_t>(RenderCap::SaveRestore)
+                  | static_cast<uint32_t>(RenderCap::CopyTexture)
+                  | static_cast<uint32_t>(RenderCap::Instancing)
+                  | static_cast<uint32_t>(RenderCap::ExternalTexture);
+    if (acrylicReady) caps |= static_cast<uint32_t>(RenderCap::Acrylic);
+    // Brief 35-B: only advertised when the dual-source pipeline really exists.
+    if (pipeMSDFSubpixel != VK_NULL_HANDLE) caps |= static_cast<uint32_t>(RenderCap::SubpixelText);
+    return caps;
+}
+
 void* VulkanBackend::RegisterExternalTexture(void* nativeView, void* samplerHandle, int layout) {
     if (!nativeView) {
         Log(LogLevel::Error, "Vulkan: RegisterExternalTexture called with null VkImageView");
@@ -987,12 +1334,49 @@ void VulkanBackend::DeleteTexture(void* textureHandle) {
 // ───────────────────────────────────────────────────────────────────────────
 void VulkanBackend::SetFrameCommandBuffer(void* cmdBuffer) {
     externalCmd = reinterpret_cast<VkCommandBuffer>(cmdBuffer);
+    if (!sharedMode) return;
+    // En modo compartido el frame de GPU empieza AQUÍ, no en BeginFrame: el host construye
+    // su UI primero y solo entrega el command buffer cuando ya está dentro de su render
+    // pass. Por eso el avance del ring y el viewport/scissor iniciales viven en esta
+    // función — hacerlos en BeginFrame significaba tocarlos con el cmd del frame ANTERIOR
+    // (ya enviado y reseteado): errores de validación "not in the recording state" y, con
+    // suficientes draws, una caída dentro del driver.
+    currentCmd = externalCmd;
+    if (!currentCmd) return;
+    currentRing = (currentRing + 1) % kRingSize;
+    ring[currentRing].vboOffset = 0;
+    ring[currentRing].eboOffset = 0;
+    ringOverflowWarned  = false;
+    warnedNoExternalCmd = false;
+    SetFullViewportAndScissor();   // el host ya está dentro de su render pass
+}
+
+bool VulkanBackend::GetSharedContext(VulkanSharedContext* out) const {
+    if (!out || device == VK_NULL_HANDLE) return false;
+    out->instance         = instance;
+    out->physicalDevice   = physicalDevice;
+    out->device           = device;
+    out->graphicsQueue    = graphicsQueue;
+    out->queueFamilyIndex = queueFamilyIndex;
+    out->colorFormat      = static_cast<uint32_t>(colorFormat);
+    out->sampleCount      = static_cast<uint32_t>(sampleCount);
+    out->renderPass       = 0;
+    out->dynamicRendering = false;
+    // Mark it as a request for a secondary window with its own swapchain.
+    out->ownSwapchain     = true;
+    out->ownerBackend     = (void*)this; // gap #4: let the secondary adopt our shaders/layouts
+    return true;
 }
 
 void VulkanBackend::SetFullViewportAndScissor() {
     if (!currentCmd) return;
-    const float w = static_cast<float>(sharedMode ? logicalViewport.width  : swapExtent.width);
-    const float h = static_cast<float>(sharedMode ? logicalViewport.height : swapExtent.height);
+    // When rendering to an offscreen RT, use its dimensions; the same
+    // negative-height Y-flip convention keeps the GL ortho matrix valid and makes
+    // the RT sample upright (UV (0,0) = top-left) exactly like the main target.
+    const float w = static_cast<float>(currentRT ? currentRT->width
+                                                 : (sharedMode ? logicalViewport.width  : swapExtent.width));
+    const float h = static_cast<float>(currentRT ? currentRT->height
+                                                 : (sharedMode ? logicalViewport.height : swapExtent.height));
     // Negative-height viewport flips Y so the GL ortho matrix works unchanged.
     VkViewport vp{0.0f, h, w, -h, 0.0f, 1.0f};
     vkCmdSetViewport(currentCmd, 0, 1, &vp);
@@ -1002,14 +1386,19 @@ void VulkanBackend::SetFullViewportAndScissor() {
 
 void VulkanBackend::ApplyScissor() {
     if (!currentCmd) return;
-    // Framebuffer size in physical pixels.
-    const int fbW = static_cast<int>(sharedMode ? logicalViewport.width  : swapExtent.width);
-    const int fbH = static_cast<int>(sharedMode ? logicalViewport.height : swapExtent.height);
+    // Framebuffer size in physical pixels (RT pixels when an offscreen target is active).
+    const int fbW = static_cast<int>(currentRT ? currentRT->width
+                                               : (sharedMode ? logicalViewport.width  : swapExtent.width));
+    const int fbH = static_cast<int>(currentRT ? currentRT->height
+                                               : (sharedMode ? logicalViewport.height : swapExtent.height));
     // Clip rects arrive in *logical* coordinates (same space as the ortho matrix).
-    // The geometry is stretched to the physical framebuffer by the viewport, so the
-    // scissor must scale logical → physical too, or it won't line up on HiDPI.
-    const float sx = (logicalViewport.width  > 0) ? static_cast<float>(fbW) / logicalViewport.width  : 1.0f;
-    const float sy = (logicalViewport.height > 0) ? static_cast<float>(fbH) / logicalViewport.height : 1.0f;
+    // For the main target the geometry is stretched to the physical framebuffer by
+    // the viewport, so the scissor must scale logical → physical too (HiDPI). For an
+    // RT the caller drives the projection in RT-pixel space, so the mapping is 1:1.
+    const float sx = currentRT ? 1.0f
+                   : ((logicalViewport.width  > 0) ? static_cast<float>(fbW) / logicalViewport.width  : 1.0f);
+    const float sy = currentRT ? 1.0f
+                   : ((logicalViewport.height > 0) ? static_cast<float>(fbH) / logicalViewport.height : 1.0f);
     VkRect2D sc;
     if (clipStack.empty()) {
         sc = {{0, 0}, {static_cast<uint32_t>(fbW), static_cast<uint32_t>(fbH)}};
@@ -1029,20 +1418,12 @@ void VulkanBackend::BeginFrame(const Color& clearColor) {
     ringOverflowWarned = false;
 
     if (sharedMode) {
-        currentCmd = externalCmd;
-        if (!currentCmd) {
-            if (!warnedNoExternalCmd) {
-                Log(LogLevel::Warning, "Vulkan shared: no external command buffer set — UI will not "
-                    "render. Call SetFrameCommandBuffer(cmd) each frame, inside the engine's active "
-                    "render pass, before Render().");
-                warnedNoExternalCmd = true;
-            }
-            return;
-        }
-        currentRing = (currentRing + 1) % kRingSize;
-        ring[currentRing].vboOffset = 0;
-        ring[currentRing].eboOffset = 0;
-        SetFullViewportAndScissor(); // engine is already inside its render pass
+        // Sin command buffer todavía: BeginFrame abre la fase de CONSTRUCCIÓN de la UI, que
+        // corre fuera del render pass del host. Dejarlo a null es deliberado — así todo lo
+        // que intente grabar antes de tiempo (RecordDraw, ApplyScissor, SetFullViewport…)
+        // se ignora en vez de escribir en el command buffer del frame anterior. El frame de
+        // GPU arranca en SetFrameCommandBuffer().
+        currentCmd = VK_NULL_HANDLE;
         return;
     }
 
@@ -1081,6 +1462,11 @@ void VulkanBackend::BeginFrame(const Color& clearColor) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(currentCmd, &bi);
 
+    // #5: the content-behind capture happens lazily inside the main pass at the first
+    // acrylic panel (CaptureBehindAndBlur breaks/resumes the pass). Just arm it here.
+    backdropCapturedThisFrame = false;
+    blurReady = false;
+
     VkClearValue clear{};
     clear.color = {{clearColor.r, clearColor.g, clearColor.b, clearColor.a}};
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -1095,13 +1481,26 @@ void VulkanBackend::BeginFrame(const Color& clearColor) {
 }
 
 void VulkanBackend::EndFrame() {
+    // Safety net: if the caller left an offscreen RT bound, end its pass and flush
+    // the offscreen command buffer so we never finish the frame mid-RT (which would
+    // leak the transient buffer and leave currentCmd pointing at it).
+    if (currentRT || offscreenCmd != VK_NULL_HANDLE) {
+        SetRenderTarget(nullptr);
+    }
+    stateStack.clear();
+
     if (sharedMode) {
-        // The engine ends its render pass, submits, and presents.
-        currentCmd = VK_NULL_HANDLE;
+        // The engine ends its render pass, submits, and presents. El externalCmd se olvida
+        // AQUÍ: es válido solo para este frame, y conservarlo hacía que el frame siguiente
+        // grabase sobre un command buffer ya enviado.
+        currentCmd  = VK_NULL_HANDLE;
+        externalCmd = VK_NULL_HANDLE;
         return;
     }
     if (!currentCmd) return; // frame was skipped
 
+    // Ends whichever main pass is active: the original CLEAR pass, or the loadOp=LOAD
+    // pass we resumed after an acrylic content-behind capture. Both finalLayout=PRESENT_SRC.
     vkCmdEndRenderPass(currentCmd);
     vkEndCommandBuffer(currentCmd);
 
@@ -1158,9 +1557,9 @@ void VulkanBackend::PopClipRect() {
 void VulkanBackend::DrawBatch(ShaderType type, const RenderVertex* vertices, size_t vertexCount,
                               const unsigned int* indices, size_t indexCount,
                               void* textureHandle, const float* projectionMatrix,
-                              const Color& textColor) {
+                              const Color& textColor, float msdfPxRange) {
     RecordDraw(type, vertices, vertexCount, indices, indexCount, textureHandle,
-               projectionMatrix, textColor, /*isLines=*/false, 1.0f);
+               projectionMatrix, textColor, /*isLines=*/false, 1.0f, msdfPxRange);
 }
 
 void VulkanBackend::DrawLines(const RenderVertex* vertices, size_t vertexCount,
@@ -1169,11 +1568,72 @@ void VulkanBackend::DrawLines(const RenderVertex* vertices, size_t vertexCount,
                projectionMatrix, Color(1, 1, 1, 1), /*isLines=*/true, width);
 }
 
+void VulkanBackend::DrawSDFInstances(const SDFInstance* instances, size_t count,
+                                     const float* projectionMatrix,
+                                     const float* revealCursor) {
+    if (!currentCmd || count == 0 || !instances) return;
+    DynBuffer& rb = ring[currentRing];
+
+    const VkDeviceSize bytes = count * sizeof(SDFInstance);
+    if (rb.vboOffset + bytes > kVertexBytesPerSlot) {
+        if (!ringOverflowWarned) {
+            Log(LogLevel::Warning, "Vulkan: vertex ring slot overflow — dropping SDF draws this frame");
+            ringOverflowWarned = true;
+        }
+        return;
+    }
+    const VkDeviceSize instLocal = rb.vboOffset;
+
+    if (srgbTarget) {
+        // Linearize the instance fill/border colors so the GPU's sRGB write-encode
+        // reproduces the authored color (parity with the vertex-color path).
+        scratchInstances.assign(instances, instances + count);
+        for (auto& s : scratchInstances) {
+            s.fillR = SrgbToLinear(s.fillR); s.fillG = SrgbToLinear(s.fillG); s.fillB = SrgbToLinear(s.fillB);
+            s.borderR = SrgbToLinear(s.borderR); s.borderG = SrgbToLinear(s.borderG); s.borderB = SrgbToLinear(s.borderB);
+            // brief 34 Parte E: mismo tratamiento al color del bisel inferior (paridad).
+            s.borderR2 = SrgbToLinear(s.borderR2); s.borderG2 = SrgbToLinear(s.borderG2); s.borderB2 = SrgbToLinear(s.borderB2);
+        }
+        std::memcpy(static_cast<char*>(rb.vboMapped) + instLocal, scratchInstances.data(), bytes);
+    } else {
+        std::memcpy(static_cast<char*>(rb.vboMapped) + instLocal, instances, bytes);
+    }
+    rb.vboOffset = AlignUp(rb.vboOffset + bytes, 16);
+
+    vkCmdBindPipeline(currentCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeSDF);
+
+    PushConstants pc{};
+    std::memcpy(pc.projection, projectionMatrix, sizeof(pc.projection));
+    pc.pxRange = 4.0f;
+    if (revealCursor) { pc.reveal[0] = revealCursor[0]; pc.reveal[1] = revealCursor[1]; pc.reveal[2] = revealCursor[2]; }
+    vkCmdPushConstants(currentCmd, layoutNoTex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(pc), &pc);
+
+    // Binding 0: static quad. Binding 1: per-instance data in the ring buffer.
+    VkBuffer vbos[2] = { sdfQuadVbo, rb.vbo };
+    VkDeviceSize offs[2] = { 0, instLocal };
+    vkCmdBindVertexBuffers(currentCmd, 0, 2, vbos, offs);
+    vkCmdBindIndexBuffer(currentCmd, sdfQuadIbo, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(currentCmd, 6, static_cast<uint32_t>(count), 0, 0, 0);
+}
+
 void VulkanBackend::RecordDraw(ShaderType type, const RenderVertex* vertices, size_t vertexCount,
                                const unsigned int* indices, size_t indexCount,
                                void* textureHandle, const float* projectionMatrix,
-                               const Color& textColor, bool isLines, float lineWidth) {
-    if (!currentCmd || vertexCount == 0) return;
+                               const Color& textColor, bool isLines, float lineWidth,
+                               float msdfPxRange) {
+    if (!currentCmd || vertexCount == 0) {
+        // Un draw sin command buffer en modo compartido = el host no llamó a
+        // SetFrameCommandBuffer este frame (antes se avisaba en BeginFrame, donde es
+        // NORMAL no tenerlo todavía; aquí ya es un fallo real del host).
+        if (sharedMode && !currentCmd && vertexCount > 0 && !warnedNoExternalCmd) {
+            Log(LogLevel::Warning, "Vulkan shared: no external command buffer set — UI will not "
+                "render. Call SetFrameCommandBuffer(cmd) each frame, inside the engine's active "
+                "render pass, before Render().");
+            warnedNoExternalCmd = true;
+        }
+        return;
+    }
     DynBuffer& rb = ring[currentRing];
 
     const VkDeviceSize vboBytes = vertexCount * sizeof(RenderVertex);
@@ -1201,13 +1661,22 @@ void VulkanBackend::RecordDraw(ShaderType type, const RenderVertex* vertices, si
     rb.vboOffset = AlignUp(rb.vboOffset + vboBytes, 16);
 
     // Select pipeline + layout.
+    // Brief 35-B: an MSDF batch goes to the subpixel pipeline only when the caller
+    // asked for it AND the device really has it built.
+    const bool subpixelBatch = (type == ShaderType::MSDF) && !isLines &&
+                               textParams.subpixel != 0 &&
+                               pipeMSDFSubpixel != VK_NULL_HANDLE;
+
     VkPipeline pipe; VkPipelineLayout layout; bool hasTex = false;
     if (isLines) {
         pipe = pipeLines; layout = layoutNoTex;
     } else switch (type) {
         case ShaderType::Basic: pipe = pipeBasic; layout = layoutNoTex; break;
         case ShaderType::Text:  pipe = pipeText;  layout = layoutTex; hasTex = true; break;
-        case ShaderType::MSDF:  pipe = pipeMSDF;  layout = layoutTex; hasTex = true; break;
+        case ShaderType::MSDF:
+            pipe = subpixelBatch ? pipeMSDFSubpixel : pipeMSDF;
+            layout = layoutTex; hasTex = true;
+            break;
         case ShaderType::Image: pipe = pipeImage; layout = layoutTex; hasTex = true; break;
         default: pipe = pipeBasic; layout = layoutNoTex; break;
     }
@@ -1227,7 +1696,27 @@ void VulkanBackend::RecordDraw(ShaderType type, const RenderVertex* vertices, si
         pc.textColor[2] = textColor.b;
     }
     pc.textColor[3] = textColor.a;
-    pc.pxRange = 4.0f;
+    // Brief 29 Part C: msdf.frag now uses the canonical msdfgen formula
+    // (0.5 * dot(unitRange, screenTexSize), floored at 1.0), so it wants the atlas'
+    // REAL distanceRange — plumbed per-batch via msdfPxRange (brief 29 Part B). The
+    // 12.0f fallback (the static atlas' range) only applies if no batch range
+    // arrived; SDF/icons stay at 4.
+    pc.pxRange = (type == ShaderType::MSDF)
+                     ? (msdfPxRange > 0.0f ? msdfPxRange : 12.0f) // 12 = static atlas distanceRange
+                     : 4.0f;
+    // Brief 35-A/35-B: transfer curve + subpixel controls. Non-MSDF batches get the
+    // identity so nothing else can inherit the curve.
+    if (type == ShaderType::MSDF) {
+        pc.textGamma = textParams.gamma;
+        pc.textContrast = textParams.contrast;
+        pc.textSubpixel = subpixelBatch ? (textParams.subpixel < 0 ? -1.0f : 1.0f) : 0.0f;
+        pc.textFringe = textParams.fringe;
+    } else {
+        pc.textGamma = 1.0f;
+        pc.textContrast = 0.0f;
+        pc.textSubpixel = 0.0f;
+        pc.textFringe = 0.0f;
+    }
     vkCmdPushConstants(currentCmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(pc), &pc);
 
@@ -1261,6 +1750,870 @@ void VulkanBackend::RecordDraw(ShaderType type, const RenderVertex* vertices, si
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Render targets / SaveState / RestoreState (brief 05)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Shared-mode strategy (also used standalone for symmetry):
+//   In BOTH modes the *main* color target's render pass is active across all UI
+//   draws — standalone begins the swapchain pass in BeginFrame; in shared mode the
+//   engine is already inside its own pass when it calls us. Beginning a nested
+//   render pass on that command buffer is illegal (validation error), and ending
+//   the engine's pass is not ours to do. So offscreen RT passes are recorded on a
+//   PRIVATE transient command buffer (offscreenCmd, allocated from uploadPool) and
+//   submitted with a fence-synced wait when control returns to the main target.
+//   This guarantees: (a) no nested/foreign pass on the main buffer, and (b) the RT
+//   image is fully written and transitioned to SHADER_READ_ONLY_OPTIMAL before the
+//   main pass samples it. The main buffer (mainCmd) is simply paused while we draw
+//   into the RT and resumed afterwards.
+//
+//   Caveat (documented): re-binding an RT clears it (loadOp = CLEAR). Draw all the
+//   content you need for a target in a single SetRenderTarget(rt) ... draw ...
+//   SetRenderTarget(prev) span. This matches blur ping-pong usage (each pass fully
+//   overwrites its target).
+
+bool VulkanBackend::CreateOffscreenRenderPass(VkRenderTarget* rt) {
+    VkAttachmentDescription color{};
+    color.format = colorFormat;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // CLEAR makes prior contents irrelevant, so UNDEFINED is the cheapest valid
+    // initial layout (works for both the first use and every re-bind).
+    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    color.finalLayout   = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &colorRef;
+
+    // External → subpass: nothing earlier in the offscreen buffer touches this
+    // image (sampling, if any, happened in a previous, already-completed submit),
+    // so TOP_OF_PIPE is sufficient. Subpass → external: publish the color write to
+    // later fragment-shader sampling.
+    VkSubpassDependency deps[2]{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].srcAccessMask = 0;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &color;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies = deps;
+    if (vkCreateRenderPass(device, &rpci, nullptr, &rt->pass) != VK_SUCCESS) {
+        Log(LogLevel::Error, "Vulkan: failed to create offscreen render pass");
+        return false;
+    }
+    return true;
+}
+
+VulkanBackend::VulkanTexture* VulkanBackend::CreateRTSampleTexture(VkRenderTarget* rt) {
+    auto* t = new VulkanTexture();
+    t->external = true;            // image/view are owned by the RT, freed in DestroyRenderTarget
+    t->image  = rt->image;         // kept so CopyTexture can vkCmdCopyImage on it
+    t->view   = rt->view;
+    t->width  = rt->width;
+    t->height = rt->height;
+    t->descriptor = AllocateTextureDescriptor(t->descriptorPool);
+    if (!t->descriptor) { delete t; return nullptr; }
+
+    VkDescriptorImageInfo dii{};
+    dii.sampler = sampler;
+    dii.imageView = rt->view;
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = t->descriptor;
+    w.dstBinding = 0;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &dii;
+    vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+    // Not pushed into `textures`: its lifetime is bound to the RT.
+    return t;
+}
+
+void* VulkanBackend::CreateRenderTarget(int width, int height) {
+    if (width <= 0 || height <= 0) return nullptr;
+    auto* rt = new VkRenderTarget();
+    rt->width = width;
+    rt->height = height;
+
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = colorFormat;
+    ici.extent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device, &ici, nullptr, &rt->image) != VK_SUCCESS) {
+        Log(LogLevel::Error, "Vulkan: failed to create render target image");
+        delete rt; return nullptr;
+    }
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device, rt->image, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device, &mai, nullptr, &rt->memory) != VK_SUCCESS ||
+        vkBindImageMemory(device, rt->image, rt->memory, 0) != VK_SUCCESS) {
+        Log(LogLevel::Error, "Vulkan: failed to allocate/bind render target memory");
+        DestroyRenderTarget(rt); return nullptr;
+    }
+
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = rt->image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = colorFormat;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(device, &vci, nullptr, &rt->view) != VK_SUCCESS) {
+        Log(LogLevel::Error, "Vulkan: failed to create render target view");
+        DestroyRenderTarget(rt); return nullptr;
+    }
+
+    if (!useDynamicRendering) {
+        if (!CreateOffscreenRenderPass(rt)) { DestroyRenderTarget(rt); return nullptr; }
+        VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fci.renderPass = rt->pass;
+        fci.attachmentCount = 1;
+        fci.pAttachments = &rt->view;
+        fci.width = static_cast<uint32_t>(width);
+        fci.height = static_cast<uint32_t>(height);
+        fci.layers = 1;
+        if (vkCreateFramebuffer(device, &fci, nullptr, &rt->framebuffer) != VK_SUCCESS) {
+            Log(LogLevel::Error, "Vulkan: failed to create render target framebuffer");
+            DestroyRenderTarget(rt); return nullptr;
+        }
+    }
+
+    rt->sampleTex = CreateRTSampleTexture(rt);
+    if (!rt->sampleTex) { DestroyRenderTarget(rt); return nullptr; }
+
+    rt->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    renderTargets.push_back(rt);
+    return rt;
+}
+
+void VulkanBackend::BeginOffscreenRecording() {
+    if (offscreenCmd != VK_NULL_HANDLE) return; // already recording offscreen
+    mainCmd = currentCmd;                        // pause the main buffer
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = uploadPool;                 // transient pool
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &ai, &offscreenCmd) != VK_SUCCESS) {
+        Log(LogLevel::Error, "Vulkan: failed to allocate offscreen command buffer");
+        offscreenCmd = VK_NULL_HANDLE;
+        return;
+    }
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(offscreenCmd, &bi);
+    currentCmd = offscreenCmd;                    // draws now target the offscreen buffer
+}
+
+void VulkanBackend::BeginRTPass(VkRenderTarget* rt) {
+    if (offscreenCmd == VK_NULL_HANDLE) return;
+    VkClearValue clear{};
+    clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+    if (useDynamicRendering) {
+        TransitionImageLayout(offscreenCmd, rt->image, rt->layout,
+                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        rt->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        att.imageView = rt->view;
+        att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.clearValue = clear;
+
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{0, 0}, {static_cast<uint32_t>(rt->width), static_cast<uint32_t>(rt->height)}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &att;
+        vkCmdBeginRendering(offscreenCmd, &ri);
+    } else {
+        VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rbi.renderPass = rt->pass;
+        rbi.framebuffer = rt->framebuffer;
+        rbi.renderArea = {{0, 0}, {static_cast<uint32_t>(rt->width), static_cast<uint32_t>(rt->height)}};
+        rbi.clearValueCount = 1;
+        rbi.pClearValues = &clear;
+        vkCmdBeginRenderPass(offscreenCmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        // The render pass transitions the image to SHADER_READ_ONLY at the end.
+    }
+    SetFullViewportAndScissor();
+    ApplyScissor();
+}
+
+void VulkanBackend::EndRTPass() {
+    if (!currentRT || offscreenCmd == VK_NULL_HANDLE) return;
+    if (useDynamicRendering) {
+        vkCmdEndRendering(offscreenCmd);
+        TransitionImageLayout(offscreenCmd, currentRT->image,
+                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    } else {
+        vkCmdEndRenderPass(offscreenCmd); // finalLayout already SHADER_READ_ONLY
+    }
+    currentRT->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+void VulkanBackend::FlushOffscreen() {
+    if (offscreenCmd == VK_NULL_HANDLE) return;
+    vkEndCommandBuffer(offscreenCmd);
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &offscreenCmd;
+    // Fence-synced submit so the RT(s) are fully rendered and in SHADER_READ_ONLY
+    // before the main pass (recorded on mainCmd, submitted later) samples them.
+    // NOTE: in shared mode the queue belongs to the engine — VkQueue submission
+    // requires external synchronization (the host must not submit from another
+    // thread concurrently). Same caveat as the texture-upload path.
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(device, &fci, nullptr, &fence) == VK_SUCCESS) {
+        vkQueueSubmit(graphicsQueue, 1, &si, fence);
+        vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+        vkDestroyFence(device, fence, nullptr);
+    } else {
+        vkQueueSubmit(graphicsQueue, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphicsQueue);
+    }
+    vkFreeCommandBuffers(device, uploadPool, 1, &offscreenCmd);
+    offscreenCmd = VK_NULL_HANDLE;
+    currentCmd = mainCmd;   // resume the main command buffer
+    mainCmd = VK_NULL_HANDLE;
+}
+
+void VulkanBackend::SetRenderTarget(void* target) {
+    auto* rt = static_cast<VkRenderTarget*>(target);
+    if (rt == currentRT) return;
+
+    // End the pass of the RT we are leaving (if any).
+    if (currentRT) EndRTPass();
+
+    if (rt) {
+        // Enter / switch to an offscreen RT. BeginOffscreenRecording is idempotent:
+        // when switching RT→RT we keep recording on the same offscreen buffer.
+        BeginOffscreenRecording();
+        currentRT = rt;
+        BeginRTPass(rt);
+    } else {
+        // Return to the main (swapchain/engine) target: submit the offscreen work,
+        // resume the main command buffer, restore its viewport/scissor + clip.
+        currentRT = nullptr;
+        FlushOffscreen();
+        SetFullViewportAndScissor();
+        ApplyScissor();
+    }
+}
+
+void* VulkanBackend::GetRenderTargetTexture(void* target) {
+    if (!target) return nullptr;
+    auto* rt = static_cast<VkRenderTarget*>(target);
+    // The offscreen render pass leaves the image in SHADER_READ_ONLY_OPTIMAL, which
+    // is what the sampling descriptor expects — just hand back the wrapper. If the
+    // RT was created but never rendered, transition it once so sampling is valid.
+    if (rt->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        VkCommandBuffer cmd = BeginSingleTimeCommands();
+        TransitionImageLayout(cmd, rt->image, rt->layout,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        EndSingleTimeCommands(cmd);
+        rt->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    return rt->sampleTex;
+}
+
+void VulkanBackend::CopyTexture(void* src, void* dst, int width, int height) {
+    if (!src || !dst || width <= 0 || height <= 0) return;
+    auto* s = static_cast<VulkanTexture*>(src);
+    auto* d = static_cast<VulkanTexture*>(dst);
+    if (!s->image || !d->image) {
+        Log(LogLevel::Error, "Vulkan CopyTexture: src/dst has no backing image");
+        return;
+    }
+    // Both images are assumed to be in SHADER_READ_ONLY_OPTIMAL (regular textures
+    // after upload, RT sample textures after rendering). Transition, copy, restore.
+    VkCommandBuffer cmd = BeginSingleTimeCommands();
+    TransitionImageLayout(cmd, s->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    TransitionImageLayout(cmd, d->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.extent = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+    vkCmdCopyImage(cmd, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    TransitionImageLayout(cmd, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    TransitionImageLayout(cmd, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    EndSingleTimeCommands(cmd);
+}
+
+void VulkanBackend::DestroyRenderTarget(VkRenderTarget* rt) {
+    if (!rt) return;
+    if (rt->sampleTex) {
+        if (rt->sampleTex->descriptor && rt->sampleTex->descriptorPool)
+            vkFreeDescriptorSets(device, rt->sampleTex->descriptorPool, 1, &rt->sampleTex->descriptor);
+        delete rt->sampleTex;
+        rt->sampleTex = nullptr;
+    }
+    if (rt->framebuffer) vkDestroyFramebuffer(device, rt->framebuffer, nullptr);
+    if (rt->pass)        vkDestroyRenderPass(device, rt->pass, nullptr);
+    if (rt->view)        vkDestroyImageView(device, rt->view, nullptr);
+    if (rt->image)       vkDestroyImage(device, rt->image, nullptr);
+    if (rt->memory)      vkFreeMemory(device, rt->memory, nullptr);
+    delete rt;
+}
+
+void VulkanBackend::DeleteRenderTarget(void* target) {
+    if (!target) return;
+    auto* rt = static_cast<VkRenderTarget*>(target);
+    // No general deferred-deletion queue exists in this backend, so (as DeleteTexture
+    // does) drain the device before freeing — guarantees no in-flight frame still
+    // samples or renders to it. Heavy but correct; RTs are rarely deleted mid-run.
+    if (device) vkDeviceWaitIdle(device);
+    if (rt == currentRT) currentRT = nullptr;
+    auto it = std::find(renderTargets.begin(), renderTargets.end(), rt);
+    if (it != renderTargets.end()) renderTargets.erase(it);
+    DestroyRenderTarget(rt);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Acrylic / Mica (#5) — backdrop capture + composite
+// ───────────────────────────────────────────────────────────────────────────
+// Phase 1: SupportsAcrylic()=true + capture the swapchain into a half-res backdrop
+// at EndFrame, composite the RAW (unblurred) backdrop + tint + luminosity + noise
+// during the main pass. Phase 2 inserts the dual-Kawase blur before the composite.
+
+// Push-constant block — must match acrylic_composite.vert/.frag exactly (124 bytes).
+namespace { struct AcrylicPC {
+    float projection[16]; // 0
+    float tint[4];        // 64
+    float center[2];      // 80
+    float halfSize[2];    // 88
+    float screenSize[2];  // 96
+    float radius;         // 104
+    float soft;           // 108
+    float tintOpacity;    // 112
+    float lumOpacity;     // 116
+    float noiseAmount;    // 120
+}; } // 124 bytes
+
+bool VulkanBackend::CreateAcrylicResources() {
+    // The content-behind capture breaks/resumes the main VkRenderPass, so it requires
+    // a classic render pass (not dynamic rendering). Standalone + shared-device window
+    // both use a VkRenderPass, so this holds; engine-shared dynamic mode keeps fallback.
+    if (useDynamicRendering || renderPass == VK_NULL_HANDLE) {
+        Log(LogLevel::Info, "Vulkan: acrylic disabled (needs a classic swapchain render pass)");
+        return false;
+    }
+    // gap #4 Phase 3: adopt the owner's acrylic shaders + layouts if available (format-
+    // independent, like the main UI ones). The acrylic PIPELINES + offscreen RTs stay
+    // per-window (they depend on this window's swapchain load-pass + render targets).
+    if (resourceOwner_ && !ownsShaderResources &&
+        resourceOwner_->acrylicCompVert != VK_NULL_HANDLE &&
+        resourceOwner_->acrylicLayout != VK_NULL_HANDLE) {
+        acrylicCompVert  = resourceOwner_->acrylicCompVert;
+        acrylicCompFrag  = resourceOwner_->acrylicCompFrag;
+        blurVert         = resourceOwner_->blurVert;
+        kawaseDownFrag   = resourceOwner_->kawaseDownFrag;
+        kawaseUpFrag     = resourceOwner_->kawaseUpFrag;
+        acrylicSetLayout = resourceOwner_->acrylicSetLayout;
+        acrylicLayout    = resourceOwner_->acrylicLayout;
+        kawaseLayout     = resourceOwner_->kawaseLayout;
+        ownsAcrylicShaderResources = false;
+        VKDBG("Vulkan: gap#4 adopted owner acrylic shaders + layouts");
+    } else {
+    // Shader modules (composite + blur).
+    acrylicCompVert = MakeShaderModule(ShadersVK::AcrylicComposite_Vert, ShadersVK::AcrylicComposite_VertSize);
+    acrylicCompFrag = MakeShaderModule(ShadersVK::AcrylicComposite_Frag, ShadersVK::AcrylicComposite_FragSize);
+    blurVert        = MakeShaderModule(ShadersVK::Blur_Vert,       ShadersVK::Blur_VertSize);
+    kawaseDownFrag  = MakeShaderModule(ShadersVK::KawaseDown_Frag, ShadersVK::KawaseDown_FragSize);
+    kawaseUpFrag    = MakeShaderModule(ShadersVK::KawaseUp_Frag,   ShadersVK::KawaseUp_FragSize);
+    if (!acrylicCompVert || !acrylicCompFrag || !blurVert || !kawaseDownFrag || !kawaseUpFrag)
+        return false;
+
+    // Descriptor set layout: 2 combined image samplers (binding0=blur, binding1=noise).
+    VkDescriptorSetLayoutBinding binds[2]{};
+    for (int i = 0; i < 2; ++i) {
+        binds[i].binding = i;
+        binds[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        binds[i].descriptorCount = 1;
+        binds[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dlci.bindingCount = 2;
+    dlci.pBindings = binds;
+    VK_FAIL(vkCreateDescriptorSetLayout(device, &dlci, nullptr, &acrylicSetLayout), "create acrylic set layout");
+
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(AcrylicPC);
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &acrylicSetLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
+    VK_FAIL(vkCreatePipelineLayout(device, &plci, nullptr, &acrylicLayout), "create acrylic pipeline layout");
+
+    // Phase 2: kawase pipeline layout — 1 sampler (reuse texSetLayout) + 8-byte push
+    // (vec2 uHalfpixel, fragment). The kawase pipelines themselves are created lazily
+    // (CreateKawasePipelines) once a compatible offscreen RT exists.
+    {
+        VkPushConstantRange kpcr{};
+        kpcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        kpcr.offset = 0; kpcr.size = sizeof(float) * 2;
+        VkPipelineLayoutCreateInfo kplci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        kplci.setLayoutCount = 1; kplci.pSetLayouts = &texSetLayout;
+        kplci.pushConstantRangeCount = 1; kplci.pPushConstantRanges = &kpcr;
+        VK_FAIL(vkCreatePipelineLayout(device, &kplci, nullptr, &kawaseLayout), "create kawase pipeline layout");
+    }
+    } // else — gap #4: this window created its own acrylic shaders/layouts
+
+    // Composite pipeline: no vertex buffer (positions from gl_VertexIndex), triangle
+    // strip (4 verts), standard alpha blend, dynamic viewport/scissor.
+    {
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = acrylicCompVert; stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = acrylicCompFrag; stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1; vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = sampleCount;
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.blendEnable = VK_TRUE;
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.colorBlendOp = VK_BLEND_OP_ADD;
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.alphaBlendOp = VK_BLEND_OP_ADD;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1; cb.pAttachments = &cba;
+        VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynci{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynci.dynamicStateCount = 2; dynci.pDynamicStates = dynStates;
+
+        VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gpci.stageCount = 2; gpci.pStages = stages;
+        gpci.pVertexInputState = &vi; gpci.pInputAssemblyState = &ia;
+        gpci.pViewportState = &vp; gpci.pRasterizationState = &rs;
+        gpci.pMultisampleState = &ms; gpci.pDepthStencilState = &ds;
+        gpci.pColorBlendState = &cb; gpci.pDynamicState = &dynci;
+        gpci.layout = acrylicLayout; gpci.subpass = 0;
+
+        VkPipelineRenderingCreateInfo prci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        VkFormat colorFmt = colorFormat;
+        if (useDynamicRendering) {
+            prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
+            prci.depthAttachmentFormat = depthFormat; prci.stencilAttachmentFormat = stencilFormat;
+            gpci.pNext = &prci; gpci.renderPass = VK_NULL_HANDLE;
+        } else {
+            gpci.renderPass = renderPass;
+        }
+        VK_FAIL(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipeAcrylicComposite),
+                "create acrylic composite pipeline");
+    }
+
+    // Dedicated descriptor pool + one persistent set for the composite (2 samplers).
+    {
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
+        VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &ps;
+        VK_FAIL(vkCreateDescriptorPool(device, &pci, nullptr, &acrylicDescriptorPool), "create acrylic desc pool");
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = acrylicDescriptorPool;
+        ai.descriptorSetCount = 1; ai.pSetLayouts = &acrylicSetLayout;
+        VK_FAIL(vkAllocateDescriptorSets(device, &ai, &acrylicDescriptor), "alloc acrylic desc set");
+    }
+
+    // Resume pass: same single-color-attachment layout as the swapchain pass but
+    // loadOp=LOAD (preserve the content-behind we already drew) and initialLayout
+    // COLOR_ATTACHMENT (the capture leaves the swapchain image there). finalLayout
+    // PRESENT_SRC so EndFrame can present normally.
+    {
+        VkAttachmentDescription color{};
+        color.format = colorFormat;
+        color.samples = sampleCount;
+        color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color.finalLayout   = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1; sub.pColorAttachments = &colorRef;
+        VkSubpassDependency dep{};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+        VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        rpci.attachmentCount = 1; rpci.pAttachments = &color;
+        rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+        rpci.dependencyCount = 1; rpci.pDependencies = &dep;
+        VK_FAIL(vkCreateRenderPass(device, &rpci, nullptr, &acrylicLoadPass), "create acrylic load pass");
+    }
+
+    acrylicReady = true;
+    Log(LogLevel::Info, "Vulkan: acrylic resources created (content-behind capture + dual-Kawase)");
+    return true;
+}
+
+void VulkanBackend::EnsureBackdropRT(int w, int h) {
+    int hw = std::max(1, w / 2);
+    int hh = std::max(1, h / 2);
+    if (backdropRT && backdropRT->width == hw && backdropRT->height == hh) return;
+    if (backdropRT) {
+        DeleteRenderTarget(backdropRT); // drains the device (rare: only on resize)
+        backdropRT = nullptr;
+    }
+    backdropRT = static_cast<VkRenderTarget*>(CreateRenderTarget(hw, hh));
+    backdropValid = false;                 // contents undefined until first capture
+    acrylicDescBlurView = VK_NULL_HANDLE;  // force descriptor rewrite
+}
+
+// One dual-Kawase pass into `dst`, sampling `src`, recorded INLINE on the current
+// command buffer (only valid while the main render pass is ended — see CaptureBehindAndBlur).
+void VulkanBackend::InlineKawasePass(VkRenderTarget* dst, VkRenderTarget* src, bool down) {
+    if (!dst || !src || !dst->framebuffer || !dst->pass || !src->sampleTex) return;
+    VkClearValue clear{}; clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = dst->pass;          // offscreen pass: CLEAR, finalLayout SHADER_READ
+    rbi.framebuffer = dst->framebuffer;
+    rbi.renderArea = {{0, 0}, {static_cast<uint32_t>(dst->width), static_cast<uint32_t>(dst->height)}};
+    rbi.clearValueCount = 1; rbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(currentCmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport vp{0.0f, 0.0f, static_cast<float>(dst->width), static_cast<float>(dst->height), 0.0f, 1.0f};
+    VkRect2D sc{{0, 0}, {static_cast<uint32_t>(dst->width), static_cast<uint32_t>(dst->height)}};
+    vkCmdSetViewport(currentCmd, 0, 1, &vp);
+    vkCmdSetScissor(currentCmd, 0, 1, &sc);
+
+    float hp[2] = { 0.5f / static_cast<float>(src->width), 0.5f / static_cast<float>(src->height) };
+    vkCmdBindPipeline(currentCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, down ? pipeKawaseDown : pipeKawaseUp);
+    vkCmdPushConstants(currentCmd, kawaseLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(hp), hp);
+    vkCmdBindDescriptorSets(currentCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, kawaseLayout,
+                            0, 1, &src->sampleTex->descriptor, 0, nullptr);
+    vkCmdDraw(currentCmd, 3, 1, 0, 0); // fullscreen triangle
+    vkCmdEndRenderPass(currentCmd);
+    dst->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+// Capture what is BEHIND the acrylic panel (everything drawn so far this frame) and
+// blur it — all on the current command buffer, in submission order, so it reflects the
+// live content. Breaks the main pass, blits the in-progress swapchain to backdropRT,
+// runs the dual-Kawase chain, then resumes the main pass with loadOp=LOAD.
+void VulkanBackend::CaptureBehindAndBlur() {
+    if (!acrylicReady || !currentCmd || swapchain == VK_NULL_HANDLE) return;
+    const int sw = static_cast<int>(swapExtent.width);
+    const int sh = static_cast<int>(swapExtent.height);
+    EnsureBackdropRT(sw, sh);
+    if (!backdropRT) return;
+    EnsureBlurChain(backdropRT->width, backdropRT->height);
+    if (!blurResult || blurChain.size() < 3) return;
+    if (!pipeKawaseDown && !CreateKawasePipelines(blurChain[0])) return;
+
+    VkImage swap = swapImages[currentImageIndex];
+
+    // End the main (CLEAR) pass: the swapchain now holds the content-behind, PRESENT_SRC.
+    vkCmdEndRenderPass(currentCmd);
+
+    auto swapBarrier = [&](VkImageLayout oldL, VkImageLayout newL, VkAccessFlags srcA, VkAccessFlags dstA,
+                           VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = oldL; b.newLayout = newL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = swap; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+        vkCmdPipelineBarrier(currentCmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+
+    // Blit content-behind → backdropRT (downscale, linear).
+    swapBarrier(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    TransitionImageLayout(currentCmd, backdropRT->image, backdropRT->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {sw, sh, 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = {backdropRT->width, backdropRT->height, 1};
+    vkCmdBlitImage(currentCmd, swap, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   backdropRT->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    TransitionImageLayout(currentCmd, backdropRT->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    backdropRT->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    // Restore the swapchain image to COLOR_ATTACHMENT for the loadOp=LOAD resume.
+    swapBarrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+    // Dual-Kawase: down (backdrop→L0→L1→L2) then up (→L1→L0→blurResult).
+    InlineKawasePass(blurChain[0], backdropRT,   true);
+    InlineKawasePass(blurChain[1], blurChain[0], true);
+    InlineKawasePass(blurChain[2], blurChain[1], true);
+    InlineKawasePass(blurChain[1], blurChain[2], false);
+    InlineKawasePass(blurChain[0], blurChain[1], false);
+    InlineKawasePass(blurResult,   blurChain[0], false);
+
+    // Resume the main pass (LOAD preserves the content-behind) so the composite and the
+    // rest of the frame draw on top.
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = acrylicLoadPass;
+    rbi.framebuffer = framebuffers[currentImageIndex];
+    rbi.renderArea = {{0, 0}, swapExtent};
+    rbi.clearValueCount = 0;
+    vkCmdBeginRenderPass(currentCmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    SetFullViewportAndScissor();
+    ApplyScissor();
+
+    backdropValid = true;
+    blurReady = true;
+}
+
+bool VulkanBackend::CreateKawasePipelines(VkRenderTarget* compatibleRT) {
+    if (pipeKawaseDown && pipeKawaseUp) return true;
+    if (!blurVert || !kawaseDownFrag || !kawaseUpFrag || !kawaseLayout) return false;
+
+    auto makeKawase = [&](VkShaderModule frag) -> VkPipeline {
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = blurVert; stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = frag; stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // blur.vert builds a fullscreen triangle
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1; vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT; // offscreen RTs are single-sample
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.blendEnable = VK_FALSE; // blur passes overwrite their target
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1; cb.pAttachments = &cba;
+        VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynci{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynci.dynamicStateCount = 2; dynci.pDynamicStates = dynStates;
+
+        VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gpci.stageCount = 2; gpci.pStages = stages;
+        gpci.pVertexInputState = &vi; gpci.pInputAssemblyState = &ia;
+        gpci.pViewportState = &vp; gpci.pRasterizationState = &rs;
+        gpci.pMultisampleState = &ms; gpci.pDepthStencilState = &ds;
+        gpci.pColorBlendState = &cb; gpci.pDynamicState = &dynci;
+        gpci.layout = kawaseLayout; gpci.subpass = 0;
+        VkPipelineRenderingCreateInfo prci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        VkFormat colorFmt = colorFormat;
+        if (useDynamicRendering) {
+            prci.colorAttachmentCount = 1; prci.pColorAttachmentFormats = &colorFmt;
+            gpci.pNext = &prci; gpci.renderPass = VK_NULL_HANDLE;
+        } else {
+            gpci.renderPass = compatibleRT->pass; // offscreen passes are all compatible
+        }
+        VkPipeline pipe = VK_NULL_HANDLE;
+        if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe) != VK_SUCCESS) {
+            Log(LogLevel::Error, "Vulkan: failed to create kawase pipeline");
+            return VK_NULL_HANDLE;
+        }
+        return pipe;
+    };
+
+    pipeKawaseDown = makeKawase(kawaseDownFrag);
+    pipeKawaseUp   = makeKawase(kawaseUpFrag);
+    return pipeKawaseDown && pipeKawaseUp;
+}
+
+void VulkanBackend::EnsureBlurChain(int bw, int bh) {
+    // blurResult at backdrop resolution; 3 chain levels at /2, /4, /8 for the
+    // down/up dual-Kawase ping-pong.
+    if (blurResult && blurResult->width == bw && blurResult->height == bh && blurChain.size() == 3) return;
+    for (auto* rt : blurChain) if (rt) DeleteRenderTarget(rt); // drains device (resize only)
+    blurChain.clear();
+    if (blurResult) { DeleteRenderTarget(blurResult); blurResult = nullptr; }
+    blurResult = static_cast<VkRenderTarget*>(CreateRenderTarget(bw, bh));
+    for (int i = 1; i <= 3; ++i) {
+        int w = std::max(1, bw >> i), h = std::max(1, bh >> i);
+        if (auto* rt = static_cast<VkRenderTarget*>(CreateRenderTarget(w, h))) blurChain.push_back(rt);
+    }
+    blurReady = false;
+}
+
+void VulkanBackend::DrawAcrylicPanel(const AcrylicParams& p, const float* projectionMatrix) {
+    if (!acrylicReady || !currentCmd) return;
+    if (p.w <= 0.0f || p.h <= 0.0f) return;
+
+    // On the first acrylic panel of the frame, capture+blur the content drawn so far
+    // (= what's behind this panel) by breaking and resuming the main pass. Later panels
+    // reuse that blur. If the capture failed, bail (no flat fallback at this layer).
+    if (!backdropCapturedThisFrame) {
+        CaptureBehindAndBlur();
+        backdropCapturedThisFrame = true;
+    }
+    if (!blurReady || !blurResult || !blurResult->sampleTex) return;
+
+    VkImageView blurView = blurResult->sampleTex->view;
+    auto* noise = static_cast<VulkanTexture*>(p.noiseTex);
+    VkImageView noiseView = (noise && noise->view) ? noise->view : blurView;
+
+    if (acrylicDescBlurView != blurView || acrylicDescNoiseTex != p.noiseTex) {
+        VkDescriptorImageInfo imgs[2]{};
+        imgs[0].sampler = sampler; imgs[0].imageView = blurView;
+        imgs[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imgs[1].sampler = sampler; imgs[1].imageView = noiseView;
+        imgs[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet w[2]{};
+        for (int i = 0; i < 2; ++i) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = acrylicDescriptor; w[i].dstBinding = i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[i].pImageInfo = &imgs[i];
+        }
+        vkUpdateDescriptorSets(device, 2, w, 0, nullptr);
+        acrylicDescBlurView = blurView;
+        acrylicDescNoiseTex = p.noiseTex;
+    }
+
+    AcrylicPC pc{};
+    std::memcpy(pc.projection, projectionMatrix, sizeof(pc.projection));
+    // Tint: linearize when the target is sRGB (parity with the vertex-color path).
+    if (srgbTarget) {
+        pc.tint[0] = SrgbToLinear(p.tintR); pc.tint[1] = SrgbToLinear(p.tintG); pc.tint[2] = SrgbToLinear(p.tintB);
+    } else {
+        pc.tint[0] = p.tintR; pc.tint[1] = p.tintG; pc.tint[2] = p.tintB;
+    }
+    pc.tint[3] = 1.0f;
+    pc.center[0] = p.x + p.w * 0.5f; pc.center[1] = p.y + p.h * 0.5f;
+    pc.halfSize[0] = p.w * 0.5f;     pc.halfSize[1] = p.h * 0.5f;
+    pc.screenSize[0] = static_cast<float>(swapExtent.width);
+    pc.screenSize[1] = static_cast<float>(swapExtent.height);
+    pc.radius = p.cornerRadius;
+    pc.soft = std::max(1.0f, p.dpiScale);
+    pc.tintOpacity = p.tintOpacity;
+    pc.lumOpacity = p.luminosityOpacity;
+    pc.noiseAmount = p.noiseAmount;
+
+    vkCmdBindPipeline(currentCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeAcrylicComposite);
+    vkCmdPushConstants(currentCmd, acrylicLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdBindDescriptorSets(currentCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, acrylicLayout,
+                            0, 1, &acrylicDescriptor, 0, nullptr);
+    // Keep the current viewport/scissor (panel clip already applied by the batch path);
+    // the shader masks to the rounded rect. Draw the 4-vertex strip.
+    vkCmdDraw(currentCmd, 4, 1, 0, 0);
+}
+
+void VulkanBackend::DestroyAcrylicResources() {
+    // backdropRT / blurResult / blurChain are tracked in renderTargets (CreateRenderTarget
+    // pushes them); remove them here so Shutdown's renderTargets loop won't double-free them.
+    auto dropRT = [&](VkRenderTarget*& rt) {
+        if (!rt) return;
+        auto it = std::find(renderTargets.begin(), renderTargets.end(), rt);
+        if (it != renderTargets.end()) renderTargets.erase(it);
+        DestroyRenderTarget(rt);
+        rt = nullptr;
+    };
+    for (auto* rt : blurChain) { VkRenderTarget* tmp = rt; dropRT(tmp); }
+    blurChain.clear();
+    dropRT(blurResult);
+    dropRT(backdropRT);
+    if (kawaseLayout) { if (ownsAcrylicShaderResources) vkDestroyPipelineLayout(device, kawaseLayout, nullptr); kawaseLayout = VK_NULL_HANDLE; }
+    blurReady = false;
+    if (acrylicDescriptorPool) { vkDestroyDescriptorPool(device, acrylicDescriptorPool, nullptr); acrylicDescriptorPool = VK_NULL_HANDLE; }
+    acrylicDescriptor = VK_NULL_HANDLE;
+    if (pipeAcrylicComposite) { vkDestroyPipeline(device, pipeAcrylicComposite, nullptr); pipeAcrylicComposite = VK_NULL_HANDLE; }
+    if (pipeKawaseDown) { vkDestroyPipeline(device, pipeKawaseDown, nullptr); pipeKawaseDown = VK_NULL_HANDLE; }
+    if (pipeKawaseUp)   { vkDestroyPipeline(device, pipeKawaseUp, nullptr);   pipeKawaseUp = VK_NULL_HANDLE; }
+    if (acrylicLayout)    { if (ownsAcrylicShaderResources) vkDestroyPipelineLayout(device, acrylicLayout, nullptr); acrylicLayout = VK_NULL_HANDLE; }
+    if (acrylicSetLayout) { if (ownsAcrylicShaderResources) vkDestroyDescriptorSetLayout(device, acrylicSetLayout, nullptr); acrylicSetLayout = VK_NULL_HANDLE; }
+    if (acrylicLoadPass)  { vkDestroyRenderPass(device, acrylicLoadPass, nullptr); acrylicLoadPass = VK_NULL_HANDLE; }
+    auto destroyMod = [&](VkShaderModule& m){ if (m) { if (ownsAcrylicShaderResources) vkDestroyShaderModule(device, m, nullptr); m = VK_NULL_HANDLE; } };
+    destroyMod(acrylicCompVert); destroyMod(acrylicCompFrag);
+    destroyMod(blurVert); destroyMod(kawaseDownFrag); destroyMod(kawaseUpFrag);
+    acrylicReady = false;
+    backdropValid = false;
+    backdropCapturedThisFrame = false;
+}
+
+void VulkanBackend::SaveState() {
+    SavedState s;
+    s.rt = currentRT;
+    s.clipStack = clipStack;
+    stateStack.push_back(std::move(s));
+}
+
+void VulkanBackend::RestoreState() {
+    if (stateStack.empty()) return;
+    SavedState s = std::move(stateStack.back());
+    stateStack.pop_back();
+    // Restore the active target. Common nesting (save main → RT work → restore main)
+    // is lossless: returning to nullptr just flushes offscreen work and resumes the
+    // untouched main pass. NOTE: restoring INTO a non-null RT re-begins its pass and
+    // therefore CLEARS it (loadOp = CLEAR) — don't rely on resuming an RT's contents.
+    if (s.rt != currentRT) SetRenderTarget(s.rt);
+    clipStack = s.clipStack;
+    SetFullViewportAndScissor();
+    ApplyScissor();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Swapchain recreation / teardown
 // ───────────────────────────────────────────────────────────────────────────
 void VulkanBackend::DestroySwapchain() {
@@ -1283,6 +2636,20 @@ void VulkanBackend::RecreateSwapchain() {
 
 void VulkanBackend::Shutdown() {
     if (device) vkDeviceWaitIdle(device);
+
+    // Render targets (brief 05). Device is idle, so destroy directly. Free any
+    // still-open offscreen command buffer first.
+    if (offscreenCmd != VK_NULL_HANDLE && uploadPool) {
+        vkFreeCommandBuffers(device, uploadPool, 1, &offscreenCmd);
+        offscreenCmd = VK_NULL_HANDLE;
+    }
+    // #5: tear down acrylic resources first (removes backdropRT from renderTargets).
+    DestroyAcrylicResources();
+
+    for (auto* rt : renderTargets) DestroyRenderTarget(rt);
+    renderTargets.clear();
+    currentRT = nullptr;
+    stateStack.clear();
 
     for (auto* t : textures) {
         if (!t->external) {
@@ -1308,19 +2675,43 @@ void VulkanBackend::Shutdown() {
         ring[i] = DynBuffer{};
     }
 
-    auto destroyPipe = [&](VkPipeline& p){ if (p) { vkDestroyPipeline(device, p, nullptr); p = VK_NULL_HANDLE; } };
-    destroyPipe(pipeBasic); destroyPipe(pipeText); destroyPipe(pipeMSDF);
-    destroyPipe(pipeImage); destroyPipe(pipeLines);
-    if (layoutNoTex) { vkDestroyPipelineLayout(device, layoutNoTex, nullptr); layoutNoTex = VK_NULL_HANDLE; }
-    if (layoutTex)   { vkDestroyPipelineLayout(device, layoutTex, nullptr);   layoutTex = VK_NULL_HANDLE; }
-    if (texSetLayout){ vkDestroyDescriptorSetLayout(device, texSetLayout, nullptr); texSetLayout = VK_NULL_HANDLE; }
+    if (sdfQuadVbo) { vkDestroyBuffer(device, sdfQuadVbo, nullptr); sdfQuadVbo = VK_NULL_HANDLE; }
+    if (sdfQuadVboMem) { vkFreeMemory(device, sdfQuadVboMem, nullptr); sdfQuadVboMem = VK_NULL_HANDLE; }
+    if (sdfQuadIbo) { vkDestroyBuffer(device, sdfQuadIbo, nullptr); sdfQuadIbo = VK_NULL_HANDLE; }
+    if (sdfQuadIboMem) { vkFreeMemory(device, sdfQuadIboMem, nullptr); sdfQuadIboMem = VK_NULL_HANDLE; }
 
-    auto destroyShader = [&](VkShaderModule& m){ if (m) { vkDestroyShaderModule(device, m, nullptr); m = VK_NULL_HANDLE; } };
-    destroyShader(vertModule); destroyShader(basicFrag); destroyShader(textFrag);
-    destroyShader(msdfFrag); destroyShader(imageFrag);
+    // gap #4 Phase 2: only the owner frees the shared UI pipelines. A secondary that
+    // ADOPTED them (ownsPipelines=false) just drops the handles below.
+    if (ownsPipelines) {
+        auto destroyPipe = [&](VkPipeline p){ if (p) vkDestroyPipeline(device, p, nullptr); };
+        destroyPipe(pipeBasic); destroyPipe(pipeText); destroyPipe(pipeMSDF);
+        destroyPipe(pipeImage); destroyPipe(pipeLines); destroyPipe(pipeSDF);
+        destroyPipe(pipeMSDFSubpixel); // brief 35-B
+    }
+    pipeBasic = VK_NULL_HANDLE; pipeText = VK_NULL_HANDLE; pipeMSDF = VK_NULL_HANDLE;
+    pipeImage = VK_NULL_HANDLE; pipeLines = VK_NULL_HANDLE; pipeSDF = VK_NULL_HANDLE;
+    pipeMSDFSubpixel = VK_NULL_HANDLE;
+    // gap #4: only the resource owner frees the shared shader modules + layouts. A
+    // secondary window that ADOPTED them (ownsShaderResources=false) just drops the
+    // handles below without destroying (the owner outlives the secondaries).
+    if (ownsShaderResources) {
+        if (layoutNoTex) vkDestroyPipelineLayout(device, layoutNoTex, nullptr);
+        if (layoutTex)   vkDestroyPipelineLayout(device, layoutTex, nullptr);
+        if (texSetLayout) vkDestroyDescriptorSetLayout(device, texSetLayout, nullptr);
+        auto destroyShader = [&](VkShaderModule m){ if (m) vkDestroyShaderModule(device, m, nullptr); };
+        destroyShader(vertModule); destroyShader(basicFrag); destroyShader(textFrag);
+        destroyShader(msdfFrag); destroyShader(msdfSubpixelFrag); destroyShader(imageFrag);
+        destroyShader(sdfVertModule); destroyShader(sdfFrag);
+    }
+    layoutNoTex = VK_NULL_HANDLE; layoutTex = VK_NULL_HANDLE; texSetLayout = VK_NULL_HANDLE;
+    vertModule = VK_NULL_HANDLE; basicFrag = VK_NULL_HANDLE; textFrag = VK_NULL_HANDLE;
+    msdfFrag = VK_NULL_HANDLE; msdfSubpixelFrag = VK_NULL_HANDLE; imageFrag = VK_NULL_HANDLE;
+    sdfVertModule = VK_NULL_HANDLE; sdfFrag = VK_NULL_HANDLE;
 
-    // Standalone-owned objects.
-    if (ownsDevice) {
+    // Window-owned objects: present in standalone AND in the shared-device,
+    // own-swapchain secondary-window mode. Destroyed without touching the device.
+    const bool ownsWindowResources = ownsDevice || ownSwapchainOnSharedDevice;
+    if (ownsWindowResources) {
         DestroySwapchain();
         for (int i = 0; i < kFramesInFlight; ++i) {
             if (frames[i].imageAvailable) vkDestroySemaphore(device, frames[i].imageAvailable, nullptr);
@@ -1334,12 +2725,19 @@ void VulkanBackend::Shutdown() {
     renderPass = VK_NULL_HANDLE;
     ownsRenderPass = false;
 
+    // Our own surface (standalone or secondary window) — uses the instance, which
+    // is shared in the secondary-window case, so destroy it before nulling handles.
+    if (ownsWindowResources && surface) {
+        vkDestroySurfaceKHR(instance, surface, nullptr);
+        surface = VK_NULL_HANDLE;
+    }
+
     if (ownsDevice) {
         if (device)   { vkDestroyDevice(device, nullptr); device = VK_NULL_HANDLE; }
-        if (surface)  { vkDestroySurfaceKHR(instance, surface, nullptr); surface = VK_NULL_HANDLE; }
         if (instance) { vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; }
     } else {
-        device = VK_NULL_HANDLE; instance = VK_NULL_HANDLE; // borrowed, don't destroy
+        // Borrowed device/instance — don't destroy. (Surface, if any, already freed.)
+        device = VK_NULL_HANDLE; instance = VK_NULL_HANDLE;
     }
 }
 

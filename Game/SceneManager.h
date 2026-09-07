@@ -28,6 +28,13 @@ public:
     bool load(const std::string& path);       // deserializa → nueva activa
     const std::string& currentPath() const { return m_currentPath; }
 
+    // (De)serialización EN MEMORIA, mismo formato que el archivo. La usa el editor para
+    // fotografiar la escena al pulsar Play y devolverla tal cual al parar, de modo que
+    // jugar no altere lo que estabas editando. `fromJson` sustituye la escena activa (el
+    // puntero de current() cambia: los modos lo detectan y re-vinculan sus entidades).
+    nlohmann::json toJson() const;
+    void           fromJson(const nlohmann::json& j);
+
 private:
     // (De)serialización registrada por tipo de componente. Mantiene el ECS ajeno a JSON.
     struct TypeIO {

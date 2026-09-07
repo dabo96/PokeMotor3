@@ -140,8 +140,12 @@ void SceneManager::init(AssetManager* assets) {
     io.load = [this](Scene& s, Entity e, const nlohmann::json& j) {
         SpriteComponent c = j.get<SpriteComponent>();
         // Sin ruta (p.ej. el jugador, cuya textura la pone el modo desde la hoja de
-        // animación) no hay nada que resolver; evita un loadTexture("") fallido.
-        if (m_assets && !c.texturePath.empty()) c.tex = m_assets->loadTexture(c.texturePath, true, true, c.filter);
+        // animación, o una entidad a la que aún no se le asignó imagen) se usa la textura
+        // blanca: un placeholder VISIBLE es mejor que una entidad que no se ve. Un
+        // loadTexture("") solo dejaría un aviso en la consola.
+        if (m_assets)
+            c.tex = c.texturePath.empty() ? m_assets->whiteTexture()
+                                          : m_assets->loadTexture(c.texturePath, true, true, c.filter);
         s.add<SpriteComponent>(e, std::move(c));
     };
     m_types.push_back(std::move(io));
@@ -152,7 +156,9 @@ void SceneManager::newScene() {
     m_currentPath.clear();
 }
 
-bool SceneManager::save(const std::string& path) {
+// Escena activa → JSON. Mismo formato que el archivo (es literalmente lo que se escribe):
+// así el snapshot de Play y el guardado a disco no pueden divergir.
+nlohmann::json SceneManager::toJson() const {
     nlohmann::json j;
     j["entities"] = nlohmann::json::array();
     for (Entity e : m_current->allEntities()) {
@@ -165,6 +171,28 @@ bool SceneManager::save(const std::string& path) {
             }
         j["entities"].push_back({ { "components", std::move(comps) } });
     }
+    return j;
+}
+
+// JSON → escena NUEVA que pasa a ser la activa. El puntero de `current()` cambia a
+// propósito: es la señal por la que los modos re-vinculan sus entidades (ver el GOTCHA de
+// que un Entity solo vale en SU escena).
+void SceneManager::fromJson(const nlohmann::json& j) {
+    auto fresh = std::make_unique<Scene>();
+    if (j.contains("entities") && j["entities"].is_array()) {
+        for (const auto& ej : j["entities"]) {
+            Entity e = fresh->createEntity();
+            if (!ej.contains("components")) continue;
+            for (auto it = ej["components"].begin(); it != ej["components"].end(); ++it)
+                for (const TypeIO& io : m_types)
+                    if (io.name == it.key()) { io.load(*fresh, e, it.value()); break; }
+        }
+    }
+    m_current = std::move(fresh);
+}
+
+bool SceneManager::save(const std::string& path) {
+    const nlohmann::json j = toJson();
 
     std::ofstream f(path);
     if (!f) { LOG_WARN("SceneManager: no se pudo escribir '%s'", path.c_str()); return false; }
@@ -183,17 +211,7 @@ bool SceneManager::load(const std::string& path) {
     try { f >> j; }
     catch (const std::exception& e) { LOG_ERROR("SceneManager: JSON inválido (%s)", e.what()); return false; }
 
-    auto fresh = std::make_unique<Scene>();
-    if (j.contains("entities") && j["entities"].is_array()) {
-        for (const auto& ej : j["entities"]) {
-            Entity e = fresh->createEntity();
-            if (!ej.contains("components")) continue;
-            for (auto it = ej["components"].begin(); it != ej["components"].end(); ++it)
-                for (const TypeIO& io : m_types)
-                    if (io.name == it.key()) { io.load(*fresh, e, it.value()); break; }
-        }
-    }
-    m_current     = std::move(fresh);
+    fromJson(j);
     m_currentPath = path;
     LOG_INFO("Escena cargada de %s (%zu entidades).", path.c_str(), m_current->allEntities().size());
     return true;

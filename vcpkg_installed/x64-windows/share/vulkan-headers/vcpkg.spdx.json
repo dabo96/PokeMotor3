@@ -3,13 +3,13 @@
   "spdxVersion": "SPDX-2.2",
   "dataLicense": "CC0-1.0",
   "SPDXID": "SPDXRef-DOCUMENT",
-  "documentNamespace": "https://spdx.org/spdxdocs/vulkan-headers-x64-windows-1.4.335.0-79ac3167-c7a9-41d7-b24b-1e9e71b1f352",
-  "name": "vulkan-headers:x64-windows@1.4.335.0 0d590186d52fc827ff22f2d63297bff14c0a44c00332949f62d5aed6a8afcc5b",
+  "documentNamespace": "https://spdx.org/spdxdocs/vulkan-headers-x64-windows-1.4.335.0-8e187c74-c79b-4dd5-ba1b-fa679f71f911",
+  "name": "vulkan-headers:x64-windows@1.4.335.0 417ab60a87726914f36e333bdbc073ea3e00df6261a631f17be7a42f874db84b",
   "creationInfo": {
     "creators": [
       "Tool: vcpkg-2025-12-16-44bb3ce006467fc13ba37ca099f64077b8bbf84d"
     ],
-    "created": "2026-05-18T03:54:01Z"
+    "created": "2026-07-05T07:48:42Z"
   },
   "relationships": [
     {
@@ -399,7 +399,7 @@
     {
       "name": "vulkan-headers:x64-windows",
       "SPDXID": "SPDXRef-binary",
-      "versionInfo": "0d590186d52fc827ff22f2d63297bff14c0a44c00332949f62d5aed6a8afcc5b",
+      "versionInfo": "417ab60a87726914f36e333bdbc073ea3e00df6261a631f17be7a42f874db84b",
       "downloadLocation": "NONE",
       "licenseConcluded": "(Apache-2.0 OR MIT)",
       "licenseDeclared": "NOASSERTION",

@@ -19,8 +19,11 @@ bool BeginMenuBar() {
 
   Vec2 viewport = ctx->renderer.GetViewportSize();
 
+  // Top offset lets a host stack the menu bar below a custom TitleBar() (0 = top).
+  float offsetY = ctx->menuBarOffsetY;
+
   auto &menuBar = ctx->menuBarState;
-  menuBar.position = Vec2(0.0f, 0.0f);
+  menuBar.position = Vec2(0.0f, offsetY);
   menuBar.size = Vec2(viewport.x, MENUBAR_HEIGHT);
   menuBar.initialized = true;
 
@@ -29,17 +32,16 @@ bool BeginMenuBar() {
   // Full-width background — darkest bar (use app background, not panel header)
   Color menuBarBg = ctx->style.backgroundColor;
   ctx->renderer.DrawRectFilled(menuBar.position, menuBar.size, menuBarBg, 0.0f);
-  IsMouseOver(ctx, menuBar.position, menuBar.size);   // marca la barra como UI (WantCaptureMouse)
 
   // Subtle bottom border (--border-soft)
   ctx->renderer.DrawRectFilled(
-      Vec2(0.0f, MENUBAR_HEIGHT - 1.0f),
+      Vec2(0.0f, offsetY + MENUBAR_HEIGHT - 1.0f),
       Vec2(viewport.x, 1.0f),
       panelStyle.borderColor, 0.0f);
 
   // Cursor starts with left padding; horizontal layout uses auto width (not full viewport)
   float leftPad = 12.0f;
-  ctx->cursorPos = Vec2(leftPad, 0.0f);
+  ctx->cursorPos = Vec2(leftPad, offsetY);
   ctx->lastItemPos = ctx->cursorPos;
 
   BeginHorizontal(4.0f, Vec2(0.0f, MENUBAR_HEIGHT), Vec2(0.0f, 0.0f));
@@ -56,8 +58,8 @@ void EndMenuBar() {
 
   auto &menuBar = ctx->menuBarState;
 
-  // Advance cursor below the menu bar
-  ctx->cursorPos = Vec2(0.0f, menuBar.size.y);
+  // Advance cursor below the menu bar (respecting any top offset)
+  ctx->cursorPos = Vec2(0.0f, menuBar.position.y + menuBar.size.y);
   ctx->lastItemPos = ctx->cursorPos;
   ctx->lastItemSize = menuBar.size;
 }
@@ -72,7 +74,7 @@ bool BeginMenu(const std::string &label, uint32_t iconCodepoint, bool enabled) {
     return false;
 
   uint32_t menuId = GenerateId("MENU:", label.c_str());
-  auto &state = ctx->menuStates[menuId];
+  auto &state = ctx->GetMenuState(menuId);
 
   const PanelStyle &panelStyle = ctx->style.panel;
   const TextStyle &textStyle = ctx->style.GetTextStyle(TypographyStyle::Body);
@@ -100,9 +102,11 @@ bool BeginMenu(const std::string &label, uint32_t iconCodepoint, bool enabled) {
       ctx->activeMenuId = 0;
     } else {
       // Cerrar todos los otros menús
-      for (auto &[id, otherState] : ctx->menuStates) {
-        if (id != menuId) {
-          otherState.open = false;
+      // brief 22 (fase 6): los menús viven en widgetStates; recorremos el mapa
+      // unificado filtrando las entradas con sub-estado menu presente.
+      for (auto &[id, ws] : ctx->widgetStates) {
+        if (ws.menu && id != menuId) {
+          ws.menu->open = false;
         }
       }
       state.open = true;
@@ -199,12 +203,10 @@ void EndMenu() {
   uint32_t currentMenuId = ctx->menuIdStack.back();
   ctx->menuIdStack.pop_back();
 
-  // Find the menu state for this specific menu
-  auto it = ctx->menuStates.find(currentMenuId);
-  if (it == ctx->menuStates.end())
-    return;
-
-  auto &state = it->second;
+  // Find the menu state for this specific menu (currentMenuId proviene del
+  // menuIdStack, sólo empujado por BeginMenu con el menú abierto → la entrada
+  // existe; GetMenuState no crea nada espurio aquí).
+  auto &state = ctx->GetMenuState(currentMenuId);
 
   // ALWAYS close the BeginVertical that BeginMenu opened, even if a MenuItem
   // click set state.open = false during this frame. Otherwise the layout stack
@@ -296,8 +298,8 @@ void EndMenu() {
     }
 
     // Save dropdown rect in MenuState so NewFrame can check clicks against it
-    it->second.dropdownPos = dropdown.dropdownPos;
-    it->second.dropdownSize = dropdown.dropdownSize;
+    state.dropdownPos = dropdown.dropdownPos;
+    state.dropdownSize = dropdown.dropdownSize;
 
     // Publicar el rect para el bloqueo de input por overlay de los widgets de
     // fondo. Persiste hasta que RenderDeferredDropdowns lo limpie al cerrarse,
@@ -333,8 +335,8 @@ bool MenuItem(const std::string &label, uint32_t iconCodepoint, bool enabled) {
     return false;
 
   uint32_t currentMenuId = ctx->menuIdStack.back();
-  auto it = ctx->menuStates.find(currentMenuId);
-  if (it == ctx->menuStates.end() || !it->second.open)
+  auto &state = ctx->GetMenuState(currentMenuId);
+  if (!state.open)
     return false;
 
   const PanelStyle &panelStyle = ctx->style.panel;
@@ -366,6 +368,8 @@ bool MenuItem(const std::string &label, uint32_t iconCodepoint, bool enabled) {
   if (!enabled) {
     itemBg = Color(itemBg.r * 0.5f, itemBg.g * 0.5f, itemBg.b * 0.5f, itemBg.a);
   }
+  // brief 35 Part B: hover fill del item animado (color spring, id por label).
+  itemBg = AnimateFill(ctx, GenerateId("MENUITEMC:", label.c_str()), itemBg);
   item.bgColor = itemBg;
 
   Color textColor =
@@ -382,7 +386,7 @@ bool MenuItem(const std::string &label, uint32_t iconCodepoint, bool enabled) {
 
   // Si se hace click, cerrar el menú
   if (clicked) {
-    it->second.open = false;
+    state.open = false;
     ctx->activeMenuId = 0;
   }
 
@@ -399,8 +403,8 @@ void MenuSeparator() {
     return;
 
   uint32_t currentMenuId = ctx->menuIdStack.back();
-  auto it = ctx->menuStates.find(currentMenuId);
-  if (it == ctx->menuStates.end() || !it->second.open)
+  auto &state = ctx->GetMenuState(currentMenuId);
+  if (!state.open)
     return;
 
   const PanelStyle &panelStyle = ctx->style.panel;
@@ -442,7 +446,6 @@ void BeginToolbar() {
   // Draw toolbar background — slightly lighter than menubar for visual separation
   Color toolbarBg = panelStyle.background;
   ctx->renderer.DrawRectFilled(toolbarPos, toolbarSize, toolbarBg, 0.0f);
-  IsMouseOver(ctx, toolbarPos, toolbarSize);   // marca la barra como UI (WantCaptureMouse)
 
   // Draw a subtle bottom border
   Color borderColor = panelStyle.borderColor;
@@ -502,7 +505,6 @@ void BeginStatusBar(const std::string &text) {
   // Draw statusbar background
   Color statusBg = AdjustContainerBackground(panelStyle.headerBackground, ctx->style.isDarkTheme);
   ctx->renderer.DrawRectFilled(statusPos, statusSize, statusBg, 0.0f);
-  IsMouseOver(ctx, statusPos, statusSize);   // marca la barra como UI (WantCaptureMouse)
 
   // Draw a subtle top border
   Color borderColor = panelStyle.borderColor;

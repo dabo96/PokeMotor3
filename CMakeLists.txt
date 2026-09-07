@@ -35,6 +35,16 @@ set(FLUENTUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(FLUENTUI_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 add_subdirectory(Libraries/WinUI3)
 
+# Fuera del Developer Command Prompt, Ninja + MSVC no encuentra los headers/libs del
+# sistema. FluentUI ya los autodetecta para su propio subárbol; aquí reusamos esas
+# rutas para los targets del motor (si no, PokeMotor falla con "Cannot open include
+# file: 'string'"). Dentro del Developer Prompt las variables vienen vacías y esto
+# es un no-op: manda el entorno.
+if(FLUENTUI_SYSTEM_INCLUDE_DIRS)
+    include_directories(SYSTEM ${FLUENTUI_SYSTEM_INCLUDE_DIRS})
+    link_directories(${FLUENTUI_SYSTEM_LIBRARY_DIRS})
+endif()
+
 if(NOT Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     message(FATAL_ERROR
         "glslangValidator no encontrado. Instala el Vulkan SDK de LunarG "
@@ -166,7 +176,8 @@ add_custom_target(vk_shaders ALL
         "$<TARGET_FILE_DIR:PokeMotor>/Shaders/SPV")
 add_dependencies(PokeMotor vk_shaders)
 
-# SDL3.dll + assets junto al exe.
+# SDL3.dll + recursos del MOTOR junto al exe. El CONTENIDO ya no viaja en Assets/: vive
+# en Templates/ y solo llega a un proyecto cuando se crea con esa plantilla.
 add_custom_command(TARGET PokeMotor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/SDL3-3.2.28/lib/x64/SDL3.dll"
@@ -178,20 +189,11 @@ add_custom_command(TARGET PokeMotor POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Models/Demo"
         "$<TARGET_FILE_DIR:PokeMotor>/Assets/Models/Demo"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Models/Sprites"
-        "$<TARGET_FILE_DIR:PokeMotor>/Assets/Models/Sprites"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Data"
-        "$<TARGET_FILE_DIR:PokeMotor>/Assets/Data"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Textures"
-        "$<TARGET_FILE_DIR:PokeMotor>/Assets/Textures"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Scripts"
-        "$<TARGET_FILE_DIR:PokeMotor>/Assets/Scripts"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/Assets/Fonts"
         "$<TARGET_FILE_DIR:PokeMotor>/Assets/Fonts"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/Templates"
+        "$<TARGET_FILE_DIR:PokeMotor>/Templates"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/WinUI3/assets"
         "$<TARGET_FILE_DIR:PokeMotor>/assets")

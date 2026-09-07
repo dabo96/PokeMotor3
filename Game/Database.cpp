@@ -6,23 +6,28 @@
 
 #include <json.hpp>
 
+#include <cstdio>
 #include <fstream>
 
 namespace pk {
 
-void Database::loadDefaults() {
-    m_species = {
-        { 1,   "Bulbasaur" }, { 4,  "Charmander" }, { 7,  "Squirtle" },
-        { 10,  "Caterpie"  }, { 16, "Pidgey"     }, { 19, "Rattata"  },
-        { 25,  "Pikachu"   }, { 43, "Oddish"     }, { 129,"Magikarp" },
-    };
+namespace {
+// Convención cuando el JSON no declara "sprite": la carpeta de sprites + el id a 3
+// dígitos. Un único sitio con la ruta, para no repartir literales por el gameplay.
+std::string spritePathForId(int id) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Assets/Models/Sprites/%03d.png", id);
+    return buf;
 }
+}  // namespace
 
 void Database::load(const std::string& path) {
+    m_species.clear();
     std::ifstream f(Project::instance().resolveRead(path));
     if (!f) {
-        LOG_INFO("Database: '%s' no encontrado; usando lista por defecto.", path.c_str());
-        loadDefaults();
+        // Proyecto sin datos de especies: no hay encuentros. El motor no inventa una
+        // lista propia — el contenido lo pone el proyecto (o su plantilla).
+        LOG_INFO("Database: '%s' no encontrado; sin especies (no habrá encuentros).", path.c_str());
         return;
     }
     try {
@@ -30,23 +35,33 @@ void Database::load(const std::string& path) {
         f >> j;
         m_species.clear();
         if (j.is_object()) {
-            // Formato del proyecto: objeto { "Nombre": { "id": N, ... }, ... }.
-            for (auto it = j.begin(); it != j.end(); ++it)
-                m_species.push_back({ it.value().value("id", 0), it.key() });
+            // Formato del proyecto: objeto { "Nombre": { "id": N, "sprite": "...", ... }, ... }.
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                if (!it.key().empty() && it.key()[0] == '_') continue;   // "_comment" y demás notas
+                m_species.push_back({ it.value().value("id", 0), it.key(),
+                                      it.value().value("sprite", std::string()) });
+            }
         } else if (j.is_array()) {
-            // Formato alterno: array [ { "id", "name" }, ... ].
+            // Formato alterno: array [ { "id", "name", "sprite" }, ... ].
             for (const auto& e : j)
-                m_species.push_back({ e.value("id", 0), e.value("name", std::string("???")) });
+                m_species.push_back({ e.value("id", 0), e.value("name", std::string("???")),
+                                      e.value("sprite", std::string()) });
         }
-        if (m_species.empty()) loadDefaults();
-        else LOG_INFO("Database: %zu especies cargadas de '%s'.", m_species.size(), path.c_str());
+        // Sin "sprite" declarado, cae en la convención por id (nunca queda vacío).
+        for (Species& s : m_species)
+            if (s.sprite.empty()) s.sprite = spritePathForId(s.id);
+        LOG_INFO("Database: %zu especies cargadas de '%s'.", m_species.size(), path.c_str());
     } catch (...) {
-        LOG_WARN("Database: '%s' corrupto; usando lista por defecto.", path.c_str());
-        loadDefaults();
+        LOG_WARN("Database: '%s' corrupto; se ignora (sin especies).", path.c_str());
+        m_species.clear();
     }
 }
 
+// Sin especies cargadas devuelve un marcador: pick() ya no puede indexar un vector vacío
+// (quien la llama debería comprobar empty(), pero esto lo hace seguro igualmente).
 const Species& Database::pick(uint32_t r) const {
+    static const Species kNone{ 0, "???", std::string() };
+    if (m_species.empty()) return kNone;
     return m_species[r % m_species.size()];
 }
 

@@ -66,6 +66,7 @@ AnimationSet loadAnimationSet(AssetManager& assets, const std::string& path) {
         out.sheet.texture = h;
         out.sheet.columns = j.value("columns", 1);
         out.sheet.rows    = j.value("rows", 1);
+        out.texturePath   = tex;   // el caller la serializa en el SpriteComponent
 
         if (j.contains("clips") && j["clips"].is_object()) {
             for (auto it = j["clips"].begin(); it != j["clips"].end(); ++it) {

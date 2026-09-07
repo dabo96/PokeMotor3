@@ -1,6 +1,14 @@
-﻿#include "core/InputState.h"
+#ifdef FLUENTUI_HAS_SDL
+#include <SDL3/SDL.h> // only for the per-frame mouse poll (owned/SDL loop); gated for embedded
+#endif
+#include "core/InputState.h"
 #include <string>
 #include <cstdlib>
+// brief 25: the SDL→UIEvent translation (UIKeyFromScancode / TranslateSDLEvent /
+// ProcessSDLEvent) moved to src/Core/SDLPlatform.cpp so SDL event translation lives
+// in the SDL platform TU. brief 26: clipboard now routes through PlatformBackend at
+// the call sites; the only SDL left here is the per-frame mouse poll, gated so the
+// embedded build (SDL=OFF) drives the mouse purely from injected UIEvents.
 
 using namespace FluentUI;
 
@@ -20,6 +28,18 @@ InputState::~InputState() = default;
 
 InputState::InputState(InputState&& other) noexcept = default;
 InputState& InputState::operator=(InputState&& other) noexcept = default;
+
+// ─── brief 20: platform-neutral key queries (state indexed by UIKey) ─────────
+static inline bool keyIndexValid(UIKey k) {
+    return static_cast<int>(k) > 0 && static_cast<int>(k) < static_cast<int>(UIKey::Count);
+}
+bool InputState::IsKeyDown(UIKey key) const     { return keyIndexValid(key) && keysDown[static_cast<size_t>(key)]; }
+bool InputState::IsKeyPressed(UIKey key) const  { return keyIndexValid(key) && keysPressed[static_cast<size_t>(key)]; }
+bool InputState::IsKeyReleased(UIKey key) const { return keyIndexValid(key) && keysReleased[static_cast<size_t>(key)]; }
+
+bool InputState::CtrlDown() const  { return keysDown[static_cast<size_t>(UIKey::LeftCtrl)]  || keysDown[static_cast<size_t>(UIKey::RightCtrl)]; }
+bool InputState::ShiftDown() const { return keysDown[static_cast<size_t>(UIKey::LeftShift)] || keysDown[static_cast<size_t>(UIKey::RightShift)]; }
+bool InputState::AltDown() const   { return keysDown[static_cast<size_t>(UIKey::LeftAlt)]   || keysDown[static_cast<size_t>(UIKey::RightAlt)]; }
 
 const std::string& InputState::TextInputBuffer() const
 {
@@ -48,7 +68,7 @@ bool InputState::HasComposition() const
     return textInputData && !textInputData->compositionText.empty();
 }
 
-void InputState::Update(SDL_Window* window)
+void InputState::Update(WindowHandle window)
 {
     keysPressed.fill(false);
     keysReleased.fill(false);
@@ -59,49 +79,64 @@ void InputState::Update(SDL_Window* window)
         textInputData->buffer.clear();
     }
     droppedFiles.clear();
+    droppedText.clear();   // brief 18.7
     anyKeyPressed = false;
 
     prevMouseX = mouseX;
     prevMouseY = mouseY;
 
-    // En SDL3, obtener la posición actual del mouse cada frame
-    // Esto asegura que siempre tengamos la posición correcta, incluso sin eventos
-    if (window) {
-        float mouseXPos, mouseYPos;
-        SDL_GetMouseState(&mouseXPos, &mouseYPos);
-        mouseX = mouseXPos;
-        mouseY = mouseYPos;
+    // En SDL3, obtener la posición actual del mouse cada frame asegura que siempre
+    // tengamos la posición correcta, incluso sin eventos. PERO SDL_GetMouseState
+    // devuelve coords relativas a la ventana CON FOCO de ratón: en multi-ventana,
+    // si el ratón está sobre OTRA ventana, aplicarlas aquí provoca hover fantasma
+    // (la ventana sin foco "cree" que el cursor está dentro). Solo refrescamos la
+    // posición cuando ESTA ventana tiene el foco del ratón; si no, mandamos el
+    // cursor fuera para que el hover se limpie.
+    // brief 26: this per-frame poll is an SDL-loop convenience; the embedded build
+    // (SDL=OFF) tracks the mouse purely from injected mouse-move UIEvents.
+#ifdef FLUENTUI_HAS_SDL
+    SDL_Window* win = static_cast<SDL_Window*>(window);
+    if (win) {
+        if (SDL_GetMouseFocus() == win) {
+            float mouseXPos, mouseYPos;
+            SDL_GetMouseState(&mouseXPos, &mouseYPos);
+            mouseX = mouseXPos;
+            mouseY = mouseYPos;
+        } else {
+            mouseX = -1000.0f;
+            mouseY = -1000.0f;
+        }
     }
-    
+#else
+    (void)window;
+#endif
+
     mouseDX = mouseX - prevMouseX;
     mouseDY = mouseY - prevMouseY;
 }
 
-void InputState::ProcessEvent(const SDL_Event& e)
+void InputState::ProcessEvent(const UIEvent& e)
 {
     switch (e.type)
     {
-        //
-    case SDL_EVENT_KEY_DOWN:
-        if (e.key.scancode < SDL_SCANCODE_COUNT)
-        {
-            keysDown[e.key.scancode] = true;
-            keysPressed[e.key.scancode] = true;
-            anyKeyPressed = true;
+    case UIEventType::KeyDown:
+        if (keyIndexValid(e.key)) {
+            keysDown[static_cast<size_t>(e.key)] = true;
+            keysPressed[static_cast<size_t>(e.key)] = true;
+        }
+        anyKeyPressed = true;
+        break;
+
+    case UIEventType::KeyUp:
+        if (keyIndexValid(e.key)) {
+            keysDown[static_cast<size_t>(e.key)] = false;
+            keysReleased[static_cast<size_t>(e.key)] = true;
         }
         break;
 
-    case SDL_EVENT_KEY_UP:
-        if (e.key.scancode < SDL_SCANCODE_COUNT)
-        {
-            keysDown[e.key.scancode] = false;
-            keysReleased[e.key.scancode] = true;
-        }
-        break;
-
-    case SDL_EVENT_TEXT_INPUT:
+    case UIEventType::TextInput:
         if (textInputData) {
-            textInputData->buffer += e.text.text;
+            textInputData->buffer += e.text;
             // Committed text clears any active composition
             textInputData->compositionText.clear();
             textInputData->compositionCursor = 0;
@@ -109,112 +144,61 @@ void InputState::ProcessEvent(const SDL_Event& e)
         }
         break;
 
-    case SDL_EVENT_TEXT_EDITING:
+    case UIEventType::TextEditing:
         if (textInputData) {
-            textInputData->compositionText = e.edit.text ? e.edit.text : "";
-            textInputData->compositionCursor = e.edit.start;
-            textInputData->compositionLength = e.edit.length;
+            textInputData->compositionText = e.text;
+            textInputData->compositionCursor = e.editStart;
+            textInputData->compositionLength = e.editLength;
         }
         break;
 
-    case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        if (e.button.button > 0)
-        {
-            int idx = static_cast<int>(e.button.button) - 1;
-            if (idx >= 0 && idx < static_cast<int>(mouseDown.size()))
-            {
-                mouseX = static_cast<float>(e.button.x);
-                mouseY = static_cast<float>(e.button.y);
-                mouseDown[idx] = true;
-                mousePressed[idx] = true;
-            }
-        }
-        break;
-
-    case SDL_EVENT_MOUSE_BUTTON_UP:
-        if (e.button.button > 0)
-        {
-            int idx = static_cast<int>(e.button.button) - 1;
-            if (idx >= 0 && idx < static_cast<int>(mouseDown.size()))
-            {
-                mouseDown[idx] = false;
-                mouseReleased[idx] = true;
-            }
-        }
-        break;
-
-    case SDL_EVENT_MOUSE_MOTION:
-        // En SDL3, las coordenadas están en el evento motion
-        mouseX = static_cast<float>(e.motion.x);
-        mouseY = static_cast<float>(e.motion.y);
-        break;
-
-    case SDL_EVENT_MOUSE_WHEEL:
-        mouseWheelX += static_cast<float>(e.wheel.x);
-        mouseWheelY += static_cast<float>(e.wheel.y);
-        break;
-
-    case SDL_EVENT_DROP_FILE:
-        if (e.drop.data) {
-            droppedFiles.emplace_back(e.drop.data);
-        }
-        break;
-
-    // Phase F2: Gamepad navigation — translate buttons to virtual key events
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-    case SDL_EVENT_GAMEPAD_BUTTON_UP:
-    {
-        bool down = (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
-        SDL_Scancode mapped = SDL_SCANCODE_UNKNOWN;
-        switch (e.gbutton.button) {
-            case SDL_GAMEPAD_BUTTON_DPAD_UP:    mapped = SDL_SCANCODE_UP; break;
-            case SDL_GAMEPAD_BUTTON_DPAD_DOWN:  mapped = SDL_SCANCODE_DOWN; break;
-            case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  mapped = SDL_SCANCODE_LEFT; break;
-            case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: mapped = SDL_SCANCODE_RIGHT; break;
-            case SDL_GAMEPAD_BUTTON_SOUTH:      mapped = SDL_SCANCODE_RETURN; break;   // A
-            case SDL_GAMEPAD_BUTTON_EAST:       mapped = SDL_SCANCODE_ESCAPE; break;   // B
-            case SDL_GAMEPAD_BUTTON_WEST:       mapped = SDL_SCANCODE_SPACE; break;    // X
-            case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:  mapped = SDL_SCANCODE_TAB; break;
-            case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: mapped = SDL_SCANCODE_TAB; break;
-            default: break;
-        }
-        if (mapped != SDL_SCANCODE_UNKNOWN && mapped < SDL_SCANCODE_COUNT) {
-            if (down) {
-                keysDown[mapped] = true;
-                keysPressed[mapped] = true;
-                anyKeyPressed = true;
+    case UIEventType::MouseButton:
+        if (e.button >= 0 && e.button < static_cast<int>(mouseDown.size())) {
+            if (e.pressed) {
+                mouseX = e.x;
+                mouseY = e.y;
+                mouseDown[e.button] = true;
+                mousePressed[e.button] = true;
             } else {
-                keysDown[mapped] = false;
-                keysReleased[mapped] = true;
+                mouseDown[e.button] = false;
+                mouseReleased[e.button] = true;
             }
         }
         break;
-    }
 
-    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-    {
-        // Right stick → scroll wheel; threshold 8000 of 32767 (~25%)
-        const Sint16 deadzone = 8000;
-        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX) {
-            if (std::abs(e.gaxis.value) > deadzone) {
-                mouseWheelX += static_cast<float>(e.gaxis.value) / 32767.0f * 0.25f;
-            }
-        } else if (e.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTY) {
-            if (std::abs(e.gaxis.value) > deadzone) {
-                mouseWheelY += -static_cast<float>(e.gaxis.value) / 32767.0f * 0.25f;
-            }
-        }
+    case UIEventType::MouseMove:
+        mouseX = e.x;
+        mouseY = e.y;
         break;
-    }
 
-    case SDL_EVENT_GAMEPAD_ADDED:
-    {
-        // Auto-open the gamepad so events flow
-        SDL_OpenGamepad(e.gdevice.which);
+    case UIEventType::MouseWheel:
+        mouseWheelX += e.wheelX;
+        mouseWheelY += e.wheelY;
         break;
-    }
 
-    case SDL_EVENT_QUIT:
+    case UIEventType::DropBegin:
+    case UIEventType::DropPosition:
+        // brief 18.7: an OS drag is over this window — track so widgets can show a
+        // drop-target highlight while the cursor moves.
+        osDragActive = true;
+        dropX = e.x;
+        dropY = e.y;
+        break;
+
+    case UIEventType::DropFile:
+        if (!e.text.empty()) droppedFiles.push_back(e.text);
+        dropX = e.x;
+        dropY = e.y;
+        break;
+
+    case UIEventType::DropText:
+        if (!e.text.empty()) droppedText = e.text;
+        dropX = e.x;
+        dropY = e.y;
+        break;
+
+    case UIEventType::DropComplete:
+        osDragActive = false;
         break;
 
     default:

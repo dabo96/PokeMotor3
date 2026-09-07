@@ -3,13 +3,13 @@
   "spdxVersion": "SPDX-2.2",
   "dataLicense": "CC0-1.0",
   "SPDXID": "SPDXRef-DOCUMENT",
-  "documentNamespace": "https://spdx.org/spdxdocs/vk-bootstrap-x64-windows-1.4.335-1c53d2a3-a07d-4db2-9069-b52531a90d9f",
-  "name": "vk-bootstrap:x64-windows@1.4.335 ed9658c71575b81474688f8f556f1a1612bd41e002ae02e3ebcd2e99b325473c",
+  "documentNamespace": "https://spdx.org/spdxdocs/vk-bootstrap-x64-windows-1.4.335-427ecb2e-91a3-412a-bf9a-a9548d03ff1c",
+  "name": "vk-bootstrap:x64-windows@1.4.335 b02d9bf73315a3718d1b079e66fd3a6d14835828cee9e51034a15b69438d6561",
   "creationInfo": {
     "creators": [
       "Tool: vcpkg-2025-12-16-44bb3ce006467fc13ba37ca099f64077b8bbf84d"
     ],
-    "created": "2026-05-18T03:54:07Z"
+    "created": "2026-07-05T07:48:47Z"
   },
   "relationships": [
     {
@@ -114,7 +114,7 @@
     {
       "name": "vk-bootstrap:x64-windows",
       "SPDXID": "SPDXRef-binary",
-      "versionInfo": "ed9658c71575b81474688f8f556f1a1612bd41e002ae02e3ebcd2e99b325473c",
+      "versionInfo": "b02d9bf73315a3718d1b079e66fd3a6d14835828cee9e51034a15b69438d6561",
       "downloadLocation": "NONE",
       "licenseConcluded": "MIT",
       "licenseDeclared": "NOASSERTION",
@@ -191,7 +191,7 @@
       "checksums": [
         {
           "algorithm": "SHA256",
-          "checksumValue": "c279b8a2fdcb867017802e5c3b6f1957f9bceb86d97a7afa81d0d50de73b10d0"
+          "checksumValue": "da3ea99785c9b11f7d06f64353498bef47b4783b2c8a1b512f2a02233aa7bda4"
         }
       ],
       "licenseConcluded": "NOASSERTION",
@@ -251,7 +251,7 @@
       "checksums": [
         {
           "algorithm": "SHA256",
-          "checksumValue": "83fe1651c5e84633c269ec84f19125e7bfdf52cafccd6794d1d8d95cf4ef5c5a"
+          "checksumValue": "96e47acb74ca9268ba49475d29a28c76e7db8cd89baacaede90633bab4e61cd8"
         }
       ],
       "licenseConcluded": "NOASSERTION",

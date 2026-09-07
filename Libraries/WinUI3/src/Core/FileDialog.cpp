@@ -1,4 +1,9 @@
 #include "core/FileDialog.h"
+// brief 26: native file dialogs are provided by SDL. In the embedded build
+// (PLATFORM_SDL=OFF) they are unavailable; the stubs at the bottom of this file
+// report every request as cancelled so callers degrade gracefully.
+#ifdef FLUENTUI_HAS_SDL
+#include <SDL3/SDL.h>
 #include <SDL3/SDL_dialog.h>
 
 namespace FluentUI {
@@ -75,17 +80,18 @@ static DialogCallbackData* MakeCallbackData(
     return data;
 }
 
-void ShowOpenFileDialog(SDL_Window* window,
+void ShowOpenFileDialog(WindowHandle window,
                         const std::vector<FileFilter>& filters,
                         const std::string& defaultPath,
                         bool allowMany,
                         FileDialogCallback callback) {
-    auto* data = MakeCallbackData(std::move(callback), window, filters, defaultPath);
+    SDL_Window* win = static_cast<SDL_Window*>(window);
+    auto* data = MakeCallbackData(std::move(callback), win, filters, defaultPath);
 
     SDL_ShowOpenFileDialog(
         sdlDialogCallback,
         data,
-        window,
+        win,
         data->sdlFilters.empty() ? nullptr : data->sdlFilters.data(),
         static_cast<int>(data->sdlFilters.size()),
         data->defaultPath.empty() ? nullptr : data->defaultPath.c_str(),
@@ -93,35 +99,60 @@ void ShowOpenFileDialog(SDL_Window* window,
     );
 }
 
-void ShowSaveFileDialog(SDL_Window* window,
+void ShowSaveFileDialog(WindowHandle window,
                         const std::vector<FileFilter>& filters,
                         const std::string& defaultPath,
                         FileDialogCallback callback) {
-    auto* data = MakeCallbackData(std::move(callback), window, filters, defaultPath);
+    SDL_Window* win = static_cast<SDL_Window*>(window);
+    auto* data = MakeCallbackData(std::move(callback), win, filters, defaultPath);
 
     SDL_ShowSaveFileDialog(
         sdlDialogCallback,
         data,
-        window,
+        win,
         data->sdlFilters.empty() ? nullptr : data->sdlFilters.data(),
         static_cast<int>(data->sdlFilters.size()),
         data->defaultPath.empty() ? nullptr : data->defaultPath.c_str()
     );
 }
 
-void ShowOpenFolderDialog(SDL_Window* window,
+void ShowOpenFolderDialog(WindowHandle window,
                           const std::string& defaultPath,
                           bool allowMany,
                           FileDialogCallback callback) {
-    auto* data = MakeCallbackData(std::move(callback), window, {}, defaultPath);
+    SDL_Window* win = static_cast<SDL_Window*>(window);
+    auto* data = MakeCallbackData(std::move(callback), win, {}, defaultPath);
 
     SDL_ShowOpenFolderDialog(
         sdlDialogCallback,
         data,
-        window,
+        win,
         data->defaultPath.empty() ? nullptr : data->defaultPath.c_str(),
         allowMany
     );
 }
 
 } // namespace FluentUI
+
+#else // !FLUENTUI_HAS_SDL — embedded build: native dialogs unavailable.
+
+namespace FluentUI {
+
+// Report every request as cancelled (empty selection, filterIndex -1). An embedded
+// host that needs file pickers provides its own via the engine's platform layer.
+void ShowOpenFileDialog(WindowHandle, const std::vector<FileFilter>&,
+                        const std::string&, bool, FileDialogCallback callback) {
+    if (callback) callback({}, -1);
+}
+void ShowSaveFileDialog(WindowHandle, const std::vector<FileFilter>&,
+                        const std::string&, FileDialogCallback callback) {
+    if (callback) callback({}, -1);
+}
+void ShowOpenFolderDialog(WindowHandle, const std::string&, bool,
+                          FileDialogCallback callback) {
+    if (callback) callback({}, -1);
+}
+
+} // namespace FluentUI
+
+#endif // FLUENTUI_HAS_SDL

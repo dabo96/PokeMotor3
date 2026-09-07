@@ -1,8 +1,23 @@
 #include "core/Context.h"
 #include "core/Renderer.h"
+#include "core/NullPlatform.h" // brief 26: GetPlatform fallback (SDL-free)
+#ifdef FLUENTUI_HAS_GL
 #include "core/OpenGLBackend.h"
+#endif
+#ifdef FLUENTUI_HAS_VULKAN
 #include "core/VulkanBackend.h"
+#endif
+#include "core/SharedResourcePool.h"
 #include "Theme/FluentTheme.h"
+#include <cassert>
+#if defined(_WIN32)
+// brief 10 Part B: query the OS "reduce animations" preference without pulling in
+// <windows.h> here (it would inject the min/max and DrawText macros that clash with
+// std::min/std::max and Renderer::DrawText across this TU). Forward-declare the one
+// API we need. SPI_GETCLIENTAREAANIMATION == 0x1042.
+extern "C" __declspec(dllimport) int __stdcall SystemParametersInfoA(
+    unsigned int uiAction, unsigned int uiParam, void* pvParam, unsigned int fWinIni);
+#endif
 
 namespace FluentUI {
 
@@ -16,12 +31,26 @@ namespace FluentUI {
     RenderBackendType GetPreferredBackend() { return g_preferredBackend; }
 
     // Factory: instantiate the configured backend (not yet initialized).
+    // This is one of the two places (with CreateDefaultPlatform) that branch on the
+    // FLUENTUI_HAS_* feature defines (brief 26-B); a requested backend that wasn't
+    // compiled in falls back to whichever one is available.
     static RenderBackend* CreateBackendInstance() {
         switch (g_preferredBackend) {
+#ifdef FLUENTUI_HAS_VULKAN
             case RenderBackendType::Vulkan: return new VulkanBackend();
-            case RenderBackendType::OpenGL:
-            default:                        return new OpenGLBackend();
+#endif
+#ifdef FLUENTUI_HAS_GL
+            case RenderBackendType::OpenGL: return new OpenGLBackend();
+#endif
+            default: break;
         }
+#if defined(FLUENTUI_HAS_GL)
+        return new OpenGLBackend();
+#elif defined(FLUENTUI_HAS_VULKAN)
+        return new VulkanBackend();
+#else
+#   error "FluentUI: no render backend compiled (enable FLUENTUI_BACKEND_GL or FLUENTUI_BACKEND_VULKAN)"
+#endif
     }
 
     void SetLogCallback(LogCallback callback) {
@@ -49,34 +78,243 @@ namespace FluentUI {
         }
     }
 
-    // Contexto ACTUAL. El backend ya no es un global aparte: vive en g_ctx->backend,
-    // de modo que GetBackend() y SetCurrentContext() siguen al contexto activo y
-    // varias ventanas (cada una su contexto) no comparten un único backend.
     static UIContext* g_ctx = nullptr;
+    static RenderBackend* g_backend = nullptr;
 
-    // Helper: initialize system cursors for a context
-    static void InitCursors(UIContext* ctx) {
-        ctx->systemCursors[static_cast<int>(UIContext::CursorType::Arrow)]     = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
-        ctx->systemCursors[static_cast<int>(UIContext::CursorType::IBeam)]     = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
-        ctx->systemCursors[static_cast<int>(UIContext::CursorType::Hand)]      = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
-        ctx->systemCursors[static_cast<int>(UIContext::CursorType::ResizeH)]   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_EW_RESIZE);
-        ctx->systemCursors[static_cast<int>(UIContext::CursorType::ResizeV)]   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NS_RESIZE);
-        ctx->systemCursors[static_cast<int>(UIContext::CursorType::ResizeNESW)]= SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NESW_RESIZE);
-        ctx->systemCursors[static_cast<int>(UIContext::CursorType::ResizeNWSE)]= SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NWSE_RESIZE);
-        ctx->cursorsInitialized = true;
+    // ─── brief 10 Part B — motion policy ──────────────────────────────────────────
+    // Single point that scales / disables animation durations. Called from header
+    // inlines (AnimatedValue/SpringValue) so it must tolerate a null context (unit
+    // tests build AnimatedValue without ever calling CreateContext).
+    float MotionDuration(float base) {
+        if (!g_ctx) return base;
+        const MotionConfig& m = g_ctx->motion;
+        if (!m.enabled || m.reduceMotion) return 0.0f;
+        return base * m.durationScale;
     }
 
-    // Helper: destroy system cursors for a context
-    static void DestroyCursors(UIContext* ctx) {
-        if (ctx->cursorsInitialized) {
-            for (auto& cursor : ctx->systemCursors) {
-                if (cursor) { SDL_DestroyCursor(cursor); cursor = nullptr; }
-            }
-            ctx->cursorsInitialized = false;
+    void InitMotionFromOS() {
+        if (!g_ctx) return;
+#if defined(_WIN32)
+        int clientAreaAnim = 1; // default: animations on
+        if (SystemParametersInfoA(0x1042 /*SPI_GETCLIENTAREAANIMATION*/, 0,
+                                  &clientAreaAnim, 0)) {
+            g_ctx->motion.reduceMotion = (clientAreaAnim == 0);
         }
+#else
+        // No portable SDL query for "reduce motion"; leave the default (false). Hosts
+        // can set g_ctx->motion.reduceMotion themselves from their platform hook.
+#endif
     }
 
-    UIContext* CreateContext(SDL_Window* window, void* existingGLContext) {
+    // brief 10 Part D: drive a managed overlay's enter/exit transition. The overlay
+    // calls this every frame passing active=open; see PresenceResult docs.
+    PresenceResult BeginPresence(UIContext* ctx, uint32_t nodeId, bool active,
+                                 float enterResponse, float exitResponse) {
+        if (!ctx) return { active ? 1.0f : 0.0f, active, false };
+        // Avoid creating an entry for an overlay that is closed and has no pending
+        // exit fade (the common "exists but not open" case queried every frame).
+        // brief 22 (fase 2): presence vive inline en WidgetState. Una entrada
+        // WidgetState puede existir por otro sub-estado sin que presence se haya
+        // usado; el equivalente a "no hay entrada presenceStates" es
+        // presence.everActive==false (se pone true en la primera llamada activa y
+        // vuelve a false al hacer el reset final). Usamos find (no crea) + everActive.
+        if (!active) {
+            auto wit = ctx->widgetStates.find(nodeId);
+            if (wit == ctx->widgetStates.end() || !wit->second.presence.everActive)
+                return { 0.0f, false, true };
+        }
+        auto& ps = ctx->GetWidgetState(nodeId).presence;
+        ps.enterT.Update(ctx->deltaTime);
+
+        if (active) {
+            if (ps.exiting || !ps.everActive) {
+                if (!ps.everActive) ps.enterT.SetImmediate(0.0f);
+                ps.enterT.SetTarget(1.0f, enterResponse, EasingType::Decelerate);
+            }
+            ps.everActive = true;
+            ps.exiting = false;
+        } else {
+            if (!ps.exiting) {
+                ps.enterT.SetTarget(0.0f, exitResponse, EasingType::Accelerate);
+                ps.exiting = true;
+            }
+        }
+
+        float t = ps.enterT.Get();
+        bool shouldDraw = active || (t > 0.01f) || ps.enterT.IsAnimating();
+        if (!shouldDraw) {
+            // brief 22 (fase 2): equivalente al viejo presenceStates.erase(nodeId).
+            // No podemos borrar solo `presence` de un WidgetState compartido con otro
+            // sub-estado, así que lo reseteamos: everActive=false ≡ "sin entrada" para
+            // el early-out de la próxima llamada inactiva.
+            ps = UIContext::PresenceState{};
+            return { 0.0f, false, true };
+        }
+        return { std::clamp(t, 0.0f, 1.0f), true, ps.exiting };
+    }
+
+    // brief 10 Part E: FLIP offset for an opt-in animated layout item.
+    Vec2 LayoutFlipOffset(UIContext* ctx, uint32_t itemId, const Vec2& currentPos,
+                          float response, float dampingRatio) {
+        if (!ctx) return Vec2(0.0f, 0.0f);
+        auto& fs = ctx->GetWidgetState(itemId).flip; // brief 22 (fase 2): antes flipStates[itemId]
+        // brief 22 (fase 9): GetWidgetState ya refresca lastFrameSeen (GC unificado);
+        // se retiró el write a lastSeenFrame del GC rotatorio (eliminado).
+        if (!fs.valid) {
+            fs.valid = true;
+            fs.prevPos = currentPos;
+            fs.offset.Configure(response, dampingRatio);
+            fs.offset.SetImmediate(Vec2(0.0f, 0.0f));
+            return Vec2(0.0f, 0.0f);
+        }
+        Vec2 delta = fs.prevPos - currentPos; // First - Last (Invert)
+        if (std::abs(delta.x) > 0.5f || std::abs(delta.y) > 0.5f) {
+            fs.offset.Nudge(delta);                  // seed the visual offset
+        }
+        fs.offset.Update(ctx->deltaTime);            // Play: decay offset → 0
+        fs.prevPos = currentPos;
+        // (wake handled by AnyAnimationActive scanning widgetStates' inline flip)
+        return fs.offset.Get();
+    }
+
+    // brief 10 Part F: stagger helpers.
+    float StaggerDelaySeconds(int index, float staggerMs, float capMs) {
+        if (index <= 0 || staggerMs <= 0.0f) return 0.0f;
+        float ms = std::min((float)index * staggerMs, capMs);
+        return ms * 0.001f;
+    }
+
+    float StaggeredAppear(UIContext* ctx, uint32_t itemId, int index, float staggerMs,
+                          float enterResponse) {
+        if (!ctx) return 1.0f;
+        auto& a = ctx->GetWidgetState(itemId).floatAnim[0]; // brief 22 (fase 2): antes floatAnimations[itemId]
+        // brief 22 (fase 9): sin write a lastSeenFrame (GC rotatorio retirado);
+        // GetWidgetState ya refrescó lastFrameSeen.
+        if (!a.IsInitialized()) {
+            a.SetImmediate(0.0f);
+            a.SetTarget(1.0f, enterResponse, EasingType::Decelerate);
+            a.SetDelay(StaggerDelaySeconds(index, staggerMs));
+            ctx->NotifyFloatAnimActive(itemId);
+        }
+        if (a.IsAnimating()) ctx->NotifyFloatAnimActive(itemId);
+        return a.Get();
+    }
+
+    // brief 10 Part G: union of all active animation sources. Used by the host loop
+    // to decide whether to idle (block on events) or render continuously.
+    bool UIContext::AnyAnimationActive() const {
+        // brief 22 (fase 9): activeColorAnimIds se retiró (huérfano: ningún widget usa
+        // WidgetState.colorAnim[]). activeRippleIds se conserva porque el ripple SÍ es
+        // una feature usada (Button.AddRipple).
+        // brief 35 Part A: activeSpringFloatIds reactivado (thumbs, progreso, indicador…).
+        if (!activeFloatAnimIds.empty() ||
+            !activeRippleIds.empty() || !activeSpringColorIds.empty() ||
+            !activeSpringFloatIds.empty() ||
+            widgetTree.HasActiveAnimations())
+            return true;
+        // brief 10 Part D/E + brief 22 (fase 2): presence (fade de overlays) y flip
+        // (item deslizante) viven inline en widgetStates. Recorrido solo-lectura del
+        // mapa unificado (no crea entradas). La población es la misma que antes tenían
+        // presenceStates + flipStates (solo ids que realmente animaron).
+        for (const auto& kv : widgetStates) {
+            if (kv.second.presence.enterT.IsAnimating()) return true;
+            if (kv.second.flip.offset.IsAnimating()) return true;
+        }
+        return false;
+    }
+
+    // ─── brief 22: accesores del estado unificado (FASE 1, aditiva) ───────────
+    // GetWidgetState crea/obtiene la entrada y refresca lastFrameSeen para que el
+    // GC nuevo la conserve. Los Get*State materializan su unique_ptr perezoso la
+    // primera vez y devuelven la referencia al sub-estado. Mientras las fases 2-8
+    // no migren widgets, nadie llama a esto en producción (mapa vacío).
+    UIContext::WidgetState& UIContext::GetWidgetState(uint32_t id) {
+        WidgetState& ws = widgetStates[id];
+        ws.lastFrameSeen = frame;
+        return ws;
+    }
+    UIContext::TextEditState& UIContext::GetTextState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.text) ws.text = std::make_unique<TextEditState>();
+        return *ws.text;
+    }
+    UIContext::PanelState& UIContext::GetPanelState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.panel) ws.panel = std::make_unique<PanelState>();
+        return *ws.panel;
+    }
+    UIContext::ScrollViewState& UIContext::GetScrollState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.scroll) ws.scroll = std::make_unique<ScrollViewState>();
+        return *ws.scroll;
+    }
+    UIContext::TabViewState& UIContext::GetTabState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.tabs) ws.tabs = std::make_unique<TabViewState>();
+        return *ws.tabs;
+    }
+    UIContext::ModalState& UIContext::GetModalState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.modal) ws.modal = std::make_unique<ModalState>();
+        return *ws.modal;
+    }
+    UIContext::ContextMenuState& UIContext::GetCtxMenuState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.ctxMenu) ws.ctxMenu = std::make_unique<ContextMenuState>();
+        return *ws.ctxMenu;
+    }
+    UIContext::FlyoutState& UIContext::GetFlyoutState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.flyout) ws.flyout = std::make_unique<FlyoutState>();
+        return *ws.flyout;
+    }
+    UIContext::MenuState& UIContext::GetMenuState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.menu) ws.menu = std::make_unique<MenuState>();
+        return *ws.menu;
+    }
+    UIContext::ListViewState& UIContext::GetListState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.list) ws.list = std::make_unique<ListViewState>();
+        return *ws.list;
+    }
+    UIContext::TreeViewState& UIContext::GetTreeState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.tree) ws.tree = std::make_unique<TreeViewState>();
+        return *ws.tree;
+    }
+    TableInternalState& UIContext::GetTableState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.table) ws.table = std::make_unique<TableInternalState>();
+        return *ws.table;
+    }
+    UIContext::ColorPickerState& UIContext::GetColorPickerState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.colorPicker) ws.colorPicker = std::make_unique<ColorPickerState>();
+        return *ws.colorPicker;
+    }
+    UIContext::SplitterState& UIContext::GetSplitterState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.splitter) ws.splitter = std::make_unique<SplitterState>();
+        return *ws.splitter;
+    }
+    DragWidgetState& UIContext::GetDragState(uint32_t id) {
+        WidgetState& ws = GetWidgetState(id);
+        if (!ws.drag) ws.drag = std::make_unique<DragWidgetState>();
+        return *ws.drag;
+    }
+
+    // brief 26 de-SDL: platform accessor. System cursors now live in SDLPlatform;
+    // the context only tracks the desired/current CursorType and applies it via the
+    // platform at end of frame. The fallback NullPlatform is a shared, leak-free
+    // singleton so widgets/tests without an assigned platform never crash.
+    PlatformBackend* GetPlatform(UIContext* ctx) {
+        if (ctx && ctx->platform) return ctx->platform;
+        static NullPlatform s_fallback;
+        return &s_fallback;
+    }
+
+    UIContext* CreateContext(WindowHandle window, void* existingGLContext) {
         if (g_ctx) return g_ctx;
 
         if (!window) {
@@ -87,40 +325,47 @@ namespace FluentUI {
         g_ctx = new UIContext();
         g_ctx->window = window;
 
-        RenderBackend* backend = CreateBackendInstance();
-        if (!backend->Init(window, existingGLContext)) {
+        g_backend = CreateBackendInstance();
+        if (!g_backend->Init(window, existingGLContext)) {
             Log(LogLevel::Error, "Failed to initialize render backend");
             if (g_preferredBackend == RenderBackendType::OpenGL) {
                 Log(LogLevel::Error, "Hint: if this is a Vulkan window, call "
                     "SetPreferredBackend(RenderBackendType::Vulkan) before CreateContext().");
             }
-            delete backend;
+            delete g_backend;
             delete g_ctx;
+            g_backend = nullptr;
             g_ctx = nullptr;
             return nullptr;
         }
 
-        if (!g_ctx->renderer.Init(backend)) {
+        g_ctx->backend = g_backend;
+
+        // brief 08 Part C: the main context owns the per-device shared resource
+        // pool. It is injected into the Renderer (which becomes the device-owner
+        // and publishes its atlas handles) and reused by every secondary window.
+        g_ctx->sharedResources = new SharedResourcePool();
+        g_ctx->ownsSharedResources = true;
+
+        if (!g_ctx->renderer.Init(g_backend, g_ctx->sharedResources)) {
             Log(LogLevel::Error, "Failed to initialize Renderer");
-            backend->Shutdown();
-            delete backend;
+            g_backend->Shutdown();
+            delete g_backend;
+            delete g_ctx->sharedResources;
             delete g_ctx;
+            g_backend = nullptr;
             g_ctx = nullptr;
             return nullptr;
         }
 
-        g_ctx->backend = backend;
         g_ctx->style = GetDarkFluentStyle();
-
-        // Initialize system cursors
-        InitCursors(g_ctx);
 
         g_ctx->initialized = true;
         Log(LogLevel::Info, "FluentUI Context created successfully");
         return g_ctx;
     }
 
-    UIContext* CreateContext(SDL_Window* window, RenderBackendType backend, void* existingContext) {
+    UIContext* CreateContext(WindowHandle window, RenderBackendType backend, void* existingContext) {
         // Keep the backend choice and its handle together so they can't desync.
         SetPreferredBackend(backend);
         return CreateContext(window, existingContext);
@@ -130,42 +375,50 @@ namespace FluentUI {
         return g_ctx;
     }
 
-    RenderBackend* GetBackend() {
-        return g_ctx ? g_ctx->backend : nullptr;
-    }
-
     void* RegisterExternalTexture(void* nativeView, void* sampler, int layout) {
-        RenderBackend* be = g_ctx ? g_ctx->backend : nullptr;
-        if (!be) {
-            Log(LogLevel::Error, "RegisterExternalTexture: no active backend (call CreateContext / SetCurrentContext first)");
+        if (!g_backend) {
+            Log(LogLevel::Error, "RegisterExternalTexture: no active backend (call CreateContext first)");
             return nullptr;
         }
-        return be->RegisterExternalTexture(nativeView, sampler, layout);
+        void* h = g_backend->RegisterExternalTexture(nativeView, sampler, layout);
+        // brief 08 Part C: track in the shared pool — the underlying image lives on
+        // the shared device/GL-context, so it is drawable from any window.
+        if (h && g_ctx && g_ctx->sharedResources) g_ctx->sharedResources->RegisterSharedTexture(h);
+        return h;
     }
 
     void DestroyExternalTexture(void* handle) {
-        RenderBackend* be = g_ctx ? g_ctx->backend : nullptr;
-        if (be && handle) be->DeleteTexture(handle);
+        if (g_ctx && g_ctx->sharedResources && handle)
+            g_ctx->sharedResources->UnregisterSharedTexture(handle);
+        if (g_backend && handle) g_backend->DeleteTexture(handle);
     }
 
     void SetCurrentContext(UIContext* ctx) {
         g_ctx = ctx;
     }
 
-    UIContext* CreateStandaloneContext(SDL_Window* window, RenderBackendType backendType,
-                                       void* existingContext, RenderBackend** outBackend) {
+    // brief 18.5: layout direction (RTL) control on the active context.
+    void SetLayoutDirection(UIContext::LayoutDirection dir) {
+        if (g_ctx) g_ctx->layoutDirection = dir;
+    }
+    UIContext::LayoutDirection GetLayoutDirection() {
+        return g_ctx ? g_ctx->layoutDirection : UIContext::LayoutDirection::LTR;
+    }
+    bool IsLayoutRTL() {
+        return g_ctx && g_ctx->IsRTL();
+    }
+
+    UIContext* CreateStandaloneContext(WindowHandle window, RenderBackend** outBackend) {
         if (!window) {
             Log(LogLevel::Error, "Window handle is NULL");
             return nullptr;
         }
 
-        SetPreferredBackend(backendType);   // CreateBackendInstance() lee el preferido
-
         auto* ctx = new UIContext();
         ctx->window = window;
 
         auto* backend = CreateBackendInstance();
-        if (!backend->Init(window, existingContext)) {
+        if (!backend->Init(window)) {
             Log(LogLevel::Error, "Failed to initialize render backend for secondary window");
             delete backend;
             delete ctx;
@@ -180,10 +433,10 @@ namespace FluentUI {
             return nullptr;
         }
 
-        ctx->backend = backend;
         ctx->style = GetDarkFluentStyle();
-        InitCursors(ctx);
         ctx->initialized = true;
+
+        ctx->backend = backend;
 
         // Return the backend pointer so the caller can clean it up later
         if (outBackend) *outBackend = backend;
@@ -191,15 +444,77 @@ namespace FluentUI {
         return ctx;
     }
 
-    UIContext* CreateStandaloneContext(SDL_Window* window, RenderBackend** outBackend) {
-        // Compat: conserva el backend preferido actual y modo standalone (sin shared).
-        return CreateStandaloneContext(window, GetPreferredBackend(), nullptr, outBackend);
+    UIContext* CreateStandaloneContext(WindowHandle window, UIContext* shareFrom,
+                                       RenderBackend** outBackend) {
+        if (!window) {
+            Log(LogLevel::Error, "Window handle is NULL");
+            return nullptr;
+        }
+        // No parent to share from → fall back to a fully isolated context.
+        if (!shareFrom || !shareFrom->backend) {
+            return CreateStandaloneContext(window, outBackend);
+        }
+
+        // Build the backend-specific "existing context" handle from the parent.
+        void* existing = nullptr;
+        VulkanSharedContext vkShared{}; // must outlive backend->Init below
+        if (g_preferredBackend == RenderBackendType::OpenGL) {
+            auto* gl = static_cast<OpenGLBackend*>(shareFrom->backend);
+            existing = gl->GetGLContext(); // reuse the SAME GL context → shared resources
+            if (!existing) {
+                Log(LogLevel::Warning, "CreateStandaloneContext(share): parent GL context is null; "
+                    "creating an isolated context");
+                return CreateStandaloneContext(window, outBackend);
+            }
+        } else { // Vulkan
+            auto* vk = static_cast<VulkanBackend*>(shareFrom->backend);
+            if (!vk->GetSharedContext(&vkShared)) {
+                Log(LogLevel::Warning, "CreateStandaloneContext(share): parent Vulkan device "
+                    "unavailable; creating an isolated context");
+                return CreateStandaloneContext(window, outBackend);
+            }
+            existing = &vkShared; // shared device + own swapchain (ownSwapchain=true)
+        }
+
+        auto* ctx = new UIContext();
+        ctx->window = window;
+
+        auto* backend = CreateBackendInstance();
+        if (!backend->Init(window, existing)) {
+            Log(LogLevel::Error, "Failed to initialize shared render backend for secondary window");
+            delete backend;
+            delete ctx;
+            return nullptr;
+        }
+        ctx->backend = backend;
+
+        // brief 08 Part A: route GL to this OS-window each frame and clear/present
+        // its own framebuffer (it shares the parent's GL context).
+        if (g_preferredBackend == RenderBackendType::OpenGL) {
+            static_cast<OpenGLBackend*>(backend)->SetSecondaryWindowMode(true);
+        }
+
+        // brief 08 Part C: reference the parent's shared resource pool (not owned).
+        ctx->sharedResources = shareFrom->sharedResources;
+        ctx->ownsSharedResources = false;
+
+        if (!ctx->renderer.Init(backend, ctx->sharedResources)) {
+            Log(LogLevel::Error, "Failed to initialize Renderer for shared secondary window");
+            backend->Shutdown();
+            delete backend;
+            delete ctx;
+            return nullptr;
+        }
+
+        ctx->style = GetDarkFluentStyle();
+        ctx->initialized = true;
+
+        if (outBackend) *outBackend = backend;
+        return ctx;
     }
 
     void DestroyStandaloneContext(UIContext* ctx, RenderBackend* backend) {
         if (!ctx) return;
-        if (g_ctx == ctx) g_ctx = nullptr;   // no dejar el contexto global colgando
-        DestroyCursors(ctx);
         ctx->renderer.Shutdown();
         if (backend) {
             backend->Shutdown();
@@ -210,13 +525,18 @@ namespace FluentUI {
 
     void DestroyContext() {
         if (!g_ctx) return;
-        DestroyCursors(g_ctx);
         g_ctx->renderer.Shutdown();
-        if (g_ctx->backend) {
-            g_ctx->backend->Shutdown();
-            delete g_ctx->backend;
-            g_ctx->backend = nullptr;
+        if (g_backend) {
+            g_backend->Shutdown();
+            delete g_backend;
+            g_backend = nullptr;
         }
+        // brief 08 Part C: free the shared resource pool last (owned by the main
+        // context). Secondary windows must already be destroyed by this point.
+        if (g_ctx->ownsSharedResources && g_ctx->sharedResources) {
+            delete g_ctx->sharedResources;
+        }
+        g_ctx->sharedResources = nullptr;
         delete g_ctx;
         g_ctx = nullptr;
     }
@@ -238,32 +558,35 @@ namespace FluentUI {
         // Actualizar tiempo
         g_ctx->deltaTime = deltaTime;
         g_ctx->time += deltaTime;
-        
-        // Perf 2.2: Only update active animations (O(active) instead of O(total))
-        for (size_t i = 0; i < g_ctx->activeColorAnimIds.size(); ) {
-            uint32_t id = g_ctx->activeColorAnimIds[i];
-            auto it = g_ctx->colorAnimations.find(id);
-            if (it != g_ctx->colorAnimations.end()) {
-                it->second.Update(deltaTime);
-                if (!it->second.IsAnimating()) {
-                    // Swap-and-pop removal (O(1))
-                    g_ctx->activeColorAnimIds[i] = g_ctx->activeColorAnimIds.back();
-                    g_ctx->activeColorAnimIds.pop_back();
-                    continue;
-                }
-            } else {
-                g_ctx->activeColorAnimIds[i] = g_ctx->activeColorAnimIds.back();
-                g_ctx->activeColorAnimIds.pop_back();
-                continue;
-            }
-            ++i;
+
+        // brief 13: el TitleBar() volverá a publicar sus zonas este frame; si no se
+        // dibuja ninguna, el callback de hit-test no marcará nada como arrastrable.
+        {
+            std::lock_guard<std::mutex> lk(g_ctx->titleBarHit.mutex);
+            g_ctx->titleBarHit.active = false;
         }
+        
+        // Perf 2.2: Only update active animations (O(active) instead of O(total)).
+        // brief 22 (fase 2): las animaciones viven inline en WidgetState. Las listas
+        // activas guardan ahora el RAW widget id; el avance busca la entrada con
+        // widgetStates.find (NO crea entradas espurias — preserva el viejo gate
+        // find()!=end()) y recorre los slots del array correspondiente. Se retira de
+        // la lista activa cuando ningún slot sigue animando (o el ripple se apaga).
+        // brief 22 (fase 9): el driver de activeColorAnimIds se retiró — el vector
+        // quedó huérfano (ningún widget usa WidgetState.colorAnim[] ni llama a
+        // NotifyColorAnimActive tras la migración fases 2-8). Los springs de color de
+        // botón (bg/fg/border) viven en springColor[] y los conduce el driver de
+        // activeSpringColorIds (más abajo).
         for (size_t i = 0; i < g_ctx->activeFloatAnimIds.size(); ) {
             uint32_t id = g_ctx->activeFloatAnimIds[i];
-            auto it = g_ctx->floatAnimations.find(id);
-            if (it != g_ctx->floatAnimations.end()) {
-                it->second.Update(deltaTime);
-                if (!it->second.IsAnimating()) {
+            auto it = g_ctx->widgetStates.find(id);
+            if (it != g_ctx->widgetStates.end()) {
+                bool anyAnim = false;
+                for (int s = 0; s < 4; ++s) {
+                    it->second.floatAnim[s].Update(deltaTime);
+                    if (it->second.floatAnim[s].IsAnimating()) anyAnim = true;
+                }
+                if (!anyAnim) {
                     g_ctx->activeFloatAnimIds[i] = g_ctx->activeFloatAnimIds.back();
                     g_ctx->activeFloatAnimIds.pop_back();
                     continue;
@@ -275,12 +598,60 @@ namespace FluentUI {
             }
             ++i;
         }
+        // brief 10 Part C: drive the springs with the same swap-pop pattern as the
+        // tween arrays above. Springs leave the active list once every slot settles.
+        for (size_t i = 0; i < g_ctx->activeSpringColorIds.size(); ) {
+            uint32_t id = g_ctx->activeSpringColorIds[i];
+            auto it = g_ctx->widgetStates.find(id);
+            if (it != g_ctx->widgetStates.end()) {
+                bool anyAnim = false;
+                for (int s = 0; s < 4; ++s) {
+                    it->second.springColor[s].Update(deltaTime);
+                    if (it->second.springColor[s].IsAnimating()) anyAnim = true;
+                }
+                if (!anyAnim) {
+                    g_ctx->activeSpringColorIds[i] = g_ctx->activeSpringColorIds.back();
+                    g_ctx->activeSpringColorIds.pop_back();
+                    continue;
+                }
+            } else {
+                g_ctx->activeSpringColorIds[i] = g_ctx->activeSpringColorIds.back();
+                g_ctx->activeSpringColorIds.pop_back();
+                continue;
+            }
+            ++i;
+        }
+        // brief 35 Part A: driver de springFloat[] reactivado (mismo patrón swap-pop
+        // que activeSpringColorIds). Conduce todo float animado no-color: posición de
+        // thumb, progreso de check, escala de punto, indicador deslizante, ProgressBar…
+        // El id sale de la lista cuando sus 4 slots se estabilizan.
+        for (size_t i = 0; i < g_ctx->activeSpringFloatIds.size(); ) {
+            uint32_t id = g_ctx->activeSpringFloatIds[i];
+            auto it = g_ctx->widgetStates.find(id);
+            if (it != g_ctx->widgetStates.end()) {
+                bool anyAnim = false;
+                for (int s = 0; s < 4; ++s) {
+                    it->second.springFloat[s].Update(deltaTime);
+                    if (it->second.springFloat[s].IsAnimating()) anyAnim = true;
+                }
+                if (!anyAnim) {
+                    g_ctx->activeSpringFloatIds[i] = g_ctx->activeSpringFloatIds.back();
+                    g_ctx->activeSpringFloatIds.pop_back();
+                    continue;
+                }
+            } else {
+                g_ctx->activeSpringFloatIds[i] = g_ctx->activeSpringFloatIds.back();
+                g_ctx->activeSpringFloatIds.pop_back();
+                continue;
+            }
+            ++i;
+        }
         for (size_t i = 0; i < g_ctx->activeRippleIds.size(); ) {
             uint32_t id = g_ctx->activeRippleIds[i];
-            auto it = g_ctx->rippleEffects.find(id);
-            if (it != g_ctx->rippleEffects.end()) {
-                it->second.Update(deltaTime);
-                if (!it->second.IsActive()) {
+            auto it = g_ctx->widgetStates.find(id);
+            if (it != g_ctx->widgetStates.end()) {
+                it->second.ripple.Update(deltaTime);
+                if (!it->second.ripple.IsActive()) {
                     g_ctx->activeRippleIds[i] = g_ctx->activeRippleIds.back();
                     g_ctx->activeRippleIds.pop_back();
                     continue;
@@ -294,7 +665,9 @@ namespace FluentUI {
         }
         
         // Perf Phase C: Record active animation counts
-        g_ctx->perfCounters.activeColorAnims = static_cast<uint32_t>(g_ctx->activeColorAnimIds.size());
+        // brief 22 (fase 9): activeColorAnimIds retirado (huérfano); el contador de
+        // color-anims queda en 0 (los springs de color se cuentan aparte si se desea).
+        g_ctx->perfCounters.activeColorAnims = 0;
         g_ctx->perfCounters.activeFloatAnims = static_cast<uint32_t>(g_ctx->activeFloatAnimIds.size());
         g_ctx->perfCounters.widgetNodeCount = static_cast<uint32_t>(g_ctx->widgetTree.NodeCount());
 
@@ -313,8 +686,20 @@ namespace FluentUI {
         g_ctx->widgetTree.ResetParentStack();
         g_ctx->widgetTree.UpdateAnimations(deltaTime);
 
-        g_ctx->renderer.BeginFrame(g_ctx->style.backgroundColor);
+        // DEBUG VISUAL (temporal): clear en blanco puro en vez de style.backgroundColor
+        // para delatar zonas que ningún widget pinta (huecos, clips mal hechos,
+        // fondos que faltan). Revertir a style.backgroundColor al terminar.
+        g_ctx->renderer.BeginFrame(Color(1.0f, 1.0f, 1.0f, 1.0f));
+        // Reveal highlight (brief 04): feed the cursor position for this frame so SDF
+        // rects with revealIntensity>0 light up their edge by proximity. Default radius
+        // 120 logical px scaled by DPI.
+        g_ctx->renderer.SetRevealCursor(
+            Vec2(g_ctx->input.MouseX(), g_ctx->input.MouseY()), 120.0f * g_ctx->dpiScale);
+        // Brief 11: feed the themed shadow color so every elevation shadow this
+        // frame is tinted by the active theme (light: black; dark: softer black).
+        g_ctx->renderer.SetShadowColor(g_ctx->style.shadowColor);
         g_ctx->scrollConsumedThisFrame = false;
+        g_ctx->flyoutOpenedThisFrame = false; // swallow-de-apertura de flyout: solo el frame en que abre
         g_ctx->mouseOverAnyWidgetLastFrame = g_ctx->mouseOverAnyWidget;
         g_ctx->mouseOverAnyWidget = false;
 
@@ -325,17 +710,20 @@ namespace FluentUI {
         g_ctx->cursorPos = { 20.0f, 20.0f };
         g_ctx->lastItemPos = g_ctx->cursorPos;
         g_ctx->lastItemSize = { 0.0f, 0.0f };
+        // brief 21: defensively reset the ID scope stack at frame start so an
+        // unbalanced PushID/PopID in one frame can't leak a stale seed into the next.
+        g_ctx->idStack.clear();
         if (!g_ctx->input.IsMouseDown(0) && g_ctx->activeWidgetType == ActiveWidgetType::Slider) {
             g_ctx->activeWidgetId = 0;
             g_ctx->activeWidgetType = ActiveWidgetType::None;
         }
-        if (!g_ctx->input.IsKeyDown(SDL_SCANCODE_LCTRL) && !g_ctx->input.IsKeyDown(SDL_SCANCODE_RCTRL)) {
+        if (!g_ctx->input.IsKeyDown(UIKey::LeftCtrl) && !g_ctx->input.IsKeyDown(UIKey::RightCtrl)) {
             g_ctx->input.anyKeyPressed = false;
         }
-        
+
         // Manejar navegación con Tab
-        if (g_ctx->input.IsKeyPressed(SDL_SCANCODE_TAB)) {
-            bool shift = g_ctx->input.IsKeyDown(SDL_SCANCODE_LSHIFT) || g_ctx->input.IsKeyDown(SDL_SCANCODE_RSHIFT);
+        if (g_ctx->input.IsKeyPressed(UIKey::Tab)) {
+            bool shift = g_ctx->input.IsKeyDown(UIKey::LeftShift) || g_ctx->input.IsKeyDown(UIKey::RightShift);
             if (!g_ctx->focusableWidgets.empty()) {
                 if (shift) {
                     // Navegar hacia atrás
@@ -363,6 +751,9 @@ namespace FluentUI {
         g_ctx->panelStyleStack.clear();
         g_ctx->textColorStack.clear();
         
+        // Identidad por orden de llamada para widgets anónimos (ver anonWidgetSeq).
+        g_ctx->anonWidgetSeq = 0;
+
         // Limpiar stack de menús al inicio de cada frame
         g_ctx->menuIdStack.clear();
         g_ctx->currentMenuItems.clear();
@@ -389,8 +780,15 @@ namespace FluentUI {
             float mouseY = g_ctx->input.MouseY();
             bool clickedOutside = true;
             
-            // Verificar context menus
-            for (auto& [id, menuState] : g_ctx->contextMenuStates) {
+            // brief 22 (fase 6): context menus y menus del MenuBar viven ahora en
+            // widgetStates (ws.ctxMenu / ws.menu). Recorremos UNA vez el mapa
+            // unificado y filtramos por sub-estado presente en lugar de iterar dos
+            // mapas paralelos.
+
+            // Verificar context menus (ws.ctxMenu)
+            for (auto& [id, ws] : g_ctx->widgetStates) {
+                if (!ws.ctxMenu) continue;
+                auto& menuState = *ws.ctxMenu;
                 if (menuState.open) {
                     Vec2 menuPos = menuState.position;
                     Vec2 menuSize = menuState.size;
@@ -402,9 +800,11 @@ namespace FluentUI {
                     }
                 }
             }
-            
-            // Verificar menus del MenuBar
-            for (auto& [id, menuState] : g_ctx->menuStates) {
+
+            // Verificar menus del MenuBar (ws.menu)
+            for (auto& [id, ws] : g_ctx->widgetStates) {
+                if (!ws.menu) continue;
+                auto& menuState = *ws.menu;
                 if (menuState.open) {
                     Vec2 menuPos = menuState.position;
                     Vec2 menuSize = menuState.size;
@@ -424,63 +824,81 @@ namespace FluentUI {
                     }
                 }
             }
-            
+
             // Si se hizo click fuera de todos los menus, cerrar todos
             if (clickedOutside) {
-                for (auto& [id, menuState] : g_ctx->contextMenuStates) {
-                    menuState.open = false;
+                for (auto& [id, ws] : g_ctx->widgetStates) {
+                    if (ws.ctxMenu) ws.ctxMenu->open = false;
+                    if (ws.menu) ws.menu->open = false;
                 }
                 g_ctx->activeContextMenuId = 0;
-                for (auto& [id, menuState] : g_ctx->menuStates) {
-                    menuState.open = false;
-                }
                 g_ctx->activeMenuId = 0;
             }
         }
-        
-        // Issue 11: Amortized GC — rotate through maps, one every GC_ROTATE_INTERVAL frames
+
+        // ─── Salvaguarda: liberar overlays "pegados" (input muerto) ───────────
+        // activeModalId y activeContextMenuId bloquean el input de TODA la UI
+        // (IsMouseInputBlocked), y quien los libera es el Begin* del propio
+        // overlay — pero SOLO si se le sigue llamando después de cerrarlo, para
+        // que llegue a su rama de "ya se desvaneció". El patrón natural del
+        // llamador, `if (open) { ContentDialog(...); }`, deja de invocarlo en el
+        // mismo frame en que open pasa a false, así que ese frame de limpieza no
+        // llega NUNCA: la app queda con el ratón muerto (y las animaciones
+        // corriendo) atrapada detrás de un overlay que ya no se ve, como si
+        // siguieras clicando sobre él. Aquí detectamos que el overlay lleva más
+        // de un frame sin construirse y liberamos su captura de input.
+        // Es una red de seguridad: el propio widget sigue siendo el camino normal
+        // de limpieza, esto solo cubre al llamador que deja de dibujarlo.
+        auto overlayStale = [&](uint32_t id) -> bool {
+            if (id == 0) return false;
+            auto it = g_ctx->widgetStates.find(id);
+            if (it == g_ctx->widgetStates.end()) return true;
+            // lastFrameSeen == frame ⇒ construido en el último frame. Se tolera un
+            // frame de gracia para hosts que llaman NewFrame sin construir UI
+            // (p.ej. ventana minimizada); si el overlay sigue lógicamente abierto,
+            // su siguiente Begin* vuelve a fijar la captura, así que auto-cura.
+            return it->second.lastFrameSeen + 1 < g_ctx->frame;
+        };
+        if (overlayStale(g_ctx->activeModalId)) {
+            g_ctx->activeModalId = 0;
+            g_ctx->insideModal = false;
+        }
+        if (overlayStale(g_ctx->activeContextMenuId)) {
+            g_ctx->activeContextMenuId = 0;
+            g_ctx->insideContextMenu = false;
+        }
+        if (overlayStale(g_ctx->activeFlyoutId)) {
+            g_ctx->activeFlyoutId = 0;
+            g_ctx->insideFlyout = false;
+            g_ctx->flyoutScopeId = 0;
+        }
+        // BeginModal empuja al stack y EndModal saca: al empezar un frame nuevo debe
+        // estar vacío. Si no lo está, un Begin se quedó sin su End (early return del
+        // llamador) y el residuo desincronizaría el EndModal del frame siguiente.
+        if (!g_ctx->modalStack.empty()) {
+            Log(LogLevel::Warning,
+                "modalStack no vacío al iniciar el frame (depth=%zu): un BeginModal "
+                "se quedó sin EndModal; se descarta el residuo.",
+                g_ctx->modalStack.size());
+            g_ctx->modalStack.clear();
+        }
+
+        // brief 22 (fase 9): retirado el GC rotatorio de mapas paralelos y la
+        // limpieza periódica de lastSeenFrame (ambos obsoletos: no quedan mapas
+        // paralelos ni escritores de lastSeenFrame). El ÚNICO GC es ahora el del
+        // mapa unificado widgetStates, con retención = GC_ROTATE_INTERVAL frames
+        // (== el viejo threshold GC_MAP_COUNT*GC_ROTATE_INTERVAL con GC_MAP_COUNT==1)
+        // y cadencia cada GC_ROTATE_INTERVAL frames. La entrada se conserva mientras
+        // GetWidgetState() la refresque (lastFrameSeen = frame).
         if (g_ctx->frame > 0 && (g_ctx->frame % UIContext::GC_ROTATE_INTERVAL) == 0) {
             uint32_t currentFrame = g_ctx->frame;
-            uint32_t threshold = UIContext::GC_MAP_COUNT * UIContext::GC_ROTATE_INTERVAL; // Full rotation cycle
-            auto& seen = g_ctx->lastSeenFrame;
+            uint32_t threshold = UIContext::GC_ROTATE_INTERVAL; // retention window (frames)
 
-            auto gcMap = [&](auto& map) {
-                for (auto it = map.begin(); it != map.end(); ) {
-                    auto seenIt = seen.find(it->first);
-                    if (seenIt == seen.end() || (currentFrame - seenIt->second) > threshold) {
-                        it = map.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-            };
-
-            switch (g_ctx->gcMapIndex) {
-                case 0:  gcMap(g_ctx->colorAnimations); break;
-                case 1:  gcMap(g_ctx->floatAnimations); break;
-                case 2:  gcMap(g_ctx->rippleEffects); break;
-                case 3:  gcMap(g_ctx->panelStates); break;
-                case 4:  gcMap(g_ctx->scrollViewStates); break;
-                case 5:  gcMap(g_ctx->tabViewStates); break;
-                case 6:  gcMap(g_ctx->listViewStates); break;
-                case 7:  gcMap(g_ctx->treeViewStates); break;
-                case 8:  gcMap(g_ctx->boolStates); break;
-                case 9:  gcMap(g_ctx->floatStates); break;
-                case 10: gcMap(g_ctx->intStates); break;
-                case 11: gcMap(g_ctx->stringStates); break;
-                case 12: gcMap(g_ctx->colorPickerStates); break;
-            }
-
-            g_ctx->gcMapIndex = (g_ctx->gcMapIndex + 1) % UIContext::GC_MAP_COUNT;
-
-            // Clean up lastSeenFrame once per full rotation
-            if (g_ctx->gcMapIndex == 0) {
-                for (auto it = seen.begin(); it != seen.end(); ) {
-                    if ((currentFrame - it->second) > threshold) {
-                        it = seen.erase(it);
-                    } else {
-                        ++it;
-                    }
+            for (auto it = g_ctx->widgetStates.begin(); it != g_ctx->widgetStates.end(); ) {
+                if ((currentFrame - it->second.lastFrameSeen) > threshold) {
+                    it = g_ctx->widgetStates.erase(it);
+                } else {
+                    ++it;
                 }
             }
         }
@@ -493,6 +911,18 @@ namespace FluentUI {
 
     void Render() {
         if (!g_ctx || !g_ctx->initialized) return;
+
+        // brief 21: by the time the frame is submitted every PushID must have a
+        // matching PopID. A non-empty stack means a container or user scope leaked.
+#ifndef NDEBUG
+        if (!g_ctx->idStack.empty()) {
+            Log(LogLevel::Warning,
+                "brief21: ID scope stack not balanced at Render() (depth=%zu); "
+                "a PushID is missing its PopID.",
+                g_ctx->idStack.size());
+            assert(g_ctx->idStack.empty() && "Unbalanced PushID/PopID");
+        }
+#endif
 
         // Phase D: render the drag-drop floating preview on the overlay layer
         if (g_ctx->dragDrop.active && g_ctx->dragDrop.previewDrawCtx) {
@@ -522,12 +952,9 @@ namespace FluentUI {
 
         g_ctx->renderer.EndFrame();
 
-        // Apply mouse cursor at end of frame
-        if (g_ctx->cursorsInitialized && g_ctx->desiredCursor != g_ctx->currentCursor) {
-            int idx = static_cast<int>(g_ctx->desiredCursor);
-            if (idx >= 0 && idx < 7 && g_ctx->systemCursors[idx]) {
-                SDL_SetCursor(g_ctx->systemCursors[idx]);
-            }
+        // Apply mouse cursor at end of frame (brief 26: via the platform seam).
+        if (g_ctx->desiredCursor != g_ctx->currentCursor) {
+            GetPlatform(g_ctx)->SetCursor(static_cast<int>(g_ctx->desiredCursor));
             g_ctx->currentCursor = g_ctx->desiredCursor;
         }
     }
@@ -569,29 +996,46 @@ namespace FluentUI {
         li.edited = edited;
 
         // Track activation transitions
-        bool wasActive = false;
-        auto itPrev = g_ctx->prevActiveItems.find(id);
-        if (itPrev != g_ctx->prevActiveItems.end()) wasActive = itPrev->second;
+        // brief 22 (fase 8): prevActiveItems/editedSinceActivate migraron a
+        // WidgetState (ws.prevActive / ws.editedSinceActivate). El .find() del mapa
+        // original solo distinguía "no visto" de false, pero el default de ambos
+        // campos es false, así que GetWidgetState (que auto-crea) preserva la
+        // semántica. El erase(id) del bloque deactivated se emula reseteando
+        // ws.editedSinceActivate = false (su valor por defecto).
+        UIContext::WidgetState& ws = g_ctx->GetWidgetState(id);
+        bool wasActive = ws.prevActive;
 
         li.activated = (active && !wasActive);
         li.deactivated = (!active && wasActive);
 
         if (li.activated) {
-            g_ctx->editedSinceActivate[id] = false;
+            ws.editedSinceActivate = false;
         }
         if (edited) {
-            g_ctx->editedSinceActivate[id] = true;
+            ws.editedSinceActivate = true;
         }
         if (li.deactivated) {
-            auto itEd = g_ctx->editedSinceActivate.find(id);
-            li.deactivatedAfterEdit = (itEd != g_ctx->editedSinceActivate.end() && itEd->second);
-            g_ctx->editedSinceActivate.erase(id);
+            li.deactivatedAfterEdit = ws.editedSinceActivate;
+            ws.editedSinceActivate = false;
         } else {
             li.deactivatedAfterEdit = false;
         }
 
         // Update prev-frame state for next frame
-        g_ctx->prevActiveItems[id] = active;
+        ws.prevActive = active;
+
+        // brief 30: within a composable TitleBar's content(), record every item's
+        // bbox so EndTitleBar can auto-exclude the interactive ones from window
+        // drag. Guarded flag ⇒ zero cost outside a title bar.
+        if (g_ctx->titleBarCapture.active) {
+            g_ctx->titleBarCapture.items.push_back({id, Rect(bboxMin, bboxMax - bboxMin)});
+        }
+        // brief 32: captura genérica (Card clicable, etc.). Independiente de la de
+        // la titlebar; ambas pueden estar activas si una Card vive dentro de una
+        // TitleBar componible.
+        if (g_ctx->interactiveCapture.active) {
+            g_ctx->interactiveCapture.items.push_back({id, Rect(bboxMin, bboxMax - bboxMin)});
+        }
     }
 
 } // namespace FluentUI

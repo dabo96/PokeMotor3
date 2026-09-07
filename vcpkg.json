@@ -5,7 +5,7 @@
         "freetype",
         "lua",
         "sol2",
-        "sdl3",
+        { "name": "sdl3", "features": [ "vulkan" ] },
         "sdl3-image",
         "zlib",
         "vulkan",

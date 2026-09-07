@@ -1,0 +1,265 @@
+{
+  "entities": [
+    {
+      "components": {
+        "Name": {
+          "value": "Map"
+        },
+        "TileMap": {
+          "width": 12,
+          "height": 10,
+          "start": [
+            5,
+            5
+          ],
+          "tiles": [
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            4,
+            4,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            4,
+            4,
+            0,
+            0,
+            1,
+            2,
+            2,
+            2,
+            2,
+            1,
+            0,
+            0,
+            4,
+            4,
+            0,
+            0,
+            1,
+            2,
+            2,
+            2,
+            2,
+            1,
+            0,
+            3,
+            4,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3,
+            3,
+            4,
+            4,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            3,
+            3,
+            4,
+            4,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            3,
+            4,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+            4
+          ],
+          "overrides": []
+        }
+      }
+    },
+    {
+      "components": {
+        "Name": {
+          "value": "Camera"
+        },
+        "Transform": {
+          "x": 5.5,
+          "y": 5.5,
+          "rot": 0.0,
+          "sx": 1.0,
+          "sy": 1.0
+        },
+        "Camera": {
+          "zoom": 32.0
+        },
+        "Script": {
+          "path": "Assets/Scripts/camera_follow.lua"
+        }
+      }
+    },
+    {
+      "components": {
+        "Name": {
+          "value": "Player"
+        },
+        "PlayerTag": {},
+        "Transform": {
+          "x": 5.0,
+          "y": 5.0,
+          "rot": 0.0,
+          "sx": 1.0,
+          "sy": 1.25
+        },
+        "Sprite": {
+          "texture": "Assets/Models/Sprites/001.png",
+          "uv": [
+            0.0,
+            0.0,
+            1.0,
+            1.0
+          ],
+          "tint": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "layer": 1,
+          "filter": 1
+        },
+        "Script": {
+          "path": "Assets/Scripts/player_movement.lua"
+        }
+      }
+    },
+    {
+      "components": {
+        "Name": {
+          "value": "NPC"
+        },
+        "Transform": {
+          "x": 3.0,
+          "y": 5.0,
+          "rot": 0.0,
+          "sx": 1.0,
+          "sy": 1.0
+        },
+        "Sprite": {
+          "texture": "Assets/Models/Sprites/001.png",
+          "uv": [
+            0.0,
+            0.0,
+            1.0,
+            1.0
+          ],
+          "tint": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "layer": 1,
+          "filter": 1
+        },
+        "Dialogue": {
+          "text": "Hola! Bienvenido a PokeMotor. Esta es la caja de dialogo con efecto maquina de escribir, capaz de paginar texto largo en varias paginas. Pulsa Enter para avanzar y, al final, para cerrar el dialogo."
+        }
+      }
+    },
+    {
+      "components": {
+        "Name": {
+          "value": "Enfermera"
+        },
+        "Transform": {
+          "x": 7.0,
+          "y": 5.0,
+          "rot": 0.0,
+          "sx": 1.0,
+          "sy": 1.0
+        },
+        "Sprite": {
+          "texture": "Assets/Models/Sprites/001.png",
+          "uv": [
+            0.0,
+            0.0,
+            1.0,
+            1.0
+          ],
+          "tint": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "layer": 1,
+          "filter": 1
+        },
+        "Script": {
+          "path": "Assets/Scripts/npc_healer.lua"
+        }
+      }
+    }
+  ]
+}

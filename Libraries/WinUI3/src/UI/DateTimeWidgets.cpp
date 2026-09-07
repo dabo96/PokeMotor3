@@ -1,11 +1,13 @@
 #include "UI/Widgets.h"
 #include "UI/WidgetHelpers.h"
+#include "UI/Icons.h"
 #include "core/Context.h"
 #include "core/Renderer.h"
 #include "Theme/FluentTheme.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <string>
 
@@ -198,7 +200,14 @@ bool TimePicker(const std::string& label, DateTimeValue* value, std::optional<Ve
 
     const TextStyle& valStyle = ctx->style.GetTextStyle(TypographyStyle::Body);
 
-    Vec2 totalSize(160.0f, 32.0f);
+    // Cada componente = [campo editable | botones ▲▼]. Separados por ":".
+    const float fieldW = 40.0f;
+    const float btnW = 18.0f;
+    const float gap = 2.0f;
+    const float compW = fieldW + gap + btnW;
+    const float sepW = 12.0f;
+    const float h = 32.0f;
+    Vec2 totalSize(compW * 3.0f + sepW * 2.0f, h);
     LayoutConstraints constraints = ConsumeNextConstraints();
     Vec2 finalSize = ApplyConstraints(ctx, constraints, totalSize);
     Vec2 widgetPos = pos.has_value()
@@ -207,48 +216,106 @@ bool TimePicker(const std::string& label, DateTimeValue* value, std::optional<Ve
 
     uint32_t id = GenerateId("TIME:", label.c_str());
     bool changed = false;
+    // Los TextInput internos mueven el cursor del layout; guardar para restaurar.
+    Vec2 savedCursor = ctx->cursorPos;
 
-    auto Spinner = [&](int* v, int lo, int hi, const Vec2& cp, uint32_t spId) {
-        Vec2 cs(40.0f, 32.0f);
-        ctx->renderer.DrawRectFilled(cp, cs, ctx->style.panel.background, 3.0f);
-        ctx->renderer.DrawRect(cp, cs, ctx->style.panel.borderColor, 3.0f);
+    // Un componente editable con spinners. `tag` da ids únicos por HH/MM/SS.
+    auto Spinner = [&](int* v, int lo, int hi, Vec2 basePos, const char* tag) {
+        // TextInput interno con label "##…" → sin header visible, id propio.
+        std::string subLabel = "##" + label + tag;
+        uint32_t sid = GenerateId("TSPIN:", subLabel.c_str());
+        uint32_t txtId = GenerateId("TXT:", subLabel.c_str());
+        std::string& buf = ctx->GetWidgetState(sid).stringVal;
+        bool& editing = ctx->GetWidgetState(sid).boolVal;
 
-        char buf[8];
-        std::snprintf(buf, sizeof(buf), "%02d", *v);
-        Vec2 ts = MeasureTextCached(ctx, buf, valStyle.fontSize);
-        ctx->renderer.DrawText(Vec2(cp.x + (cs.x - ts.x) * 0.5f,
-                                    cp.y + (cs.y - ts.y) * 0.5f),
-                               buf, valStyle.color, valStyle.fontSize);
-
-        // Up/Down zones: top half / bottom half on hover+click
-        Vec2 mp(ctx->input.MouseX(), ctx->input.MouseY());
-        if (PointInRect(mp, cp, cs) && ctx->input.IsMousePressed(0)) {
-            if (mp.y < cp.y + cs.y * 0.5f) {
-                *v = (*v >= hi) ? lo : *v + 1;
-            } else {
-                *v = (*v <= lo) ? hi : *v - 1;
-            }
-            changed = true;
+        // Fuera de edición, el buffer refleja el valor (sincronía externa).
+        if (!editing) {
+            char fb[8]; std::snprintf(fb, sizeof(fb), "%02d", *v);
+            buf = fb;
         }
-        // Wheel scroll on hover
-        if (PointInRect(mp, cp, cs) && ctx->input.MouseWheelY() != 0.0f) {
-            int delta = (ctx->input.MouseWheelY() > 0.0f) ? 1 : -1;
-            int nv = *v + delta;
+
+        // Campo editable (permite escribir la hora con el teclado).
+        // basePos YA es absoluto (deriva de ctx->cursorPos). TextInput vuelve a
+        // pasar su `pos` por ResolveAbsolutePosition, que suma CurrentOffset(ctx).
+        // Para no contar el offset del contenedor dos veces (lo que hundía el
+        // campo por debajo de los botones al hacer scroll), le pasamos la pos
+        // RELATIVA al padre: basePos - CurrentOffset. Ver
+        // feedback_resolve_absolute_position_rule.
+        Vec2 off = CurrentOffset(ctx);
+        Vec2 relPos(basePos.x - off.x, basePos.y - off.y);
+        LayoutConstraints fc; fc.width = SizeConstraint::Auto; fc.fixedWidth = fieldW;
+        SetNextConstraints(fc);
+        SetNextTextInputCenterX();  // HH/MM/SS centrados en X dentro del campo.
+        TextInput(subLabel, &buf, fieldW, false, relPos, nullptr, 0);
+
+        Vec2 spinPos(basePos.x + fieldW + gap, basePos.y);
+        Vec2 fullRect(compW, h);
+        Vec2 mp(ctx->input.MouseX(), ctx->input.MouseY());
+
+        // Commit (Enter / click fuera) → parsear + clamp a [lo,hi].
+        bool nowActive = (ctx->activeWidgetId == txtId &&
+                          ctx->activeWidgetType == ActiveWidgetType::TextInput);
+        bool clickAway = editing && ctx->input.IsMousePressed(0) &&
+                         !PointInRect(mp, basePos, fullRect);
+        if (nowActive && !clickAway) {
+            editing = true;
+        } else if (editing) {
+            editing = false;
+            if (clickAway && ctx->activeWidgetId == txtId) {
+                ctx->activeWidgetId = 0;
+                ctx->activeWidgetType = ActiveWidgetType::None;
+            }
+            int parsed = static_cast<int>(std::strtol(buf.c_str(), nullptr, 10));
+            parsed = std::clamp(parsed, lo, hi);
+            if (parsed != *v) { *v = parsed; changed = true; }
+            char fb[8]; std::snprintf(fb, sizeof(fb), "%02d", *v);
+            buf = fb;
+        }
+
+        // Botones ▲ (arriba) / ▼ (abajo).
+        Vec2 upP = spinPos;
+        Vec2 upS(btnW, h * 0.5f);
+        Vec2 dnP(spinPos.x, spinPos.y + upS.y);
+        Vec2 dnS(btnW, h - upS.y);
+        auto arrowBtn = [&](Vec2 bp, Vec2 bs, bool isUp) -> bool {
+            bool hov = IsMouseOver(ctx, bp, bs);
+            ctx->renderer.DrawRectFilled(bp, bs, InputFieldBackground(ctx, hov), 0.0f);
+            uint32_t glyph = isUp ? Icons::ChevronUp : Icons::ChevronDown;
+            float g = bs.y * 0.9f;
+            DrawWidgetIcon(ctx, bp, bs, glyph, valStyle.color, g,
+                           (bs.x - g) * 0.5f, 0.0f);
+            return hov && ctx->input.IsMousePressed(0);
+        };
+        bool up = arrowBtn(upP, upS, true);
+        bool dn = arrowBtn(dnP, dnS, false);
+        ctx->renderer.DrawRect(spinPos, Vec2(btnW, h),
+                               ctx->style.panel.borderColor, 0.0f);
+
+        // Subir/bajar con wrap simétrico (23→0, 0→23; igual para 0..59).
+        if (up) { *v = (*v >= hi) ? lo : *v + 1; changed = true; editing = false; }
+        if (dn) { *v = (*v <= lo) ? hi : *v - 1; changed = true; editing = false; }
+
+        // Rueda del ratón sobre el componente completo.
+        if (PointInRect(mp, basePos, fullRect) && ctx->input.MouseWheelY() != 0.0f) {
+            int nv = *v + ((ctx->input.MouseWheelY() > 0.0f) ? 1 : -1);
             if (nv < lo) nv = hi;
             if (nv > hi) nv = lo;
             *v = nv;
             changed = true;
         }
-        (void)spId;
     };
 
     Vec2 cp = widgetPos;
-    Spinner(&value->hour,   0, 23, cp, id ^ 0x10); cp.x += 44.0f;
-    ctx->renderer.DrawText(Vec2(cp.x - 4.0f, cp.y + 8.0f), ":", valStyle.color, valStyle.fontSize);
-    Spinner(&value->minute, 0, 59, cp, id ^ 0x20); cp.x += 44.0f;
-    ctx->renderer.DrawText(Vec2(cp.x - 4.0f, cp.y + 8.0f), ":", valStyle.color, valStyle.fontSize);
-    Spinner(&value->second, 0, 59, cp, id ^ 0x30);
+    auto colon = [&](float x) {
+        ctx->renderer.DrawText(Vec2(x, cp.y + 8.0f), ":", valStyle.color,
+                               valStyle.fontSize);
+    };
+    Spinner(&value->hour,   0, 23, cp, "h"); colon(cp.x + compW + 3.0f); cp.x += compW + sepW;
+    Spinner(&value->minute, 0, 59, cp, "m"); colon(cp.x + compW + 3.0f); cp.x += compW + sepW;
+    Spinner(&value->second, 0, 59, cp, "s");
 
+    // Restaurar el cursor (los TextInput internos lo movieron) y avanzar una vez.
+    ctx->cursorPos = savedCursor;
     ctx->lastItemPos = widgetPos;
     AdvanceCursor(ctx, finalSize);
     SetLastItem(id, widgetPos, widgetPos + finalSize, false, false, false, changed);

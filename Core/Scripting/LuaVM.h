@@ -14,8 +14,10 @@ public:
     void init();                                     // abre librerías + registra el Script API
 
     // Carga y ejecuta un chunk; devuelve la tabla de módulo (exports/on_start/on_update)
-    // o una tabla inválida si hubo error (logueado). Para ScriptComponent.
-    sol::table loadModule(const std::string& path);
+    // o una tabla inválida si hubo error (logueado). Para ScriptComponent. Con `outError`
+    // el mensaje se devuelve además al llamante (el inspector lo muestra en la entidad, no
+    // solo en la consola), y se vacía si la carga fue bien.
+    sol::table loadModule(const std::string& path, std::string* outError = nullptr);
 
     // Define los wrappers Lua de la API de eventos (show_text/show_choice/wait) que
     // ceden con coroutine.yield. Los llama el ScriptSystem tras registrar las funciones

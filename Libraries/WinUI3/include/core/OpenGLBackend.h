@@ -2,7 +2,6 @@
 
 #include "RenderBackend.h"
 #include <glad/glad.h>
-#include <SDL3/SDL.h>
 #include <unordered_map>
 #include <vector>
 
@@ -17,7 +16,19 @@ public:
     void Shutdown() override;
     void BeginFrame(const Color& clearColor) override;
     void EndFrame() override;
+    void Present() override;
     void SetViewport(int width, int height) override;
+
+    // brief 08 Part A: expose the GL context (GL context, as an opaque void*)
+    // so a secondary window's backend can reuse the SAME context (shared GL-side).
+    void* GetGLContext() const { return glContext; }
+
+    // brief 08 Part A: mark this backend as driving a secondary OS-window that
+    // shares the main context. In that mode BeginFrame makes the window current
+    // and clears its default framebuffer (it is a real window, not an engine
+    // overlay), and Present swaps it. ownsGLContext stays false so the shared
+    // context is never destroyed by this backend.
+    void SetSecondaryWindowMode(bool v) { secondaryWindow = v; }
 
     void PushClipRect(int x, int y, int width, int height) override;
     void PopClipRect() override;
@@ -30,10 +41,22 @@ public:
     void DrawBatch(ShaderType type, const RenderVertex* vertices, size_t vertexCount,
                    const unsigned int* indices, size_t indexCount,
                    void* textureHandle, const float* projectionMatrix,
-                   const Color& textColor = {1,1,1,1}) override;
+                   const Color& textColor = {1,1,1,1}, float msdfPxRange = 0.0f) override;
+
+    void SetTextRenderParams(const TextRenderParams& params) override { textParams = params; }
 
     void DrawLines(const RenderVertex* vertices, size_t vertexCount,
                    float width, const float* projectionMatrix) override;
+
+    void DrawSDFInstances(const SDFInstance* instances, size_t count,
+                          const float* projectionMatrix,
+                          const float* revealCursor = nullptr) override;
+
+    // --- Capabilities (brief 24) ---
+    uint32_t Capabilities() const override;
+
+    // --- Acrylic / Mica backdrop (brief 06) ---
+    void DrawAcrylicPanel(const AcrylicParams& params, const float* projectionMatrix) override;
 
     // --- Render Targets / FBO (Phase 5) ---
     void* CreateRenderTarget(int width, int height) override;
@@ -49,14 +72,34 @@ public:
     Color ReadPixel(int x, int y) override;
 
 private:
-    SDL_Window* window = nullptr;
-    SDL_GLContext glContext = nullptr;
+    void* window = nullptr;     // native window handle (opaque; cast in the .cpp)
+    void* glContext = nullptr;  // GL context (opaque; cast in the .cpp)
     bool ownsGLContext = true;  // false when using an external context
+    // brief 08 Part A: true when this backend renders a secondary OS-window that
+    // shares the main GL context. Distinguishes "embedded in an engine context"
+    // (ownsGLContext==false, no clear, save/restore engine state) from "our own
+    // secondary window on a shared context" (clear + present, no save/restore).
+    bool secondaryWindow = false;
     GLuint shaderProgram = 0;
     GLuint textShaderProgram = 0;
     GLuint msdfShaderProgram = 0;
+    // Brief 35-B: dual-source variant of the MSDF program. 0 when the driver has
+    // no GL_ARB_blend_func_extended (core in 3.3) or the program failed to link.
+    GLuint msdfSubpixelProgram = 0;
+    bool dualSourceBlendSupported = false;
+    // True while the SRC1 blend func is bound, so we only touch blend state on a
+    // real transition (subpixel batch <-> everything else).
+    bool subpixelBlendActive = false;
+    // Params for the batches drawn from now on (brief 35-A/35-B). Defaults are the
+    // identity curve + grayscale, i.e. the pre-brief behavior.
+    TextRenderParams textParams;
     GLuint imageShaderProgram = 0;
+    GLuint sdfRectProgram = 0;
     GLuint vao = 0, vbo = 0, ebo = 0;
+    // SDF instanced pipeline (brief 01): dedicated VAO with a static unit quad +
+    // a dynamic per-instance buffer.
+    GLuint sdfVao = 0, sdfQuadVBO = 0, sdfQuadEBO = 0, sdfInstanceVBO = 0;
+    size_t sdfInstanceCapacity = 0;
     Vec2 viewportSize = {800.0f, 600.0f};
 
     // Issue 3: Cached uniform locations
@@ -65,11 +108,19 @@ private:
         GLint textColor = -1;
         GLint pxRange = -1;
         GLint texture = -1;
+        GLint reveal = -1; // uReveal (SDF reveal cursor, brief 04)
+        // Brief 35-A/35-B (MSDF programs only; -1 on every other shader).
+        GLint textGamma = -1;
+        GLint textContrast = -1;
+        GLint subpixel = -1;
+        GLint fringe = -1;
     };
     ShaderUniforms basicUniforms;
     ShaderUniforms textUniforms;
     ShaderUniforms msdfUniforms;
+    ShaderUniforms msdfSubpixelUniforms;
     ShaderUniforms imageUniforms;
+    ShaderUniforms sdfRectUniforms;
 
     // Issue 2: Pre-allocated VBO/EBO capacity
     size_t vboCapacity = 0;
@@ -80,6 +131,10 @@ private:
     float lastProjection[16] = {};
     Color lastTextColor{-1,-1,-1,-1}; // Invalid initial value to force first upload
     float lastPxRange = -1.0f;
+    float lastTextGamma = -1.0f;
+    float lastTextContrast = -1.0f;
+    float lastSubpixel = 0.0f;
+    float lastFringe = -1.0f;
 
     // Issue 4: GL state caching
     GLuint lastBoundProgram = 0;
@@ -145,6 +200,35 @@ private:
     GLuint CreateShaderProgram(const char* vertexSource, const char* fragmentSource);
     void UpdateClipScissor();
     void QueryUniforms(GLuint program, ShaderUniforms& uniforms);
+
+    // --- Acrylic / Mica backdrop (brief 06) ---
+    // Blur programs + fullscreen-quad VAO, created lazily on first acrylic use.
+    GLuint kawaseDownProgram = 0;
+    GLuint kawaseUpProgram = 0;
+    GLuint acrylicCompositeProgram = 0;
+    GLuint blurVao = 0, blurVbo = 0;
+    // Cached uniform locations.
+    GLint uKawaseDownTex = -1, uKawaseDownHalfpixel = -1;
+    GLint uKawaseUpTex = -1, uKawaseUpHalfpixel = -1;
+    GLint uCmpProjection = -1, uCmpCenter = -1, uCmpHalf = -1, uCmpSoft = -1;
+    GLint uCmpBlur = -1, uCmpNoise = -1, uCmpScreenSize = -1, uCmpRadius = -1;
+    GLint uCmpTint = -1, uCmpTintOpacity = -1, uCmpLumOpacity = -1, uCmpNoiseAmount = -1;
+    bool acrylicResourcesReady = false;
+    void EnsureAcrylicResources();
+    // A ping-pong chain of half/quarter/... resolution color targets reused across
+    // panels and frames; rebuilt when the framebuffer size changes.
+    struct BlurLevel { GLuint fbo = 0; GLuint tex = 0; int w = 0, h = 0; };
+    std::vector<BlurLevel> blurChain;     // index 0 = 1/2 res, 1 = 1/4, ...
+    BlurLevel blurCapture;                // 1/2-res capture of the backdrop
+    BlurLevel micaCache;                  // cached blurred backdrop for Mica
+    int micaCacheW = 0, micaCacheH = 0;   // fb size the Mica cache was built at
+    bool micaCacheValid = false;
+    int blurChainFbW = 0, blurChainFbH = 0;
+    void EnsureBlurChain(int fbW, int fbH, int passes);
+    void DestroyBlurChain();
+    // Capture the default framebuffer (downscaled) into `blurCapture`, then run the
+    // dual-Kawase down/up passes; the final blurred image lands in `blurChain[0]`.
+    void CaptureAndBlur(int fbW, int fbH, int passes);
 };
 
 } // namespace FluentUI

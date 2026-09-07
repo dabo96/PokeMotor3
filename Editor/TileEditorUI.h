@@ -7,9 +7,11 @@
 
 #include "Core/Math.h"
 #include "Game/TileMap.h"
+#include "Math/Rect.h"   // FluentUI::Rect: rect del pane que reciben las superficies
 
 #include <mutex>
 #include <string>
+#include <unordered_set>
 
 struct SDL_Window;
 
@@ -53,13 +55,18 @@ private:
     void ensureLoaded();
     void buildMapScreen(int width, int height);      // pantalla de pintura del mapa
     void buildTilesetScreen(int width, int height);  // pantalla de configuración del tileset
-    void drawPalette(float top, int width, int height);
-    void drawCanvas(float top, int width, int height);
+    // Superficies dibujadas a mano (rejillas con hit-test propio). Reciben el RECT donde
+    // pintar —el que les da el Splitter— en vez de deducirlo de constantes de layout.
+    void drawPalette(const FluentUI::Rect& r);
+    void drawCanvas(const FluentUI::Rect& r);
     // Pantalla de tileset: lista de tipos (izquierda) + atlas recortado (derecha).
-    void drawTypeList(float top, float x, float listW, int height);
-    void drawAtlasPanel(float top, float x, int width, int height);
+    void drawTypeList(const FluentUI::Rect& r);
+    void drawAtlasPanel(const FluentUI::Rect& r);
+    // Rect libre que queda en el pane actual del Splitter, desde el cursor hasta abajo.
+    FluentUI::Rect remainingPane(FluentUI::Vec2 paneOrigin, FluentUI::Vec2 paneSize) const;
     void saveTileset();         // escribe tileset.json + avisa al overworld para reconstruir
     void addNewType();          // añade un tipo nuevo y lo selecciona
+    void addNewGroup();         // añade un tipo nuevo dentro de un grupo nuevo y lo selecciona
     void removeSelectedType();  // borra el tipo seleccionado y remapea la copia de trabajo del mapa
     void changeImageDialog();   // abre el diálogo nativo para elegir la imagen del tileset
     void applyPendingImage();   // aplica (en el hilo principal) la imagen elegida en el diálogo
@@ -68,6 +75,8 @@ private:
     void* atlasHandle();
     void save();
     void reload();
+    void resizeMap();            // aplica m_mapWBuf×m_mapHBuf a la copia de trabajo del mapa
+    void syncSizeBuffers();      // vuelca el tamaño actual del mapa a los buffers de texto
     void floodFill(int x, int y, TileType from, TileType to);
 
     EventBus*     m_bus    = nullptr;   // notifica al overworld al guardar (no propio)
@@ -92,6 +101,19 @@ private:
     bool    m_rectActive = false;
     IVec2   m_rectStart{ 0, 0 };
     IVec2   m_rectEnd{ 0, 0 };
+    double  m_mapW = 0.0;          // campos del control "Redimensionar" (NumberBox trabaja en double)
+    double  m_mapH = 0.0;
+    // Ratios de los Splitters de cada pantalla (paleta|lienzo y tipos|atlas). Son estado
+    // editable: el divisor se arrastra igual que en la ventana principal.
+    float   m_ratioPalette = 0.22f;
+    float   m_ratioTypes   = 0.34f;
+    bool    m_mapSizeOpen  = true;   // Expander "Mapa" (tamaño) desplegado
+    bool    m_typeInspOpen = true;   // Expander "Tipo seleccionado" desplegado
+    // Scroll (con la rueda) de las listas de tipos: config (drawTypeList) y paleta (drawPalette).
+    float   m_typeScroll    = 0.0f;
+    float   m_paletteScroll = 0.0f;
+    // Grupos plegados (dropdown): compartido por ambas listas; su cabecera oculta los miembros.
+    std::unordered_set<std::string> m_collapsedGroups;
     char    m_status[96] = { 0 };
 };
 

@@ -24,6 +24,12 @@ struct LogEntry { LogLevel level; std::string text; };
 // Copia (thread-safe) las entradas recientes del log para mostrarlas en la UI.
 void logSnapshot(std::vector<LogEntry>& out);
 
+// Errores y avisos acumulados desde el arranque. Es un contador, no una copia del buffer:
+// la UI lo consulta cada frame (p.ej. el aviso de la consola plegada del editor) sin pagar
+// el snapshot completo.
+struct LogCounts { unsigned warn = 0, error = 0; };
+LogCounts logCounts();
+
 }  // namespace pk
 
 #define LOG_TRACE(...) ::pk::logMessage(::pk::LogLevel::Trace, __VA_ARGS__)

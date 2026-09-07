@@ -7,9 +7,13 @@ namespace pk {
 
 void Input::update(const std::vector<RawEvent>& events) {
     m_previous = m_current;  // 1) el actual pasa a ser pasado
+    m_wheel    = Vec2(0.0f, 0.0f);   // la rueda es un delta del frame, no un estado
 
     for (const RawEvent& e : events) {  // 2) aplica los eventos crudos
         switch (e.type) {
+            case RawEvent::MouseWheel:
+                m_wheel = m_wheel + e.wheel;   // varias muescas en el mismo frame se suman
+                break;
             case RawEvent::KeyDown:
                 if (e.key != Key::Unknown) m_current.keys[(std::size_t)e.key] = true;
                 break;

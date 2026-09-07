@@ -1,6 +1,7 @@
 #include "core/UIBuilder.h"
 #include "UI/Widgets.h"
 #include "core/Context.h"
+#include "core/PlatformBackend.h" // brief 26: OS services via GetPlatform(ctx)
 #include "core/DockSystem.h"
 
 namespace FluentUI {
@@ -105,6 +106,25 @@ bool UIBuilder::slider(const std::string& label, int* value, int min, int max,
 
 void UIBuilder::progressBar(float fraction, const Vec2& size, const std::string& overlay) {
     ProgressBar(fraction, size, overlay);
+}
+
+// --- Feedback & estado (brief 15) ---
+bool UIBuilder::infoBar(const std::string& id, InfoSeverity severity,
+                        const std::string& title, const std::string& message,
+                        bool closable, const std::string& actionText) {
+    return InfoBar(id, severity, title, message, closable, actionText);
+}
+void UIBuilder::progressRing(const std::string& id, float size, float progress) {
+    ProgressRing(id, size, progress);
+}
+void UIBuilder::badge(int count, bool dot, std::optional<Vec2> anchorTopRight) {
+    Badge(count, dot, anchorTopRight);
+}
+void UIBuilder::skeleton(const Vec2& size, float cornerRadius) {
+    Skeleton(size, cornerRadius);
+}
+void UIBuilder::skeletonText(int lines, float lineHeight, float lastLineFraction) {
+    SkeletonText(lines, lineHeight, lastLineFraction);
 }
 
 bool UIBuilder::textInput(const std::string& label, std::string* value, float width, size_t maxLength) {
@@ -303,10 +323,84 @@ void UIBuilder::contextMenu(const std::string& id, std::function<void(UIBuilder&
 
 void UIBuilder::modal(const std::string& id, const std::string& title, bool* open,
                       const Vec2& size, std::function<void(UIBuilder&)> content) {
+    // EndModal SOLO cuando BeginModal devolvió true (contrato B2, igual que flyout
+    // justo debajo). Estaba fuera del if: con el modal cerrado — el caso normal, ya
+    // que este wrapper se llama cada frame — se ejecutaba un EndModal espurio que
+    // hacía PopOpacity, EndVertical y PopClipRect sobre el estado del PADRE,
+    // descuadrando su layout y su clip.
     if (BeginModal(id, title, open, size)) {
         if (content) content(*this);
+        EndModal();
     }
-    EndModal();
+}
+
+void UIBuilder::flyout(const std::string& id, const Rect& anchorRect,
+                       std::function<void(UIBuilder&)> content) {
+    // EndFlyout only when open: BeginFlyout returning false leaves no flyout scope
+    // (and could otherwise act on an unrelated active flyout).
+    if (BeginFlyout(id, anchorRect)) {
+        if (content) content(*this);
+        EndFlyout();
+    }
+}
+
+void UIBuilder::menuFlyout(const std::string& id, const Rect& anchorRect,
+                           const std::vector<MenuEntry>& entries) {
+    MenuFlyout(id, anchorRect, entries);
+}
+
+// --- BRIEF 14: Signature controls (sugar) ---
+
+bool UIBuilder::toggleSwitch(const std::string& label, bool* value,
+                             const std::string& onText, const std::string& offText) {
+    return ToggleSwitch(label, value, onText, offText);
+}
+
+void UIBuilder::expander(const std::string& id, const std::string& header,
+                         std::function<void(UIBuilder&)> content,
+                         uint32_t icon, bool* expanded) {
+    if (BeginExpander(id, header, icon, expanded)) {
+        if (content) content(*this);
+        EndExpander();
+    }
+}
+
+int UIBuilder::splitButton(const std::string& label, uint32_t icon,
+                           std::function<void()> onPrimary,
+                           const std::vector<CommandItem>& menu) {
+    return SplitButton(label, icon, onPrimary, menu);
+}
+
+void UIBuilder::dropDownButton(const std::string& label, uint32_t icon,
+                               const std::vector<CommandItem>& menu) {
+    DropDownButton(label, icon, menu);
+}
+
+bool UIBuilder::numberBox(const std::string& label, double* value,
+                          double min, double max, double step, const char* format) {
+    return NumberBox(label, value, min, max, step, format);
+}
+
+bool UIBuilder::teachingTip(const std::string& id, const Rect& targetRect,
+                            const std::string& title, const std::string& body,
+                            const std::string& actionText) {
+    return TeachingTip(id, targetRect, title, body, actionText);
+}
+
+DialogResult UIBuilder::contentDialog(const std::string& id, bool* open,
+                                      const std::string& title,
+                                      std::function<void(UIBuilder&)> body,
+                                      const std::string& primaryText,
+                                      const std::string& secondaryText,
+                                      const std::string& closeText) {
+    return ContentDialog(id, open, title,
+                         [&]() { if (body) body(*this); },
+                         primaryText, secondaryText, closeText);
+}
+
+bool UIBuilder::rating(const std::string& id, int* value, int maxStars,
+                       bool allowHalf) {
+    return RatingControl(id, value, maxStars, allowHalf);
 }
 
 // --- Grid layout ---
@@ -320,6 +414,39 @@ void UIBuilder::grid(const std::string& id, int columns, int itemCount,
         if (cellContent) cellContent(*this, i);
     }
     EndGrid();
+}
+
+// --- Layout primitives (brief 19) ---
+
+void UIBuilder::wrapPanel(const std::string& id,
+                          std::function<void(UIBuilder&)> content,
+                          float hGap, float vGap) {
+    BeginWrapPanel(id, hGap, vGap);
+    if (content) content(*this);
+    EndWrapPanel();
+}
+
+void UIBuilder::uniformGrid(const std::string& id, int columns, int itemCount,
+                            std::function<void(UIBuilder&, int index)> cellContent,
+                            float gap) {
+    BeginUniformGrid(id, columns, gap);
+    for (int i = 0; i < itemCount; ++i) {
+        if (i > 0) UniformGridNextCell();
+        if (cellContent) cellContent(*this, i);
+    }
+    EndUniformGrid();
+}
+
+void UIBuilder::canvas(const std::string& id, const Vec2& size,
+                       std::function<void(UIBuilder&)> content) {
+    BeginCanvas(id, size);
+    if (content) content(*this);
+    EndCanvas();
+}
+
+void UIBuilder::adaptiveLayout(std::function<void(UIBuilder&, Breakpoint)> build) {
+    if (!build) return;
+    AdaptiveLayout([this, &build](Breakpoint bp) { build(*this, bp); });
 }
 
 // --- Table/DataGrid ---
@@ -470,6 +597,42 @@ void UIBuilder::debugOverlay() {
     ctx->renderer.SetLayer(RenderLayer::Default); // Restore
 }
 
+// --- Text quality tuning (briefs 35-A / 35-B / 35-C) ---
+
+void UIBuilder::textQualityPanel() {
+    if (!ctx) return;
+    Renderer& r = ctx->renderer;
+    // Edited by value and written back whenever something changed: TextQuality is
+    // plain per-frame state, so this costs nothing and keeps the API immutable.
+    Renderer::TextQuality q = r.GetTextQuality();
+    bool changed = false;
+
+    label("Text rendering", TypographyStyle::Subtitle);
+
+    changed |= checkbox("Contrast / gamma curve (35-A)", &q.contrastEnabled);
+    changed |= slider("Gamma light-on-dark", &q.gammaLightOnDark, 0.5f, 2.5f);
+    changed |= slider("Gamma dark-on-light", &q.gammaDarkOnLight, 0.5f, 2.5f);
+    changed |= slider("Contrast", &q.contrast, 0.0f, 1.0f);
+
+    separator();
+
+    const bool subpixelAvailable = r.GetBackend() &&
+                                   r.GetBackend()->Supports(RenderCap::SubpixelText);
+    changed |= checkbox("Subpixel AA (35-B)", &q.subpixelEnabled);
+    if (!subpixelAvailable) {
+        // Honest status: the checkbox is a preference, the capability is the gate.
+        label("  (unavailable: backend has no dual-source blending)", TypographyStyle::Caption);
+    }
+    changed |= checkbox("BGR stripe order", &q.bgrStripes);
+    changed |= slider("Fringe reduction", &q.fringe, 0.0f, 1.0f);
+
+    separator();
+
+    changed |= checkbox("Vertical grid fit (35-C)", &q.verticalGridFit);
+
+    if (changed) r.SetTextQuality(q);
+}
+
 // --- Dock Space (Phase 4) ---
 
 void UIBuilder::dockSpace(std::function<void(UIBuilder&)> content) {
@@ -554,7 +717,7 @@ void UIBuilder::dockSpace(std::function<void(UIBuilder&)> content) {
                                         mx > viewport.x || my > viewport.y);
                 if (outsideViewport && drag.onPanelDragOut) {
                     float gx = 0.0f, gy = 0.0f;
-                    SDL_GetGlobalMouseState(&gx, &gy);
+                    GetPlatform(ctx)->GetGlobalMousePos(gx, gy);
                     std::string panelId = drag.panelId;
                     auto cb = drag.onPanelDragOut;
                     drag.Reset();
@@ -689,6 +852,110 @@ float UIBuilder::dpiScale() const {
 
 float UIBuilder::scaled(float value) const {
     return ctx ? value * ctx->dpiScale : value;
+}
+
+// ─── BRIEF 16: Collections (sugar) ──────────────────────────────────────────
+
+void UIBuilder::gridView(const std::string& id, int itemCount, const Vec2& itemSize,
+                         std::function<void(UIBuilder&, int)> itemBuilder,
+                         float gap, float minItemWidth) {
+    GridView(id, itemCount, itemSize,
+             [this, &itemBuilder](int index) { if (itemBuilder) itemBuilder(*this, index); },
+             gap, minItemWidth);
+}
+
+DataGridResult UIBuilder::dataGrid(const std::string& id,
+                                   const std::vector<DataColumn>& cols, int rowCount,
+                                   std::function<std::string(int, int)> getCell,
+                                   std::function<void(int, int, const std::string&)> setCell) {
+    return DataGrid(id, cols, rowCount, getCell, setCell);
+}
+
+int UIBuilder::pagination(const std::string& id, int pageCount, int* currentPage) {
+    return Pagination(id, pageCount, currentPage);
+}
+
+void UIBuilder::expanderList(const std::string& id, int itemCount,
+                             std::function<std::string(int)> headerFn,
+                             std::function<void(UIBuilder&, int)> bodyFn,
+                             bool accordion) {
+    ExpanderList(id, itemCount, headerFn,
+                 [this, &bodyFn](int i) { if (bodyFn) bodyFn(*this, i); }, accordion);
+}
+
+int UIBuilder::flipView(const std::string& id, int itemCount,
+                        std::function<void(UIBuilder&, int)> itemBuilder,
+                        int* currentIndex) {
+    return FlipView(id, itemCount,
+                    [this, &itemBuilder](int index) { if (itemBuilder) itemBuilder(*this, index); },
+                    currentIndex);
+}
+
+// ─── BRIEF 13: App shell & navegación (sugar) ───────────────────────────────
+
+std::string UIBuilder::navigationView(const std::string& id,
+                                      const std::vector<NavItem>& items,
+                                      std::string* selectedKey, NavDisplayMode mode,
+                                      const std::vector<NavItem>& footerItems) {
+    return NavigationView(id, items, selectedKey, mode, footerItems);
+}
+
+std::string UIBuilder::navigationView(const std::string& id,
+                                      const std::vector<NavItem>& items,
+                                      std::string* selectedKey) {
+    return NavigationView(id, items, selectedKey);
+}
+
+void UIBuilder::commandBar(const std::string& id,
+                           const std::vector<CommandItem>& primary,
+                           const std::vector<CommandItem>& secondary) {
+    CommandBar(id, primary, secondary);
+}
+
+int UIBuilder::breadcrumbBar(const std::string& id,
+                             const std::vector<std::string>& crumbs) {
+    return BreadcrumbBar(id, crumbs);
+}
+
+TitleBarResult UIBuilder::titleBar(const std::string& id, const std::string& title,
+                                   uint32_t icon, std::function<void()> content) {
+    return TitleBar(id, title, icon, std::move(content));
+}
+
+// ─── BRIEF 17: Texto y contenido rico (sugar) ───────────────────────────────
+
+void UIBuilder::selectableText(const std::string& id, const std::string& text,
+                               float fontSize, bool wrap) {
+    SelectableText(id, text, fontSize, wrap);
+}
+
+bool UIBuilder::hyperlink(const std::string& text, const std::string& url,
+                          float fontSize) {
+    return HyperlinkButton(text, url, fontSize);
+}
+
+std::string UIBuilder::autoSuggestBox(
+    const std::string& id, std::string* text,
+    const std::function<std::vector<std::string>(const std::string&)>& suggestionsFn,
+    const std::string& placeholder) {
+    return AutoSuggestBox(id, text, suggestionsFn, placeholder);
+}
+
+bool UIBuilder::tokenizingTextBox(
+    const std::string& id, std::vector<std::string>* tokens,
+    const std::string& placeholder,
+    const std::function<std::vector<std::string>(const std::string&)>& suggestionsFn) {
+    return TokenizingTextBox(id, tokens, placeholder, suggestionsFn);
+}
+
+bool UIBuilder::passwordBox(const std::string& id, std::string* value,
+                            const std::string& placeholder) {
+    return PasswordBox(id, value, placeholder);
+}
+
+void UIBuilder::markdownView(const std::string& id, const std::string& markdown,
+                             float maxWidth) {
+    MarkdownView(id, markdown, maxWidth);
 }
 
 } // namespace FluentUI

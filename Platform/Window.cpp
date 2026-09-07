@@ -43,8 +43,15 @@ bool Window::create(const char* title, int width, int height) {
     // botón de cerrar (no es fullscreen sin bordes). RESIZABLE permite redimensionar
     // (el renderer recrea la swapchain ante el cambio de tamaño). El width/height
     // pedido es el tamaño "restaurado"; consultamos el real tras maximizar.
-    m_window = SDL_CreateWindow(title, width, height,
-                               SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED);
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED;
+#ifdef ENGINE_EDITOR
+    // El editor dibuja su PROPIA barra de título (FluentUI::TitleBar), así que la ventana nace
+    // SIN borde nativo. Se hace en la creación (no en runtime con SDL_SetWindowBordered) para
+    // evitar el estado raro que deja quitar el borde a una ventana ya maximizada (des-maximiza /
+    // pierde el foco de ratón → los clicks dejan de registrarse).
+    flags |= SDL_WINDOW_BORDERLESS;
+#endif
+    m_window = SDL_CreateWindow(title, width, height, flags);
     if (!m_window) {
         LOG_ERROR("SDL_CreateWindow falló: %s", SDL_GetError());
         return false;

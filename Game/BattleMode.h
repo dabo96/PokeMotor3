@@ -15,7 +15,9 @@ namespace pk {
 
 class BattleMode : public GameMode {
 public:
-    BattleMode(std::string foeName, int foeId);
+    // El sprite del rival llega COMO DATO (Species::sprite, de species.json); el combate
+    // no sabe qué imagen usa cada especie ni la deduce.
+    BattleMode(std::string foeName, int foeId, std::string foeSprite);
 
     void onEnter(GameContext& ctx) override;
     void handleInput(GameContext& ctx) override;
@@ -27,6 +29,7 @@ public:
 private:
     std::string        m_foeName;
     int                m_foeId = 0;
+    std::string        m_foeSprite;   // ruta del arte del rival (vacía = sin textura)
     TextureHandle      m_foeTex;
     OrthographicCamera m_cam;
     float              m_t = 0.0f;   // tiempo en combate (para el "bob" del sprite)

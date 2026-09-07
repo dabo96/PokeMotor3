@@ -12,7 +12,54 @@ enum class ShaderType {
     Basic,      // Simple quads/lines
     Text,       // Bitmap text (Red channel only)
     MSDF,       // Multi-channel Signed Distance Field text
-    Image       // Textured quad (full RGBA sampling with tint)
+    Image,      // Textured quad (full RGBA sampling with tint)
+    SDFRect     // Instanced signed-distance-field rounded rect (fill/border/shadow/reveal)
+};
+
+// Per-widget instance for the SDF rounded-rect pipeline (briefs 01-04). One quad
+// is instanced per entry; the fragment shader resolves the rounded box analytically.
+// Layout is std140-friendly (contiguous floats) and identical on GL and Vulkan;
+// attribute offsets are taken via offsetof so the struct is the single source of
+// truth. See 00_INDEX.md.
+struct SDFInstance {
+    float cx = 0, cy = 0;            // rect center (logical px)
+    float hx = 0, hy = 0;            // half-size (px), border/AA excluded
+    float radius = 0;               // corner radius (px)
+    float borderWidth = 0;          // border thickness (px); reused as blur when mode==1
+    float softness = 1;             // AA width (px); typically max(1, dpiScale)
+    float mode = 0;                 // 0=fill+border, 1=shadow (brief 03), 2=acrylic-mask (brief 06)
+    float fillR = 0, fillG = 0, fillB = 0, fillA = 0;
+    float borderR = 0, borderG = 0, borderB = 0, borderA = 0;
+    // Reveal highlight (brief 04). 0 = no effect.
+    float revealIntensity = 0;
+    // Brief 34 Parte E: color inferior del borde de elevación (bisel vertical Win11).
+    // Antes eran 3 floats de padding libres; ahora llevan el RGB del borde inferior y
+    // reutilizan borderA como alpha común, así el struct SIGUE en 80 bytes (sin coste
+    // de ancho de banda). Si (borderR2,borderG2,borderB2) == (borderR,borderG,borderB)
+    // el borde es plano (retrocompatible con briefs 01-04).
+    float borderR2 = 0, borderG2 = 0, borderB2 = 0; // color borde inferior (top-left origin: +y abajo)
+};
+static_assert(sizeof(SDFInstance) == 80, "SDFInstance debe seguir en 80 bytes (brief 34 Parte E)");
+
+// Parameters for one Acrylic/Mica backdrop panel (brief 06). The backend captures
+// the backdrop behind `rect`, blurs it (dual Kawase) and composites tint +
+// luminosity + noise, masked to the rounded rect. All coordinates are logical px
+// (top-left origin), matching the ortho projection used by DrawSDFInstances.
+struct AcrylicParams {
+    float x = 0, y = 0, w = 0, h = 0;   // panel rect (logical px)
+    float cornerRadius = 0;
+    float tintR = 0, tintG = 0, tintB = 0;
+    float tintOpacity = 0.15f;          // 0..1 tint blend over the blurred backdrop
+    float luminosityOpacity = 0.85f;    // 0..1 desaturate-to-luminosity blend
+    float noiseAmount = 0.02f;          // grain strength
+    float dpiScale = 1.0f;              // AA / pixel sizing
+    int   blurPasses = 3;               // dual-Kawase iterations (≈ blur radius)
+    int   mica = 0;                     // 0 = Acrylic (live backdrop), 1 = Mica (cheap/static)
+    // Flat fallback color (premultiplied semantics not assumed). Used by the
+    // Renderer's DrawRectAcrylicFallback when the backend can't blur.
+    float fallbackR = 0, fallbackG = 0, fallbackB = 0, fallbackA = 0;
+    // Blue-noise texture handle (created by the Renderer via CreateTexture).
+    void* noiseTex = nullptr;
 };
 
 /// Objects shared by an external Vulkan engine when FluentUI renders inside its
@@ -48,6 +95,23 @@ struct VulkanSharedContext {
     bool     dynamicRendering = false;
     uint32_t depthFormat     = 0;       // VkFormat of depth attachment (0 = none)
     uint32_t stencilFormat   = 0;       // VkFormat of stencil attachment (0 = none)
+
+    // brief 08 Part B (multi-window): when true the backend treats this as a
+    // SECONDARY OS-WINDOW on a shared device — it creates its OWN surface,
+    // swapchain, render pass, per-frame sync and PRESENTS, instead of recording
+    // onto an engine-supplied command buffer. Only instance/physicalDevice/
+    // device/graphicsQueue/queueFamilyIndex are required in this mode; renderPass/
+    // colorFormat are ignored (the backend derives them from its own surface).
+    // The device/instance are NOT owned and never destroyed by this backend.
+    // Populate it from the main UI backend via VulkanBackend::GetSharedContext().
+    bool     ownSwapchain    = false;
+
+    // gap #4 (multi-window pipeline sharing): opaque pointer to the OWNER VulkanBackend
+    // (the main window's) so a secondary window can ADOPT its device-level shader
+    // modules / layouts instead of recreating them. Only meaningful with ownSwapchain;
+    // set by VulkanBackend::GetSharedContext(). Never dereferenced outside VulkanBackend.
+    // The owner must outlive the secondary windows.
+    void*    ownerBackend    = nullptr; // VulkanBackend*
 };
 
 struct RenderVertex {
@@ -56,13 +120,56 @@ struct RenderVertex {
     float u = 0.0f, v = 0.0f; // Added UVs for general use
 };
 
+// Brief 24: backend capability flags. Optional features (render targets,
+// save/restore, copy, readpixel, instancing, acrylic, external textures) are
+// implemented by some backends and not others. Instead of calling a no-op stub
+// and getting a silent nullptr/transparent result, callers query
+// `backend->Supports(cap)` first and degrade gracefully when it is missing.
+enum class RenderCap : uint32_t {
+    RenderTargets   = 1u << 0,  // CreateRenderTarget/SetRenderTarget/GetRenderTargetTexture/DeleteRenderTarget
+    SaveRestore     = 1u << 1,  // SaveState/RestoreState
+    CopyTexture     = 1u << 2,  // CopyTexture
+    ReadPixel       = 1u << 3,  // ReadPixel (eyedropper, Phase C6)
+    Instancing      = 1u << 4,  // DrawSDFInstances (SDF pipeline, brief 01)
+    Acrylic         = 1u << 5,  // DrawAcrylicPanel real blur (brief 06)
+    ExternalTexture = 1u << 6,  // RegisterExternalTexture (engine viewport in UI)
+    SubpixelText    = 1u << 7,  // dual-source blending for ClearType-style text (brief 35-B)
+};
+
+// Brief 35-A/35-B: per-batch text rendering parameters. Set on the backend right
+// before an MSDF text batch is drawn (SetTextRenderParams); backends that ignore
+// it keep rendering exactly as before, which is what makes this degrade cleanly.
+//
+// The defaults are the IDENTITY (gamma 1, contrast 0, grayscale), so a batch that
+// never received params renders like the pre-brief pipeline.
+struct TextRenderParams {
+    // Transfer curve (DirectWrite's gamma + enhancedContrast equivalent).
+    // gamma > 1 thins (light text on dark), gamma < 1 fattens (dark on light).
+    float gamma = 1.0f;
+    float contrast = 0.0f;
+    // Subpixel mode: 0 = grayscale, +1 = RGB stripe order, -1 = BGR. Only honored
+    // when the backend reports RenderCap::SubpixelText.
+    int   subpixel = 0;
+    // Extra desaturation ON TOP of the shader's FIR5 filter (0 = filtered stripes
+    // as-is, 1 = fully grayscale). The FIR5 does the real work, so this stays low.
+    float fringe = 0.1f;
+};
+
 class RenderBackend {
 public:
     virtual ~RenderBackend() = default;
 
+    // --- Capabilities (brief 24) ---
+    // Bitwise-OR of the RenderCap values this backend actually implements. Pure
+    // virtual so every backend (GL, Vulkan, DX11) must answer honestly.
+    virtual uint32_t Capabilities() const = 0;
+    // True if this backend implements the optional feature `c`. Optional methods
+    // below must only be called when the matching capability is reported.
+    bool Supports(RenderCap c) const { return (Capabilities() & static_cast<uint32_t>(c)) != 0; }
+
     // --- Initialization and Frame ---
     // The meaning of `existingContext` depends on the backend:
-    //   - OpenGL: an existing SDL_GLContext to reuse (null = create our own).
+    //   - OpenGL: an existing GL context to reuse (null = create our own).
     //   - Vulkan: a VulkanSharedContext* describing the engine's device/render
     //             pass (null = standalone; creates its own device/swapchain).
     virtual bool Init(void* windowHandle, void* existingContext = nullptr) = 0;
@@ -70,6 +177,12 @@ public:
     virtual void BeginFrame(const Color& clearColor) = 0;
     virtual void EndFrame() = 0;
     virtual void SetViewport(int width, int height) = 0;
+
+    // Present this backend's window for the frame (brief 08/09: backend-agnostic
+    // multi-window present). OpenGL swaps the window's buffers; Vulkan already
+    // presented inside EndFrame (standalone / own-swapchain modes) and the
+    // engine-shared mode lets the engine present, so it is a no-op there.
+    virtual void Present() {}
 
     // --- External frame command buffer (Vulkan shared mode) ---
     // Supply the command buffer the engine is currently recording into. The
@@ -105,14 +218,45 @@ public:
     // vertices: pointer to array of RenderVertex
     // indices: pointer to array of unsigned int
     // textureHandle: pointer returned by CreateTexture (can be null for Basic shader)
-    virtual void DrawBatch(ShaderType type, const RenderVertex* vertices, size_t vertexCount, 
-                           const unsigned int* indices, size_t indexCount, 
+    // msdfPxRange (brief 29 Part B): the MSDF atlas' real distanceRange for text
+    // batches. 0 => not an MSDF text batch; the backend keeps its own default.
+    virtual void DrawBatch(ShaderType type, const RenderVertex* vertices, size_t vertexCount,
+                           const unsigned int* indices, size_t indexCount,
                            void* textureHandle, const float* projectionMatrix,
-                           const Color& textColor = {1,1,1,1}) = 0;
+                           const Color& textColor = {1,1,1,1}, float msdfPxRange = 0.0f) = 0;
     
+    // Brief 35-A/35-B: parameters for the NEXT text batches (state, not per-draw
+    // argument, so the DrawBatch signature — and every backend that overrides it —
+    // stays untouched). The Renderer calls this immediately before flushing an MSDF
+    // batch. Backends that don't implement it ignore the call and keep the plain
+    // grayscale coverage path.
+    virtual void SetTextRenderParams(const TextRenderParams& params) { (void)params; }
+
     // Special case for lines because of line width
     virtual void DrawLines(const RenderVertex* vertices, size_t vertexCount,
                            float width, const float* projectionMatrix) = 0;
+
+    // Draw N rounded-rect SDF instances in a single instanced draw call. The unit
+    // quad ([-1,-1]..[1,1], 6 indices) is provided internally by the backend; the
+    // caller only supplies the per-widget instances. projectionMatrix is the same
+    // ortho matrix used by DrawBatch.
+    //   revealCursor: optional pointer to vec3 {cursorX, cursorY, revealRadius} in
+    //   logical px (brief 04). Pass nullptr (or radius<=0) to disable the reveal.
+    virtual void DrawSDFInstances(const SDFInstance* instances, size_t count,
+                                  const float* projectionMatrix,
+                                  const float* revealCursor = nullptr) = 0;
+
+    // --- Acrylic / Mica backdrop (brief 06) ---
+    // True if the backend can capture+blur+composite real acrylic. When false the
+    // Renderer falls back to DrawRectAcrylicFallback (flat tinted fills).
+    // Deprecated alias kept for source compatibility — prefer Supports(RenderCap::Acrylic).
+    bool SupportsAcrylic() const { return Supports(RenderCap::Acrylic); }
+    // Composite one acrylic/mica panel. Called from Renderer::EndFrame at the panel's
+    // place in draw order (so everything behind it is already on the framebuffer in
+    // GL; in Vulkan the backdrop is captured at frame start — see VulkanBackend).
+    virtual void DrawAcrylicPanel(const AcrylicParams& params, const float* projectionMatrix) {
+        (void)params; (void)projectionMatrix;
+    }
 
     // --- Render Targets / FBO (Phase 5) ---
     // Returns an opaque handle to the render target

@@ -1,14 +1,93 @@
 #include "UI/WidgetHelpers.h"
 #include "core/Context.h"
 #include "core/Renderer.h"
+#include "Theme/Material.h"  // brief 35: FluentMaterial (AnimateStateColors)
+#include "UI/Icons.h"   // brief 18.5: directional-icon mirror pairs
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <cstdint>
 
 namespace FluentUI {
 
 // Static variable to store layout constraints for the next widget
 static std::optional<LayoutConstraints> nextConstraints;
+
+// Flag one-shot: el siguiente TextInput single-line centra su texto en X.
+static bool nextTextInputCenterX = false;
+
+// brief 35 Part F: flag one-shot "el siguiente contenedor anima su layout (FLIP)".
+// Consumido por BeginListView (y otros contenedores opt-in). Off por defecto.
+static bool nextAnimateLayout = false;
+
+// brief 35 Part B: color de estado animado compartido (ver doc en WidgetHelpers.h).
+// Slots springColor[0..2] == fill / foreground / border. Idéntico al patrón que el
+// piloto de Button usaba inline; reimplementar Button sobre esto es la prueba de que
+// el helper es correcto.
+AnimatedColors AnimateStateColors(UIContext *ctx, uint32_t id,
+                                  const FluentMaterial &target,
+                                  const Color &foregroundTarget,
+                                  float response) {
+  auto &ws = ctx->GetWidgetState(id);
+  auto &fillAnim = ws.springColor[0];
+  auto &fgAnim = ws.springColor[1];
+  auto &borderAnim = ws.springColor[2];
+
+  // Primera vez: configurar el spring y fijar el valor inicial sin animar.
+  if (!fillAnim.IsInitialized()) {
+    fillAnim.Configure(response, 1.0f);
+    fillAnim.SetImmediate(target.fill);
+  }
+  if (!fgAnim.IsInitialized()) {
+    fgAnim.Configure(response, 1.0f);
+    fgAnim.SetImmediate(foregroundTarget);
+  }
+  if (!borderAnim.IsInitialized()) {
+    borderAnim.Configure(response, 1.0f);
+    borderAnim.SetImmediate(target.border);
+  }
+
+  // Cada frame: apuntar al color del estado actual. SetTarget preserva la velocidad
+  // (reversión continua) y degrada a snap solo con reduceMotion (via MotionDuration).
+  fillAnim.SetTarget(target.fill);
+  fgAnim.SetTarget(foregroundTarget);
+  borderAnim.SetTarget(target.border);
+
+  // Mantener el id en la lista activa mientras algún slot siga asentándose.
+  // NotifySpringColorActive deduplica, así que las tres llamadas colapsan en una.
+  if (fillAnim.IsAnimating()) ctx->NotifySpringColorActive(id);
+  if (fgAnim.IsAnimating()) ctx->NotifySpringColorActive(id);
+  if (borderAnim.IsAnimating()) ctx->NotifySpringColorActive(id);
+
+  return { fillAnim.Get(), fgAnim.Get(), borderAnim.Get() };
+}
+
+// brief 35 Part B: transición suave de un color de fondo por spring (ver doc en el .h).
+Color AnimateFill(UIContext *ctx, uint32_t id, const Color &target, float response) {
+  auto &sp = ctx->GetWidgetState(id).springColor[0];
+  if (!sp.IsInitialized()) {
+    sp.Configure(response, 1.0f);
+    sp.SetImmediate(target);
+  }
+  sp.SetTarget(target);
+  if (sp.IsAnimating())
+    ctx->NotifySpringColorActive(id);
+  return sp.Get();
+}
+
+// brief 35 Wave 2: progreso de foco animado de un campo de entrada (ver doc en el .h).
+float AnimateInputFocus(UIContext *ctx, uint32_t id, bool hasFocus) {
+  auto &sp = ctx->GetWidgetState(id).springFloat[0];
+  float tgt = hasFocus ? 1.0f : 0.0f;
+  if (!sp.IsInitialized()) {
+    sp.Configure(MotionTokens::Interactive, 1.0f);
+    sp.SetImmediate(tgt);
+  }
+  sp.SetTarget(tgt);
+  if (sp.IsAnimating())
+    ctx->NotifySpringFloatActive(id);
+  return std::clamp(sp.Get(), 0.0f, 1.0f);
+}
 
 bool IsRectInViewport(UIContext *ctx, const Vec2 &pos, const Vec2 &size) {
   if (!ctx)
@@ -157,7 +236,12 @@ Vec2 ApplyConstraints(UIContext *ctx, const LayoutConstraints &constraints,
   case SizeConstraint::Auto:
     if (constraints.fixedHeight > 0.0f) {
       result.y = constraints.fixedHeight;
-    } else if (inHorizontal && available.y > 0.0f && result.y > available.y) {
+    } else if (inHorizontal && !ctx->layoutStack.back().isWrap &&
+               available.y > 0.0f && result.y > available.y) {
+      // El clamp de altura vale para horizontales de altura acotada (toolbar,
+      // statusbar). Un WrapPanel crece hacia abajo por diseño: su available.y
+      // hereda el restante (posiblemente agotado) del padre vertical y clampear
+      // con él aplasta a los hijos (chips a 9.6px al final de una página larga).
       // Auto en eje secundario de un horizontal layout (toolbar, statusbar):
       // la altura del padre acota al hijo para que no se desborde.
       result.y = available.y;
@@ -222,7 +306,34 @@ void AdvanceCursor(UIContext *ctx, const Vec2 &size) {
   }
 
   LayoutStack &stack = ctx->layoutStack.back();
-  if (stack.isVertical) {
+  if (stack.isWrap && !ctx->wrapStack.empty()) {
+    // brief 19 (WrapPanel): flow children left→right, wrapping to a new row when
+    // there is no usable room left on the current row. The current item has
+    // already been drawn at stack.cursor (== ctx->cursorPos), so it always lands
+    // at a real position (no stranding/gaps). After advancing past it, if the
+    // cursor has reached the right edge we wrap pre-emptively so the *next* item
+    // starts a fresh row. Immediate-mode caveat: because the next child's size
+    // isn't known until it is built, a row's trailing item may extend up to its
+    // own width past the right edge before the wrap fires — fine for the chip/
+    // toolbar use case and clipped by any enclosing clip rect. Children must be
+    // Auto-sized (a Fill child would otherwise eat the whole row).
+    WrapFrameContext &wf = ctx->wrapStack.back();
+    // Record the current item's extent into the open row.
+    wf.rowHeight = std::max(wf.rowHeight, size.y);
+    wf.maxWidth = std::max(wf.maxWidth, (stack.cursor.x + size.x) - wf.left);
+    wf.totalHeight =
+        std::max(wf.totalHeight, (stack.cursor.y + size.y) - wf.origin.y);
+    // Advance to the next slot on the same row.
+    stack.cursor.x += size.x + wf.hGap;
+    stack.itemCount++;
+    // If the row is full (no usable width remains), wrap for the next item.
+    if (stack.cursor.x >= wf.left + wf.availWidth) {
+      stack.cursor.x = wf.left;
+      stack.cursor.y += wf.rowHeight + wf.vGap;
+      wf.rowHeight = 0.0f;
+    }
+    ctx->cursorPos = stack.cursor;
+  } else if (stack.isVertical) {
     stack.contentSize.x = std::max(stack.contentSize.x, size.x);
     stack.contentSize.y += size.y;
     // Reset X to left edge after each item, applying any active CollapsingHeader indent.
@@ -237,6 +348,12 @@ void AdvanceCursor(UIContext *ctx, const Vec2 &size) {
     }
     ctx->cursorPos = Vec2(stack.cursor.x, stack.cursor.y);
   } else {
+    // brief 18.5 (RTL): when stack.rtl is set, children should pack right→left
+    // from the container's right edge. Correct geometric mirroring of auto-sized
+    // children needs a measure pass (the child draws at cursorPos before its
+    // width is known), so it is deferred; horizontal layout currently flows
+    // left→right regardless. Direction is still honoured for directional icons
+    // (MirrorDirectionalIcon) and explicit-width mirroring (MirrorXInContainer).
     stack.contentSize.x += size.x;
     stack.contentSize.y = std::max(stack.contentSize.y, size.y);
     stack.cursor.x += size.x;
@@ -249,6 +366,46 @@ void AdvanceCursor(UIContext *ctx, const Vec2 &size) {
     }
     ctx->cursorPos = Vec2(stack.cursor.x, stack.contentStart.y);
   }
+}
+
+uint32_t MirrorDirectionalIcon(UIContext *ctx, uint32_t codepoint) {
+  if (!ctx || !ctx->IsRTL())
+    return codepoint;
+  switch (codepoint) {
+    case Icons::ChevronLeft:        return Icons::ChevronRight;
+    case Icons::ChevronRight:       return Icons::ChevronLeft;
+    case Icons::ChevronsLeft:       return Icons::ChevronsRight;
+    case Icons::ChevronsRight:      return Icons::ChevronsLeft;
+    case Icons::ChevronLeftCircle:  return Icons::ChevronRightCircle;
+    case Icons::ChevronRightCircle: return Icons::ChevronLeftCircle;
+    case Icons::ChevronLeftSquare:  return Icons::ChevronRightSquare;
+    case Icons::ChevronRightSquare: return Icons::ChevronLeftSquare;
+    case Icons::ArrowLeft:          return Icons::ArrowRight;
+    case Icons::ArrowRight:         return Icons::ArrowLeft;
+    case Icons::ArrowLeftCircle:    return Icons::ArrowRightCircle;
+    case Icons::ArrowRightCircle:   return Icons::ArrowLeftCircle;
+    case Icons::ArrowLeftSquare:    return Icons::ArrowRightSquare;
+    case Icons::ArrowRightSquare:   return Icons::ArrowLeftSquare;
+    default:                        return codepoint;
+  }
+}
+
+float MirrorXInContainer(UIContext *ctx, float x, float width) {
+  if (!ctx || !ctx->IsRTL())
+    return x;
+  // Mirror within the current horizontal layout's content box if one is active,
+  // otherwise within the window viewport.
+  float left, span;
+  if (!ctx->layoutStack.empty() && !ctx->layoutStack.back().isVertical) {
+    const LayoutStack &s = ctx->layoutStack.back();
+    left = s.contentStart.x;
+    span = s.availableSpace.x > 1.0f ? s.availableSpace.x : s.contentSize.x;
+  } else {
+    left = 0.0f;
+    span = ctx->renderer.GetViewportSize().x;
+  }
+  // new_left = left + span - (x - left) - width
+  return left + span - (x - left) - width;
 }
 
 Vec2 MeasureTextCached(UIContext *ctx, const std::string &text,
@@ -352,69 +509,98 @@ uint32_t AnimSlot(uint32_t widgetId, uint32_t slot) {
   return widgetId + SLOT_OFFSET_BASE * (slot + 1);
 }
 
+// brief 21: djb2 mix of a NUL-terminated string into an existing hash seed.
+// Extracted from the GenerateId overloads so PushID and GenerateId share the
+// exact same mixing function. NOTE (compat): with seed == 5381 (the djb2 base,
+// which is also CurrentIdSeed() when the scope stack is empty) the output bytes
+// are IDENTICAL to the pre-brief-21 inline loop, so persisted per-frame widget
+// state keyed by these IDs is preserved.
+static inline uint32_t HashStr(uint32_t h, const char *s) {
+  int c;
+  while ((c = *s++)) {
+    h = ((h << 5) + h) + c;
+  }
+  return h;
+}
+
 // Helper to register hash with GC tracking
-// Perf 1.2: Only register base ID — animation slots registered lazily via RegisterAnimSlots
+// brief 22 (fase 9): ya no escribe lastSeenFrame (el GC rotatorio se retiró; el GC
+// del mapa unificado usa WidgetState.lastFrameSeen). Solo publica lastGeneratedId.
 static uint32_t RegisterHash(uint32_t hash) {
   UIContext *ctx = GetContext();
   if (ctx) {
-    ctx->lastSeenFrame[hash] = ctx->frame;
     ctx->lastGeneratedId = hash;
   }
   return hash;
 }
 
-// Perf 1.2: Lazy registration of animation slots — only called by widgets that use animations
-void RegisterAnimSlots(uint32_t widgetId) {
+// brief 21: current scope seed, null-safe (5381 == djb2 base when no context or
+// empty scope stack, which keeps the hash byte-identical to the old constant).
+static inline uint32_t CurrentSeed() {
   UIContext *ctx = GetContext();
-  if (ctx) {
-    uint32_t frame = ctx->frame;
-    ctx->lastSeenFrame[AnimSlot(widgetId, 0)] = frame;
-    ctx->lastSeenFrame[AnimSlot(widgetId, 1)] = frame;
-    ctx->lastSeenFrame[AnimSlot(widgetId, 2)] = frame;
-  }
+  return ctx ? ctx->CurrentIdSeed() : 5381u;
 }
 
+// brief 21: all overloads now start from the current scope seed (CurrentIdSeed())
+// instead of the bare 5381 constant, and chain HashStr. When the scope stack is
+// empty CurrentIdSeed() == 5381, so the mixing order is unchanged and the hash
+// bytes are identical to the previous implementation.
 uint32_t GenerateId(const char *str) {
-  uint32_t hash = 5381;
-  int c;
-  while ((c = *str++)) {
-    hash = ((hash << 5) + hash) + c;
-  }
+  uint32_t hash = CurrentSeed();
+  hash = HashStr(hash, str);
   return RegisterHash(hash);
 }
 
 // Issue 14: Two-part GenerateId without string concatenation
 uint32_t GenerateId(const char *prefix, const char *str) {
-  uint32_t hash = 5381;
-  int c;
-  const char* p = prefix;
-  while ((c = *p++)) {
-    hash = ((hash << 5) + hash) + c;
-  }
-  p = str;
-  while ((c = *p++)) {
-    hash = ((hash << 5) + hash) + c;
-  }
+  uint32_t hash = CurrentSeed();
+  hash = HashStr(hash, prefix);
+  hash = HashStr(hash, str);
   return RegisterHash(hash);
 }
 
 // Issue 14: Three-part GenerateId without string concatenation
 uint32_t GenerateId(const char *a, const char *b, const char *c_str) {
-  uint32_t hash = 5381;
-  int c;
-  const char* p = a;
-  while ((c = *p++)) {
-    hash = ((hash << 5) + hash) + c;
-  }
-  p = b;
-  while ((c = *p++)) {
-    hash = ((hash << 5) + hash) + c;
-  }
-  p = c_str;
-  while ((c = *p++)) {
-    hash = ((hash << 5) + hash) + c;
-  }
+  uint32_t hash = CurrentSeed();
+  hash = HashStr(hash, a);
+  hash = HashStr(hash, b);
+  hash = HashStr(hash, c_str);
   return RegisterHash(hash);
+}
+
+// brief 21: ID scope stack push/pop. Each push derives a new seed from the
+// current top (CurrentIdSeed()) mixed with the discriminant, so scopes nest.
+void PushID(const char *str) {
+  UIContext *ctx = GetContext();
+  if (ctx) ctx->idStack.push_back(HashStr(ctx->CurrentIdSeed(), str));
+}
+
+void PushID(int i) {
+  UIContext *ctx = GetContext();
+  if (ctx) {
+    uint32_t h = ctx->CurrentIdSeed();
+    h = ((h << 5) + h) + static_cast<uint32_t>(i);
+    ctx->idStack.push_back(h);
+  }
+}
+
+void PushID(const void *ptr) {
+  UIContext *ctx = GetContext();
+  if (ctx) {
+    uint32_t h = ctx->CurrentIdSeed();
+    // Mix the pointer bits in 32-bit chunks via the same djb2 step.
+    uintptr_t v = reinterpret_cast<uintptr_t>(ptr);
+    while (v) {
+      h = ((h << 5) + h) + static_cast<uint32_t>(v & 0xFFu);
+      v >>= 8;
+    }
+    ctx->idStack.push_back(h);
+  }
+}
+
+void PopID() {
+  UIContext *ctx = GetContext();
+  if (ctx && !ctx->idStack.empty()) ctx->idStack.pop_back();
 }
 
 void DrawScrollbar(UIContext *ctx, const Vec2 &barPos, const Vec2 &barSize,
@@ -475,19 +661,23 @@ void DrawScrollbar(UIContext *ctx, const Vec2 &barPos, const Vec2 &barSize,
 }
 
 Color AdjustContainerBackground(const Color &bg, bool isDarkTheme) {
+  // El alpha del color de entrada se PRESERVA: forzarlo a 1 hacía que cualquier contenedor
+  // (TabView, ScrollView, TreeView) tapase por completo una superficie translúcida, y el
+  // host que hubiera bajado el alpha de su panel no veía ningún efecto. Con los temas
+  // opacos (alpha 1) el resultado es idéntico al de antes.
   if (isDarkTheme) {
-    return Color(bg.r * 1.15f, bg.g * 1.15f, bg.b * 1.15f, 1.0f);
+    return Color(bg.r * 1.15f, bg.g * 1.15f, bg.b * 1.15f, bg.a);
   }
-  return Color(bg.r * 0.92f, bg.g * 0.92f, bg.b * 0.92f, 1.0f);
+  return Color(bg.r * 0.92f, bg.g * 0.92f, bg.b * 0.92f, bg.a);
 }
 
 Color AdjustListSurfaceBackground(const Color &bg, bool isDarkTheme) {
   // Stronger contrast than AdjustContainerBackground so list/tree surfaces are
   // visible even when nested inside an already-adjusted panel.
   if (isDarkTheme) {
-    return Color(bg.r * 1.35f, bg.g * 1.35f, bg.b * 1.35f, 1.0f);
+    return Color(bg.r * 1.35f, bg.g * 1.35f, bg.b * 1.35f, bg.a);   // alpha preservado
   }
-  return Color(bg.r * 0.85f, bg.g * 0.85f, bg.b * 0.85f, 1.0f);
+  return Color(bg.r * 0.85f, bg.g * 0.85f, bg.b * 0.85f, bg.a);
 }
 
 bool PointInRect(const Vec2 &p, const Vec2 &pos, const Vec2 &size) {
@@ -512,20 +702,40 @@ Color InputFieldBackground(UIContext *ctx, bool hover) {
 }
 
 Color InputFieldBorder(UIContext *ctx, bool hover) {
+  // El parámetro `hover` se IGNORA a propósito (se conserva por compatibilidad de
+  // API): el contorno de un campo no debe cambiar de color al pasar el ratón. El
+  // feedback de puntero lo da el FONDO (InputFieldBackground(ctx, hover)) y el de
+  // foco, el borde de acento que interpola el propio widget. Un borde que se aclara
+  // en hover se lee como un parpadeo y no es el comportamiento de Fluent.
+  (void)hover;
   Color bg = ctx->GetEffectivePanelStyle().background;
   if (ctx->style.isDarkTheme) {
     // Brighter than the surface so the field edge reads as a crisp 1px line.
-    float f = hover ? 1.95f : 1.55f;
-    return Color(std::min(bg.r * f, 1.0f), std::min(bg.g * f, 1.0f),
-                 std::min(bg.b * f, 1.0f), 1.0f);
+    return Color(std::min(bg.r * 1.55f, 1.0f), std::min(bg.g * 1.55f, 1.0f),
+                 std::min(bg.b * 1.55f, 1.0f), 1.0f);
   }
   // Light: a touch darker than the surface for a subtle gray outline.
-  float f = hover ? 0.55f : 0.72f;
-  return Color(bg.r * f, bg.g * f, bg.b * f, 1.0f);
+  return Color(bg.r * 0.72f, bg.g * 0.72f, bg.b * 0.72f, 1.0f);
 }
 
 void SetNextConstraints(const LayoutConstraints &constraints) {
   nextConstraints = constraints;
+}
+
+void SetNextTextInputCenterX() { nextTextInputCenterX = true; }
+
+bool ConsumeNextTextInputCenterX() {
+  bool v = nextTextInputCenterX;
+  nextTextInputCenterX = false;
+  return v;
+}
+
+void SetNextAnimateLayout() { nextAnimateLayout = true; }
+
+bool ConsumeNextAnimateLayout() {
+  bool v = nextAnimateLayout;
+  nextAnimateLayout = false;
+  return v;
 }
 
 // DPI helpers (Phase 4)
@@ -607,10 +817,73 @@ float DrawWidgetIcon(UIContext *ctx, const Vec2 &rectPos, const Vec2 &rectSize,
     if (codepoint == 0u) return 0.0f;
     if (!ctx) return iconSize + gap;
 
-    Vec2 iconPos(rectPos.x + leftPadding,
-                 rectPos.y + (rectSize.y - iconSize) * 0.5f);
-    ctx->renderer.DrawIconGlyph(iconPos, codepoint, color, iconSize);
+    // Center the icon's actual visual bounding box on the rect's vertical center
+    // so it lines up optically with text centered on the same rect. Anchoring by
+    // the icon font's ascent (as plain DrawIconGlyph does) makes icons sit higher
+    // than adjacent text because the two fonts have different vertical metrics.
+    float centerY = rectPos.y + rectSize.y * 0.5f;
+    ctx->renderer.DrawIconGlyphVCentered(rectPos.x + leftPadding, centerY, codepoint, color, iconSize);
     return iconSize + gap;
+}
+
+// ─── brief 32: captura genérica de interactivos (Card, etc.) ─────────────────
+
+std::vector<Rect> CollectInteractiveRects(
+    UIContext *ctx, size_t focusStart,
+    const std::vector<std::pair<uint32_t, Rect>> &items) {
+    std::vector<Rect> out;
+    if (!ctx) return out;
+    for (const auto &item : items) {
+        // interactivo == su id quedó registrado en focusableWidgets desde focusStart.
+        for (size_t k = focusStart; k < ctx->focusableWidgets.size(); ++k) {
+            if (ctx->focusableWidgets[k] == item.first) {
+                out.push_back(item.second);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+ScopedInteractiveCapture::ScopedInteractiveCapture(UIContext *ctx) : ctx_(ctx) {
+    // Guardar estado previo (permite anidar scopes de captura).
+    prevActive_ = ctx_ ? ctx_->interactiveCapture.active : false;
+    prevFocusStart_ = ctx_ ? ctx_->interactiveCapture.focusStart : 0;
+    if (ctx_) prevItems_ = std::move(ctx_->interactiveCapture.items);
+    if (ctx_) {
+        ctx_->interactiveCapture.active = true;
+        ctx_->interactiveCapture.focusStart = ctx_->focusableWidgets.size();
+        ctx_->interactiveCapture.items.clear();
+    }
+}
+
+ScopedInteractiveCapture::~ScopedInteractiveCapture() {
+    if (!ctx_) return;
+    // Restaurar el scope exterior (o desarmar si no había).
+    ctx_->interactiveCapture.active = prevActive_;
+    ctx_->interactiveCapture.focusStart = prevFocusStart_;
+    ctx_->interactiveCapture.items = std::move(prevItems_);
+}
+
+std::vector<Rect> ScopedInteractiveCapture::ExcludedRects() const {
+    if (!ctx_) return {};
+    return CollectInteractiveRects(ctx_, ctx_->interactiveCapture.focusStart,
+                                   ctx_->interactiveCapture.items);
+}
+
+bool ScopedInteractiveCapture::HitsInteractive(const Vec2 &p) const {
+    if (!ctx_) return false;
+    for (const auto &item : ctx_->interactiveCapture.items) {
+        // solo interactivos (focusables)
+        bool interactive = false;
+        for (size_t k = ctx_->interactiveCapture.focusStart;
+             k < ctx_->focusableWidgets.size(); ++k) {
+            if (ctx_->focusableWidgets[k] == item.first) { interactive = true; break; }
+        }
+        if (!interactive) continue;
+        if (item.second.Contains(p)) return true;
+    }
+    return false;
 }
 
 } // namespace FluentUI

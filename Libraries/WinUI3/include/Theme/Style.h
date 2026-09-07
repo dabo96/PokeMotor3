@@ -1,6 +1,7 @@
 #pragma once
 #include "Math/Color.h"
 #include "Math/Vec2.h"
+#include <optional>
 #include <string>
 
 namespace FluentUI {
@@ -127,10 +128,16 @@ namespace FluentUI {
         float spacing = 8.0f;
         float padding = 12.0f;
         bool isDarkTheme = true; // Cached theme mode flag
+        bool isHighContrast = false; // brief 34 Parte F: HC del SO (sin translúcidos/acrylic/reveal/bisel)
 
         // Accent colors used by widgets (sliders, checkboxes, tabs, etc.)
         Color accentColor = Color(0.0f, 0.47f, 0.84f, 1.0f);       // Primary accent (default: Fluent Blue)
-        Color sliderFillColor = Color(0.0f, 0.0f, 0.0f, 0.0f);     // Slider fill override; if alpha=0, falls back to accentColor
+        // Brief 34 Parte C: antes era un Color con alpha=0 como sentinela de "no
+        // definido → usa accentColor", que chocaba con tokens legítimamente
+        // transparentes. Ahora es explícito: nullopt = usa accentColor; un valor
+        // (incluido uno translúcido) = override real del relleno del slider.
+        std::optional<Color> sliderFillColor;                      // Slider fill override (nullopt = accentColor)
+        Color shadowColor = Color(0.0f, 0.0f, 0.0f, 1.0f);         // Brief 11: themed drop-shadow tint (alpha scales per-layer opacity)
 
         Typography typography;
         ButtonStyle button;

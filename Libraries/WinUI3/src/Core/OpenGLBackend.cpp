@@ -1,3 +1,4 @@
+#include <SDL3/SDL.h>
 #include "core/OpenGLBackend.h"
 #include "core/EmbeddedShaders.h"
 #include "core/Context.h"
@@ -16,6 +17,12 @@ void OpenGLBackend::QueryUniforms(GLuint program, ShaderUniforms& uniforms) {
     uniforms.textColor = glGetUniformLocation(program, "uTextColor");
     uniforms.pxRange = glGetUniformLocation(program, "pxRange");
     uniforms.texture = glGetUniformLocation(program, "uTexture");
+    uniforms.reveal = glGetUniformLocation(program, "uReveal");
+    // Brief 35-A/35-B: only the MSDF programs declare these; -1 elsewhere.
+    uniforms.textGamma = glGetUniformLocation(program, "uTextGamma");
+    uniforms.textContrast = glGetUniformLocation(program, "uTextContrast");
+    uniforms.subpixel = glGetUniformLocation(program, "uSubpixel");
+    uniforms.fringe = glGetUniformLocation(program, "uFringe");
 }
 
 bool OpenGLBackend::Init(void* windowHandle, void* existingGLContext) {
@@ -25,20 +32,20 @@ bool OpenGLBackend::Init(void* windowHandle, void* existingGLContext) {
         // Reuse the caller's GL context — do not create a new one
         glContext = static_cast<SDL_GLContext>(existingGLContext);
         ownsGLContext = false;
-        SDL_GL_MakeCurrent(window, glContext);
+        SDL_GL_MakeCurrent(static_cast<SDL_Window*>(window), static_cast<SDL_GLContext>(glContext));
     } else {
         // Create our own GL context
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
-        glContext = SDL_GL_CreateContext(window);
+        glContext = SDL_GL_CreateContext(static_cast<SDL_Window*>(window));
         if (!glContext) {
             Log(LogLevel::Error, "OpenGL Error: Failed to create GL context: %s", SDL_GetError());
             return false;
         }
         ownsGLContext = true;
-        SDL_GL_MakeCurrent(window, glContext);
+        SDL_GL_MakeCurrent(static_cast<SDL_Window*>(window), static_cast<SDL_GLContext>(glContext));
     }
 
     if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
@@ -56,12 +63,34 @@ bool OpenGLBackend::Init(void* windowHandle, void* existingGLContext) {
     textShaderProgram = CreateShaderProgram(Shaders::TextVertexShader, Shaders::TextFragmentShader);
     msdfShaderProgram = CreateShaderProgram(Shaders::MSDFVertexShader, Shaders::MSDFFragmentShader);
     imageShaderProgram = CreateShaderProgram(Shaders::ImageVertexShader, Shaders::ImageFragmentShader);
+    sdfRectProgram = CreateShaderProgram(Shaders::SDFRectVertexShader, Shaders::SDFRectFragmentShader);
+
+    // Brief 35-B: subpixel text needs dual-source blending (GL_ARB_blend_func_extended,
+    // core since 3.3). Query it honestly instead of assuming — the capability is what
+    // gates the whole feature, and without it we never even build the program.
+    dualSourceBlendSupported = GLAD_GL_VERSION_3_3 != 0;
+    if (dualSourceBlendSupported) {
+        msdfSubpixelProgram = CreateShaderProgram(Shaders::MSDFVertexShader,
+                                                  Shaders::MSDFSubpixelFragmentShader);
+        // CreateShaderProgram returns a handle even when linking failed, so ask GL
+        // directly — a half-enabled path would render invisible text.
+        GLint linked = GL_FALSE;
+        if (msdfSubpixelProgram) glGetProgramiv(msdfSubpixelProgram, GL_LINK_STATUS, &linked);
+        if (linked) {
+            QueryUniforms(msdfSubpixelProgram, msdfSubpixelUniforms);
+        } else {
+            if (msdfSubpixelProgram) { glDeleteProgram(msdfSubpixelProgram); msdfSubpixelProgram = 0; }
+            dualSourceBlendSupported = false;
+            Log(LogLevel::Warning, "OpenGL: subpixel text program failed to build — using grayscale text");
+        }
+    }
 
     // Issue 3: Cache uniform locations once after shader creation
     QueryUniforms(shaderProgram, basicUniforms);
     QueryUniforms(textShaderProgram, textUniforms);
     QueryUniforms(msdfShaderProgram, msdfUniforms);
     QueryUniforms(imageShaderProgram, imageUniforms);
+    QueryUniforms(sdfRectProgram, sdfRectUniforms);
 
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);
@@ -90,8 +119,63 @@ bool OpenGLBackend::Init(void* windowHandle, void* existingGLContext) {
     glBindVertexArray(0);
     vaoIsBound = false;
 
+    // --- SDF instanced pipeline (brief 01) ---
+    // Dedicated VAO: attribute 0 is the static unit quad (divisor 0); attributes
+    // 1..6 are per-instance SDFInstance fields (divisor 1).
+    {
+        static const float quadVerts[8] = {
+            -1.0f, -1.0f,   1.0f, -1.0f,   1.0f, 1.0f,   -1.0f, 1.0f
+        };
+        static const unsigned int quadIdx[6] = { 0, 1, 2, 0, 2, 3 };
+
+        glGenVertexArrays(1, &sdfVao);
+        glGenBuffers(1, &sdfQuadVBO);
+        glGenBuffers(1, &sdfQuadEBO);
+        glGenBuffers(1, &sdfInstanceVBO);
+
+        glBindVertexArray(sdfVao);
+
+        glBindBuffer(GL_ARRAY_BUFFER, sdfQuadVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quadVerts), quadVerts, GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glVertexAttribDivisor(0, 0);
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sdfQuadEBO);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(quadIdx), quadIdx, GL_STATIC_DRAW);
+
+        glBindBuffer(GL_ARRAY_BUFFER, sdfInstanceVBO);
+        sdfInstanceCapacity = 256 * sizeof(SDFInstance);
+        glBufferData(GL_ARRAY_BUFFER, sdfInstanceCapacity, nullptr, GL_DYNAMIC_DRAW);
+        const GLsizei stride = sizeof(SDFInstance);
+        // loc 1: iCenter (cx,cy)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SDFInstance, cx));
+        glEnableVertexAttribArray(1); glVertexAttribDivisor(1, 1);
+        // loc 2: iHalf (hx,hy)
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SDFInstance, hx));
+        glEnableVertexAttribArray(2); glVertexAttribDivisor(2, 1);
+        // loc 3: iParams (radius,borderWidth,softness,mode)
+        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SDFInstance, radius));
+        glEnableVertexAttribArray(3); glVertexAttribDivisor(3, 1);
+        // loc 4: iFill (rgba)
+        glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SDFInstance, fillR));
+        glEnableVertexAttribArray(4); glVertexAttribDivisor(4, 1);
+        // loc 5: iBorder (rgba)
+        glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SDFInstance, borderR));
+        glEnableVertexAttribArray(5); glVertexAttribDivisor(5, 1);
+        // loc 6: iReveal (revealIntensity) — brief 04
+        glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SDFInstance, revealIntensity));
+        glEnableVertexAttribArray(6); glVertexAttribDivisor(6, 1);
+        // loc 7: iBorder2 (borderR2,G2,B2) — brief 34 Parte E (color inferior del bisel)
+        glVertexAttribPointer(7, 3, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(SDFInstance, borderR2));
+        glEnableVertexAttribArray(7); glVertexAttribDivisor(7, 1);
+
+        glBindVertexArray(0);
+    }
+
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    subpixelBlendActive = false; // brief 35-B: blend state reset out from under the cache
 
     // Perf R2: Persistent mapped buffers — disabled pending investigation of text artifacts
     // InitPersistentBuffers();
@@ -182,21 +266,50 @@ void OpenGLBackend::Shutdown() {
     if (shaderProgram) { glDeleteProgram(shaderProgram); shaderProgram = 0; }
     if (textShaderProgram) { glDeleteProgram(textShaderProgram); textShaderProgram = 0; }
     if (msdfShaderProgram) { glDeleteProgram(msdfShaderProgram); msdfShaderProgram = 0; }
+    if (msdfSubpixelProgram) { glDeleteProgram(msdfSubpixelProgram); msdfSubpixelProgram = 0; }
     if (imageShaderProgram) { glDeleteProgram(imageShaderProgram); imageShaderProgram = 0; }
+    if (sdfRectProgram) { glDeleteProgram(sdfRectProgram); sdfRectProgram = 0; }
     if (vao) { glDeleteVertexArrays(1, &vao); vao = 0; }
     if (vbo) { glDeleteBuffers(1, &vbo); vbo = 0; }
     if (ebo) { glDeleteBuffers(1, &ebo); ebo = 0; }
+    if (sdfVao) { glDeleteVertexArrays(1, &sdfVao); sdfVao = 0; }
+    if (sdfQuadVBO) { glDeleteBuffers(1, &sdfQuadVBO); sdfQuadVBO = 0; }
+    if (sdfQuadEBO) { glDeleteBuffers(1, &sdfQuadEBO); sdfQuadEBO = 0; }
+    if (sdfInstanceVBO) { glDeleteBuffers(1, &sdfInstanceVBO); sdfInstanceVBO = 0; }
+
+    // Acrylic / Mica resources (brief 06)
+    DestroyBlurChain();
+    if (kawaseDownProgram) { glDeleteProgram(kawaseDownProgram); kawaseDownProgram = 0; }
+    if (kawaseUpProgram) { glDeleteProgram(kawaseUpProgram); kawaseUpProgram = 0; }
+    if (acrylicCompositeProgram) { glDeleteProgram(acrylicCompositeProgram); acrylicCompositeProgram = 0; }
+    if (blurVao) { glDeleteVertexArrays(1, &blurVao); blurVao = 0; }
+    if (blurVbo) { glDeleteBuffers(1, &blurVbo); blurVbo = 0; }
+    acrylicResourcesReady = false;
 
     if (glContext && ownsGLContext) {
-        SDL_GL_DestroyContext(glContext);
+        SDL_GL_DestroyContext(static_cast<SDL_GLContext>(glContext));
     }
     glContext = nullptr;
     textureIsAlphaOnly.clear();
 }
 
 void OpenGLBackend::BeginFrame(const Color& clearColor) {
-    // When using an external GL context, save the engine's state so we can restore it after UI rendering
-    if (!ownsGLContext) {
+    // brief 08 Part A: a secondary window shares the main GL context but is a real
+    // OS-window we drive. Route GL to it before recording this frame. (Single
+    // window / engine-embedded cases keep the context the caller already made
+    // current.)
+    if (secondaryWindow && window && glContext) {
+        SDL_GL_MakeCurrent(static_cast<SDL_Window*>(window), static_cast<SDL_GLContext>(glContext));
+    }
+
+    // "present" = we own this window's default framebuffer (own context, or our
+    // own secondary window on a shared context). Only the engine-embedded case
+    // (external context, NOT a secondary window) must preserve engine GL state.
+    const bool present = ownsGLContext || secondaryWindow;
+
+    // When embedded in an external engine context, save its state so we can
+    // restore it after UI rendering.
+    if (!present) {
         SaveState();
     }
 
@@ -206,10 +319,11 @@ void OpenGLBackend::BeginFrame(const Color& clearColor) {
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    subpixelBlendActive = false; // brief 35-B: blend state reset out from under the cache
 
-    // Only clear the framebuffer when we own the context;
-    // with an external context the engine already rendered its scene
-    if (ownsGLContext) {
+    // Clear when we drive the framebuffer; with an external engine context the
+    // engine already rendered its scene and we only overlay the UI.
+    if (present) {
         glClearColor(clearColor.r, clearColor.g, clearColor.b, clearColor.a);
         glClear(GL_COLOR_BUFFER_BIT);
     }
@@ -243,10 +357,17 @@ void OpenGLBackend::EndFrame() {
         bufferFences[currentBufferRegion] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     }
 
-    // When using an external GL context, restore the engine's GL state
-    if (!ownsGLContext) {
+    // When embedded in an external engine context (not our own secondary window),
+    // restore the engine's GL state.
+    if (!ownsGLContext && !secondaryWindow) {
         RestoreState();
     }
+}
+
+void OpenGLBackend::Present() {
+    // Swap this window's buffers. Used by the backend-agnostic multi-window path
+    // (brief 09 AppWindow). The main FluentApp loop still swaps directly.
+    if (window) SDL_GL_SwapWindow(static_cast<SDL_Window*>(window));
 }
 
 void OpenGLBackend::SetViewport(int width, int height) {
@@ -376,16 +497,38 @@ void OpenGLBackend::DeleteTexture(void* textureHandle) {
 void OpenGLBackend::DrawBatch(ShaderType type, const RenderVertex* vertices, size_t vertexCount,
                              const unsigned int* indices, size_t indexCount,
                              void* textureHandle, const float* projectionMatrix,
-                             const Color& textColor) {
+                             const Color& textColor, float msdfPxRange) {
     if (vertexCount == 0) return;
 
     GLuint program = 0;
     ShaderUniforms* uniforms = nullptr;
+    // Brief 35-B: an MSDF batch goes to the subpixel program only when the caller
+    // asked for it AND the driver supports dual-source blending. Everything else
+    // (including every non-text batch) stays on the classic alpha-blend path.
+    const bool subpixelBatch = (type == ShaderType::MSDF) &&
+                               textParams.subpixel != 0 && dualSourceBlendSupported &&
+                               msdfSubpixelProgram != 0;
     switch (type) {
         case ShaderType::Basic: program = shaderProgram; uniforms = &basicUniforms; break;
         case ShaderType::Text:  program = textShaderProgram; uniforms = &textUniforms; break;
-        case ShaderType::MSDF:  program = msdfShaderProgram; uniforms = &msdfUniforms; break;
+        case ShaderType::MSDF:
+            program  = subpixelBatch ? msdfSubpixelProgram : msdfShaderProgram;
+            uniforms = subpixelBatch ? &msdfSubpixelUniforms : &msdfUniforms;
+            break;
         case ShaderType::Image: program = imageShaderProgram; uniforms = &imageUniforms; break;
+    }
+
+    // Blend state follows the program, not the batch order: the subpixel program
+    // outputs coverage on src1, so the blend factors must read SRC1. Restored to
+    // the standard alpha blend as soon as a non-subpixel batch is drawn.
+    if (subpixelBatch != subpixelBlendActive) {
+        if (subpixelBatch) {
+            glBlendFuncSeparate(GL_SRC1_COLOR, GL_ONE_MINUS_SRC1_COLOR,
+                                GL_SRC1_ALPHA, GL_ONE_MINUS_SRC1_ALPHA);
+        } else {
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
+        subpixelBlendActive = subpixelBatch;
     }
 
     // Issue 4: Only bind program if changed
@@ -397,6 +540,12 @@ void OpenGLBackend::DrawBatch(ShaderType type, const RenderVertex* vertices, siz
         projectionDirty = true;
         lastTextColor = {-1,-1,-1,-1};
         lastPxRange = -1.0f;
+        // Brief 35-A/35-B: uniforms live per-program, so a program switch
+        // invalidates these caches too.
+        lastTextGamma = -1.0f;
+        lastTextContrast = -1.0f;
+        lastSubpixel = 0.0f;
+        lastFringe = -1.0f;
     }
 
     // Perf 3.5: Only upload uniforms when values change
@@ -414,9 +563,46 @@ void OpenGLBackend::DrawBatch(ShaderType type, const RenderVertex* vertices, siz
             lastTextColor = textColor;
         }
     }
-    if (uniforms->pxRange != -1 && lastPxRange != 4.0f) {
-        glUniform1f(uniforms->pxRange, 4.0f);
-        lastPxRange = 4.0f;
+    // Brief 29 Part C: the MSDF shader now uses the canonical msdfgen formula
+    // (0.5 * dot(unitRange, screenTexSize), floored at 1.0), so it wants the atlas'
+    // REAL distanceRange — plumbed per-batch via msdfPxRange (brief 29 Part B). The
+    // 12.0f fallback (the static atlas' range) only applies if no batch range
+    // arrived; SDF/icons stay at 4.
+    float wantPxRange = (type == ShaderType::MSDF)
+                            ? (msdfPxRange > 0.0f ? msdfPxRange : 12.0f) // 12 = static atlas distanceRange
+                            : 4.0f;
+    if (uniforms->pxRange != -1 && lastPxRange != wantPxRange) {
+        glUniform1f(uniforms->pxRange, wantPxRange);
+        lastPxRange = wantPxRange;
+    }
+
+    // Brief 35-A/35-B: text transfer curve + subpixel controls. Only the MSDF
+    // programs declare them (locations are -1 elsewhere, so this is free for the
+    // other shaders). Uploaded whenever the value or the program changed.
+    if (uniforms->textGamma != -1 || uniforms->textContrast != -1) {
+        // Non-text batches must not inherit the curve; they don't sample it, but
+        // keeping the uniforms at identity avoids surprises if a shader later does.
+        const float wantGamma = (type == ShaderType::MSDF) ? textParams.gamma : 1.0f;
+        const float wantContrast = (type == ShaderType::MSDF) ? textParams.contrast : 0.0f;
+        if (uniforms->textGamma != -1 && lastTextGamma != wantGamma) {
+            glUniform1f(uniforms->textGamma, wantGamma);
+            lastTextGamma = wantGamma;
+        }
+        if (uniforms->textContrast != -1 && lastTextContrast != wantContrast) {
+            glUniform1f(uniforms->textContrast, wantContrast);
+            lastTextContrast = wantContrast;
+        }
+    }
+    if (subpixelBatch) {
+        const float wantSub = (textParams.subpixel < 0) ? -1.0f : 1.0f;
+        if (uniforms->subpixel != -1 && lastSubpixel != wantSub) {
+            glUniform1f(uniforms->subpixel, wantSub);
+            lastSubpixel = wantSub;
+        }
+        if (uniforms->fringe != -1 && lastFringe != textParams.fringe) {
+            glUniform1f(uniforms->fringe, textParams.fringe);
+            lastFringe = textParams.fringe;
+        }
     }
 
     if (textureHandle) {
@@ -558,6 +744,56 @@ void OpenGLBackend::DrawLines(const RenderVertex* vertices, size_t vertexCount,
 
     glLineWidth(1.0f);
     // Issue 4: Don't unbind VAO/program
+}
+
+void OpenGLBackend::DrawSDFInstances(const SDFInstance* instances, size_t count,
+                                     const float* projectionMatrix,
+                                     const float* revealCursor) {
+    if (count == 0 || !instances) return;
+
+    // Bind the SDF program (respect the program cache).
+    if (lastBoundProgram != sdfRectProgram) {
+        glUseProgram(sdfRectProgram);
+        lastBoundProgram = sdfRectProgram;
+        projectionDirty = true; // force projection re-upload after a program switch
+    }
+
+    // Upload projection (reuse the projectionDirty cache pattern).
+    if (sdfRectUniforms.projection != -1) {
+        if (projectionDirty || std::memcmp(lastProjection, projectionMatrix, 16 * sizeof(float)) != 0) {
+            glUniformMatrix4fv(sdfRectUniforms.projection, 1, GL_FALSE, projectionMatrix);
+            std::memcpy(lastProjection, projectionMatrix, 16 * sizeof(float));
+            projectionDirty = false;
+        }
+    }
+
+    // Reveal cursor (brief 04). Uploaded per draw; cheap and the value can change
+    // each frame. {0,0,0} (radius 0) disables the effect in the shader.
+    if (sdfRectUniforms.reveal != -1) {
+        if (revealCursor) glUniform3f(sdfRectUniforms.reveal, revealCursor[0], revealCursor[1], revealCursor[2]);
+        else              glUniform3f(sdfRectUniforms.reveal, 0.0f, 0.0f, 0.0f);
+    }
+
+    // The SDF VAO carries its own quad/instance buffer bindings; binding it sets the
+    // current ARRAY_BUFFER/ELEMENT_ARRAY_BUFFER, so invalidate the quad-path caches.
+    glBindVertexArray(sdfVao);
+    vaoIsBound = false;       // quad path must rebind its own VAO afterwards
+    lastBoundVBO = 0;
+    lastBoundEBO = 0;
+
+    // Stream the instances into the dynamic instance buffer.
+    size_t needed = count * sizeof(SDFInstance);
+    glBindBuffer(GL_ARRAY_BUFFER, sdfInstanceVBO);
+    if (needed > sdfInstanceCapacity) {
+        sdfInstanceCapacity = needed * 2;
+        glBufferData(GL_ARRAY_BUFFER, sdfInstanceCapacity, nullptr, GL_DYNAMIC_DRAW);
+    }
+    glBufferSubData(GL_ARRAY_BUFFER, 0, needed, instances);
+
+    glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0, static_cast<GLsizei>(count));
+
+    // Leave the default quad VAO unbound; the next DrawBatch rebinds `vao`.
+    glBindVertexArray(0);
 }
 
 GLuint OpenGLBackend::CompileShader(GLenum type, const char* source) {
@@ -707,6 +943,7 @@ void OpenGLBackend::RestoreState() {
 
     glBlendFuncSeparate(savedState.blendSrcRGB, savedState.blendDstRGB,
                         savedState.blendSrcAlpha, savedState.blendDstAlpha);
+    subpixelBlendActive = false; // brief 35-B: blend state reset out from under the cache
 
     glUseProgram(savedState.currentProgram);
     glBindTexture(GL_TEXTURE_2D, savedState.boundTexture);
@@ -719,6 +956,241 @@ void OpenGLBackend::RestoreState() {
     vaoIsBound = (savedState.boundVAO != 0);
 
     savedState.saved = false;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Acrylic / Mica backdrop (brief 06)
+// ───────────────────────────────────────────────────────────────────────────
+
+void OpenGLBackend::EnsureAcrylicResources() {
+    if (acrylicResourcesReady) return;
+    kawaseDownProgram = CreateShaderProgram(Shaders::BlurVertexShader, Shaders::KawaseDownFragment);
+    kawaseUpProgram   = CreateShaderProgram(Shaders::BlurVertexShader, Shaders::KawaseUpFragment);
+    acrylicCompositeProgram = CreateShaderProgram(Shaders::AcrylicCompositeVertexShader,
+                                                  Shaders::AcrylicCompositeFragmentShader);
+
+    uKawaseDownTex       = glGetUniformLocation(kawaseDownProgram, "uTex");
+    uKawaseDownHalfpixel = glGetUniformLocation(kawaseDownProgram, "uHalfpixel");
+    uKawaseUpTex         = glGetUniformLocation(kawaseUpProgram, "uTex");
+    uKawaseUpHalfpixel   = glGetUniformLocation(kawaseUpProgram, "uHalfpixel");
+
+    uCmpProjection   = glGetUniformLocation(acrylicCompositeProgram, "uProjection");
+    uCmpCenter       = glGetUniformLocation(acrylicCompositeProgram, "uCenter");
+    uCmpHalf         = glGetUniformLocation(acrylicCompositeProgram, "uHalf");
+    uCmpSoft         = glGetUniformLocation(acrylicCompositeProgram, "uSoft");
+    uCmpBlur         = glGetUniformLocation(acrylicCompositeProgram, "uBlur");
+    uCmpNoise        = glGetUniformLocation(acrylicCompositeProgram, "uNoiseTex");
+    uCmpScreenSize   = glGetUniformLocation(acrylicCompositeProgram, "uScreenSize");
+    uCmpRadius       = glGetUniformLocation(acrylicCompositeProgram, "uRadius");
+    uCmpTint         = glGetUniformLocation(acrylicCompositeProgram, "uTint");
+    uCmpTintOpacity  = glGetUniformLocation(acrylicCompositeProgram, "uTintOpacity");
+    uCmpLumOpacity   = glGetUniformLocation(acrylicCompositeProgram, "uLuminosityOpacity");
+    uCmpNoiseAmount  = glGetUniformLocation(acrylicCompositeProgram, "uNoiseAmount");
+
+    // Fullscreen quad (pos.xy, uv.xy) for the blur passes — triangle strip.
+    static const float quad[16] = {
+        -1.f, -1.f, 0.f, 0.f,
+         1.f, -1.f, 1.f, 0.f,
+        -1.f,  1.f, 0.f, 1.f,
+         1.f,  1.f, 1.f, 1.f,
+    };
+    glGenVertexArrays(1, &blurVao);
+    glGenBuffers(1, &blurVbo);
+    glBindVertexArray(blurVao);
+    glBindBuffer(GL_ARRAY_BUFFER, blurVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+
+    acrylicResourcesReady = true;
+}
+
+static GLuint MakeColorRT(int w, int h, GLuint& outFbo) {
+    GLuint tex = 0, fbo = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    outFbo = fbo;
+    return tex;
+}
+
+void OpenGLBackend::DestroyBlurChain() {
+    for (auto& lv : blurChain) {
+        if (lv.fbo) glDeleteFramebuffers(1, &lv.fbo);
+        if (lv.tex) glDeleteTextures(1, &lv.tex);
+    }
+    blurChain.clear();
+    if (micaCache.fbo) { glDeleteFramebuffers(1, &micaCache.fbo); micaCache.fbo = 0; }
+    if (micaCache.tex) { glDeleteTextures(1, &micaCache.tex); micaCache.tex = 0; }
+    micaCacheValid = false;
+}
+
+void OpenGLBackend::EnsureBlurChain(int fbW, int fbH, int passes) {
+    int needLevels = passes + 1; // level 0 = 1/2 res, then halve per level
+    if (blurChainFbW == fbW && blurChainFbH == fbH &&
+        static_cast<int>(blurChain.size()) >= needLevels) {
+        return; // reuse
+    }
+    DestroyBlurChain();
+    blurChain.reserve(needLevels);
+    for (int i = 0; i < needLevels; ++i) {
+        int w = std::max(1, fbW >> (i + 1));
+        int h = std::max(1, fbH >> (i + 1));
+        BlurLevel lv; lv.w = w; lv.h = h;
+        lv.tex = MakeColorRT(w, h, lv.fbo);
+        blurChain.push_back(lv);
+    }
+    blurChainFbW = fbW; blurChainFbH = fbH;
+}
+
+void OpenGLBackend::CaptureAndBlur(int fbW, int fbH, int passes) {
+    // 1. Downscale-capture the default framebuffer into level 0 (1/2 res).
+    BlurLevel& l0 = blurChain[0];
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, l0.fbo);
+    glBlitFramebuffer(0, 0, fbW, fbH, 0, 0, l0.w, l0.h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+    glDisable(GL_BLEND);
+    glBindVertexArray(blurVao);
+
+    // 2. Downsample chain: level[k] -> level[k+1].
+    glUseProgram(kawaseDownProgram);
+    glUniform1i(uKawaseDownTex, 0);
+    glActiveTexture(GL_TEXTURE0);
+    for (int k = 0; k < passes; ++k) {
+        BlurLevel& src = blurChain[k];
+        BlurLevel& dst = blurChain[k + 1];
+        glBindFramebuffer(GL_FRAMEBUFFER, dst.fbo);
+        glViewport(0, 0, dst.w, dst.h);
+        glBindTexture(GL_TEXTURE_2D, src.tex);
+        glUniform2f(uKawaseDownHalfpixel, 0.5f / src.w, 0.5f / src.h);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    // 3. Upsample chain: level[k] -> level[k-1].
+    glUseProgram(kawaseUpProgram);
+    glUniform1i(uKawaseUpTex, 0);
+    for (int k = passes; k >= 1; --k) {
+        BlurLevel& src = blurChain[k];
+        BlurLevel& dst = blurChain[k - 1];
+        glBindFramebuffer(GL_FRAMEBUFFER, dst.fbo);
+        glViewport(0, 0, dst.w, dst.h);
+        glBindTexture(GL_TEXTURE_2D, src.tex);
+        glUniform2f(uKawaseUpHalfpixel, 0.5f / src.w, 0.5f / src.h);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    // Final blurred backdrop now lives in blurChain[0] (1/2 res, full screen extent).
+}
+
+void OpenGLBackend::DrawAcrylicPanel(const AcrylicParams& p, const float* projectionMatrix) {
+    if (p.w <= 0.0f || p.h <= 0.0f) return;
+    EnsureAcrylicResources();
+
+    const int fbW = std::max(1, static_cast<int>(viewportSize.x));
+    const int fbH = std::max(1, static_cast<int>(viewportSize.y));
+    int passes = std::clamp(p.blurPasses, 1, 5);
+    EnsureBlurChain(fbW, fbH, passes);
+
+    // Save scissor state (EndFrame set it for the panel's clip). Blur passes must
+    // not be scissored (they fill offscreen RTs); the composite restores it.
+    GLboolean scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    GLint scBox[4]; glGetIntegerv(GL_SCISSOR_BOX, scBox);
+    glDisable(GL_SCISSOR_TEST);
+
+    GLuint blurredTex;
+    if (p.mica && micaCacheValid && micaCache.w == fbW && micaCache.h == fbH) {
+        // Mica: reuse the cached blurred backdrop (near-static).
+        blurredTex = micaCache.tex;
+    } else {
+        CaptureAndBlur(fbW, fbH, passes);
+        blurredTex = blurChain[0].tex;
+        if (p.mica) {
+            // Cache the blurred result at full-screen-relative size for reuse.
+            if (!micaCache.tex || micaCache.w != fbW || micaCache.h != fbH) {
+                if (micaCache.fbo) glDeleteFramebuffers(1, &micaCache.fbo);
+                if (micaCache.tex) glDeleteTextures(1, &micaCache.tex);
+                micaCache.tex = MakeColorRT(blurChain[0].w, blurChain[0].h, micaCache.fbo);
+                micaCache.w = fbW; micaCache.h = fbH;
+            }
+            // Copy blurChain[0] -> micaCache via blit.
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, blurChain[0].fbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, micaCache.fbo);
+            glBlitFramebuffer(0, 0, blurChain[0].w, blurChain[0].h,
+                              0, 0, blurChain[0].w, blurChain[0].h,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            blurredTex = micaCache.tex;
+            micaCacheValid = true;
+        }
+    }
+
+    // Composite onto the default framebuffer over the panel rect.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, fbW, fbH);
+    if (scissorWasEnabled) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(scBox[0], scBox[1], scBox[2], scBox[3]);
+    }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    subpixelBlendActive = false; // brief 35-B: blend state reset out from under the cache
+
+    glUseProgram(acrylicCompositeProgram);
+    glUniformMatrix4fv(uCmpProjection, 1, GL_FALSE, projectionMatrix);
+    glUniform2f(uCmpCenter, p.x + p.w * 0.5f, p.y + p.h * 0.5f);
+    glUniform2f(uCmpHalf, p.w * 0.5f, p.h * 0.5f);
+    glUniform1f(uCmpSoft, std::max(1.0f, p.dpiScale));
+    glUniform1f(uCmpRadius, p.cornerRadius);
+    glUniform2f(uCmpScreenSize, static_cast<float>(fbW), static_cast<float>(fbH));
+    glUniform3f(uCmpTint, p.tintR, p.tintG, p.tintB);
+    glUniform1f(uCmpTintOpacity, p.tintOpacity);
+    glUniform1f(uCmpLumOpacity, p.luminosityOpacity);
+    glUniform1f(uCmpNoiseAmount, p.noiseAmount);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, blurredTex);
+    glUniform1i(uCmpBlur, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)(uintptr_t)p.noiseTex);
+    glUniform1i(uCmpNoise, 1);
+    glActiveTexture(GL_TEXTURE0);
+
+    glBindVertexArray(blurVao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+
+    // Invalidate our state caches — we changed program/texture/VAO/FBO behind the
+    // batch renderer's back; the next DrawBatch/DrawSDFInstances rebinds everything.
+    lastBoundProgram = 0;
+    lastBoundTexture = 0;
+    vaoIsBound = false;
+    lastBoundVBO = 0;
+    lastBoundEBO = 0;
+    projectionDirty = true;
+}
+
+// Brief 24: the GL backend implements every optional feature except external
+// texture wrapping (RegisterExternalTexture is Vulkan-only so far).
+uint32_t OpenGLBackend::Capabilities() const {
+    return static_cast<uint32_t>(RenderCap::RenderTargets)
+         | static_cast<uint32_t>(RenderCap::SaveRestore)
+         | static_cast<uint32_t>(RenderCap::CopyTexture)
+         | static_cast<uint32_t>(RenderCap::ReadPixel)
+         | static_cast<uint32_t>(RenderCap::Instancing)
+         | static_cast<uint32_t>(RenderCap::Acrylic)
+         // Brief 35-B: only advertised when the dual-source program really linked.
+         | (dualSourceBlendSupported && msdfSubpixelProgram
+                ? static_cast<uint32_t>(RenderCap::SubpixelText) : 0u);
 }
 
 // Phase C6: read a single pixel from the default framebuffer.

@@ -34,6 +34,9 @@ public:
 
     Vec2 mousePosition() const { return m_current.mouse; }
     Vec2 mouseDelta()    const { return m_current.mouse - m_previous.mouse; }
+    // Rueda acumulada en ESTE frame (y = vertical, arriba positivo). Se reinicia en cada
+    // update: no es estado, es el desplazamiento del frame.
+    Vec2 mouseWheel()    const { return m_wheel; }
 
     // Botones de ratón (1=izq, 2=medio, 3=der), igual que SDL.
     bool isMouseDown(int button)      const { return inRange(button) && m_current.mouseBtn[button]; }
@@ -52,6 +55,7 @@ private:
     };
     State     m_current;
     State     m_previous;   // la foto del frame anterior → detecta flancos
+    Vec2      m_wheel{ 0.0f, 0.0f };   // rueda de este frame (no persiste entre frames)
     EventBus* m_bus  = nullptr;
     bool      m_quit = false;
 };

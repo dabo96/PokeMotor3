@@ -33,6 +33,12 @@ void Project::init() {
     if (!m_engineAssets.empty())
         m_engineAssets = fs::path(m_engineAssets).lexically_normal().string();
 
+    // Directorio del ejecutable: es donde el post-build deja los recursos de la APP
+    // (shaders, atlas de fuentes). Se guarda siempre —también en Debug, donde el fallback
+    // de contenido apunta al árbol de fuentes— para resolveAppFile.
+    if (const char* base = SDL_GetBasePath())
+        m_exeDir = fs::path(base).lexically_normal().string();
+
     // Config de USUARIO (recientes) en la carpeta de preferencias del SO (no es contenido
     // del proyecto y NO se hardcodea ninguna ruta de proyecto).
     if (const char* pref = SDL_GetPrefPath("PokeMotor", "PokeMotor")) m_prefDir = pref;
@@ -40,8 +46,8 @@ void Project::init() {
 
     // NO se abre ni crea ningún proyecto aquí: la raíz queda vacía hasta que la pantalla de
     // bienvenida llame a newProject/openProject. La demo carga por fallback al motor.
-    LOG_INFO("Project: fallback motor='%s'; %zu recientes. Sin proyecto activo (esperando bienvenida).",
-             m_engineAssets.c_str(), m_recents.size());
+    LOG_INFO("Project: plantillas en '%s/Templates'; %zu recientes. Sin proyecto activo "
+             "(esperando bienvenida).", m_engineAssets.c_str(), m_recents.size());
 }
 
 void Project::loadRecents() {
@@ -78,18 +84,33 @@ void Project::setRoot(const std::string& dir) {
     m_root = fs::path(dir).lexically_normal().string();
 }
 
+// Contenido del PROYECTO y solo del proyecto: sin proyecto abierto —o si el archivo no
+// está— se devuelve la ruta tal cual y el que carga informa de que falta. El motor ya no
+// presta sus assets: lo que puebla un proyecto son las plantillas, al crearlo.
 std::string Project::resolveRead(const std::string& rel) const {
     if (rel.empty()) return rel;
     const fs::path p(rel);
     if (p.is_absolute()) return rel;
-    std::error_code ec;
-    if (!m_root.empty()) {
-        const fs::path cand = fs::path(m_root) / p;
-        if (fs::exists(cand, ec)) return cand.lexically_normal().string();   // existe en el proyecto
-    }
-    if (!m_engineAssets.empty())
-        return (fs::path(m_engineAssets) / p).lexically_normal().string();   // fallback al motor
+    if (!m_root.empty()) return (fs::path(m_root) / p).lexically_normal().string();
     return rel;
+}
+
+// Recurso de la aplicación (no contenido del proyecto): junto al exe primero, y si no
+// está, bajo la raíz del motor. Devuelve absoluta para que resolveRead no la reescriba.
+std::string Project::resolveAppFile(const std::string& rel) const {
+    if (rel.empty()) return rel;
+    const fs::path p(rel);
+    if (p.is_absolute()) return rel;
+    std::error_code ec;
+    if (!m_exeDir.empty()) {
+        const fs::path cand = fs::path(m_exeDir) / p;
+        if (fs::exists(cand, ec)) return cand.lexically_normal().string();
+    }
+    if (!m_engineAssets.empty()) {
+        const fs::path cand = fs::path(m_engineAssets) / p;
+        if (fs::exists(cand, ec)) return cand.lexically_normal().string();
+    }
+    return rel;   // no encontrado: relativa al cwd (comportamiento previo)
 }
 
 std::string Project::resolveWrite(const std::string& rel) const {
@@ -105,7 +126,8 @@ std::string Project::resolveWrite(const std::string& rel) const {
 
 // --- Fase 2: archivo de proyecto (.pkproj) ---
 
-bool Project::newProject(const std::string& pkprojPath, const std::string& name) {
+bool Project::newProject(const std::string& pkprojPath, const std::string& name,
+                         const std::string& templateName) {
     const fs::path pk(pkprojPath);
     const fs::path dir = pk.parent_path();
     std::error_code ec;
@@ -118,7 +140,18 @@ bool Project::newProject(const std::string& pkprojPath, const std::string& name)
     m_name       = name.empty() ? pk.stem().string() : name;
     m_pkprojPath = pk.lexically_normal().string();
     m_startScene.clear();
-    seedEngineAssets();   // arranca el proyecto nuevo con los assets de contenido del motor
+
+    // Contenido inicial: Base (los .lua que el editor adjunta al crear jugador/cámara) y
+    // encima la plantilla elegida. Si ésta trae una escena, queda como escena inicial.
+    copyTemplate("Base");
+    // "Empty" es la plantilla SIN carpeta: el proyecto se queda con el esqueleto + Base.
+    if (!templateName.empty() && templateName != "Base" && templateName != "Empty" &&
+        !copyTemplate(templateName))
+        LOG_WARN("Proyecto: la plantilla '%s' no existe; se crea vacío.", templateName.c_str());
+    if (fs::exists(fs::path(m_root) / "Assets/Data/scene.json", ec))
+        m_startScene = "Assets/Data/scene.json";
+    LOG_INFO("Proyecto: plantilla '%s' aplicada en %s", templateName.c_str(), m_root.c_str());
+
     if (!save()) return false;
     addRecent(m_pkprojPath);
     LOG_INFO("Proyecto creado: '%s' en %s", m_name.c_str(), m_root.c_str());
@@ -139,23 +172,41 @@ bool Project::openProject(const std::string& pkprojPath) {
     setRoot(fs::path(pkprojPath).parent_path().string());
     m_pkprojPath = fs::path(pkprojPath).lexically_normal().string();
     addRecent(m_pkprojPath);
+    // Fontanería mínima: los .lua que el editor adjunta al crear un jugador o una cámara
+    // deben existir en TODO proyecto. Se copian si faltan (skip_existing nunca pisa los del
+    // usuario); esto también repara los proyectos que antes los tomaban prestados del motor.
+    copyTemplate("Base");
     LOG_INFO("Proyecto abierto: '%s' (%s)", m_name.c_str(), m_root.c_str());
     return true;
 }
 
-void Project::seedEngineAssets() const {
-    if (m_root.empty() || m_engineAssets.empty()) return;
-    const fs::path src = fs::path(m_engineAssets) / "Assets";
-    const fs::path dst = fs::path(m_root) / "Assets";
+// Vuelca "Templates/<name>/" sobre la raíz del proyecto. skip_existing: una plantilla
+// nunca pisa lo que el usuario ya tenga (y Base, que va primera, gana a las demás).
+bool Project::copyTemplate(const std::string& name) const {
+    if (m_root.empty() || name.empty()) return false;
     std::error_code ec;
-    // Solo subcarpetas de CONTENIDO (no Models/Demo 3D pesado ni Fonts del motor).
-    for (const char* sub : { "Models/Sprites", "Textures", "Data", "Scripts" }) {
-        const fs::path from = src / sub, to = dst / sub;
-        if (!fs::exists(from, ec)) continue;
-        fs::create_directories(to.parent_path(), ec);
-        fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::skip_existing, ec);
+    const fs::path src(resolveAppFile("Templates/" + name));
+    if (!fs::exists(src, ec) || !fs::is_directory(src, ec)) return false;
+    fs::copy(src, fs::path(m_root),
+             fs::copy_options::recursive | fs::copy_options::skip_existing, ec);
+    if (ec) { LOG_WARN("Proyecto: fallo copiando la plantilla '%s' (%s)", name.c_str(), ec.message().c_str()); return false; }
+    return true;
+}
+
+// Las plantillas son CARPETAS, no una lista en el código: añadir una es crear su carpeta.
+std::vector<std::string> Project::templateNames() const {
+    std::vector<std::string> out{ "Empty" };   // sintética: proyecto en blanco (solo Base)
+    std::error_code ec;
+    const fs::path dir(resolveAppFile("Templates"));
+    if (!fs::exists(dir, ec)) return out;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        if (!e.is_directory()) continue;
+        const std::string n = e.path().filename().string();
+        if (n == "Base") continue;      // se aplica siempre, no se elige
+        out.push_back(n);
     }
-    LOG_INFO("Proyecto: assets de arranque sembrados en %s", dst.string().c_str());
+    std::sort(out.begin() + 1, out.end());   // "Empty" siempre primera
+    return out;
 }
 
 std::string Project::importAsset(const std::string& srcAbsPath, const std::string& destRelDir) const {

@@ -4,12 +4,13 @@
 #include "core/UndoSystem.h"
 #include "core/LayoutSerializer.h"
 #include "Theme/Style.h"
-#include <SDL3/SDL.h>
+#include "core/UIEvent.h" // WindowHandle, UIEvent (brief 20; no SDL in this header)
 #include <string>
 #include <functional>
 #include <cstdint>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 
 namespace FluentUI {
 
@@ -17,6 +18,8 @@ namespace FluentUI {
 struct UIContext;
 class DockSpace;
 class RenderBackend;
+class PlatformBackend; // brief 25: platform seam (SDL lives behind this)
+enum class DockPosition; // defined in DockSystem.h
 
 /// Application configuration passed to FluentApp constructor.
 struct AppConfig {
@@ -26,6 +29,18 @@ struct AppConfig {
     bool darkMode = true;    ///< Start with dark Fluent theme.
     int targetFPS = 60;      ///< Frame rate cap (0 = vsync only).
     bool enableDPI = true;   ///< Auto-detect and apply DPI scaling.
+
+    /// brief 18.3: attach the Windows UI Automation provider (screen-reader peer)
+    /// to the main window. Opt-in because it subclasses the OS window proc; the
+    /// default-off keeps existing apps untouched. No effect on non-Windows.
+    bool enableAccessibility = false;
+
+    /// brief 13: borderless window with a custom title bar. When true, the window
+    /// is created borderless and a hit-test is installed so the
+    /// FluentUI::TitleBar() widget drives drag/resize/caption-buttons. Opt-in so
+    /// the default window chrome is preserved for existing apps. The app MUST draw
+    /// a TitleBar() each frame (otherwise the window has no draggable region).
+    bool useCustomTitleBar = false;
 
     /// Optional override for the icon font path. When empty (default),
     /// FluentApp searches for `assets/fonts/lucide.ttf` next to the
@@ -49,7 +64,7 @@ public:
     void root(std::function<void(UIBuilder&)> buildFn);
 
     // Access
-    SDL_Window* window() { return window_; }
+    WindowHandle window() { return window_; }
     UIContext* context() { return ctx_; }
     bool isOpen() const { return open_; }
     void close() { open_ = false; }
@@ -61,26 +76,39 @@ public:
 private:
     friend class FluentApp; // Only FluentApp can construct
 
+    // brief 09 Fase 1: backend-agnostic. The window owns a UIContext created with
+    // CreateStandaloneContext(window, parentCtx) so it SHARES the parent's GPU
+    // device / GL context and resource pool (brief 08). No own GL context.
+    // brief 25: `platform` is borrowed from the owning FluentApp (all OS/window
+    // calls route through it); the AppWindow never owns or destroys it.
     AppWindow(const std::string& title, int width, int height,
-              SDL_Window* parentWindow, SDL_GLContext parentGLContext);
+              WindowHandle parentWindow, void* parentGLContext,
+              UIContext* parentCtx, PlatformBackend* platform);
 
-    // Process one frame (called by FluentApp in the main loop)
-    // Switches GL context, renders, and restores parent context.
-    void processFrame(float dt, SDL_Window* parentWindow, SDL_GLContext parentGLContext);
+    // Process one frame (called by FluentApp in the main loop). Sets this context
+    // current, builds + renders the panel, and presents via the backend. For GL it
+    // restores the parent context afterwards (parentGLContext may be null on Vulkan).
+    void processFrame(float dt, WindowHandle parentWindow, void* parentGLContext);
 
-    // Route an SDL event to this window's input system
-    void routeEvent(const SDL_Event& e);
+    // Route a neutral UI event to this window's input system / window handling.
+    void routeEvent(const UIEvent& e);
 
     // Update DPI scale from current display
     void updateDPIScale();
 
-    SDL_Window* window_ = nullptr;
-    SDL_GLContext glContext_ = nullptr;  // Own GL context
-    RenderBackend* backend_ = nullptr;   // Own backend (for cleanup)
+    WindowHandle window_ = nullptr;      // native window handle (opaque; cast in the .cpp)
+    RenderBackend* backend_ = nullptr;   // Own backend (for cleanup); shares parent device
+    PlatformBackend* platform_ = nullptr; // brief 25: borrowed from FluentApp (not owned)
     UIContext* ctx_ = nullptr;
+    // brief 09: the SHARED GL context (parent's) this window renders with. Stored
+    // only so GL resource cleanup can be made current at destruction. Null on Vulkan.
+    void* sharedGLContext_ = nullptr;    // GL context (opaque; cast in the .cpp)
     bool open_ = true;
     std::function<void(UIBuilder&)> rootBuilder_;
     std::string panelId_; // Phase E5: set when hosting a detached dock panel
+    // brief 09 Fase 3: custom-titlebar drag state for re-dock detection.
+    bool titleDragging_ = false;
+    int  titleDragDX_ = 0, titleDragDY_ = 0; // cursor offset from window origin
 };
 
 /// Main application class. Owns the SDL window, GL context, and UIContext.
@@ -100,31 +128,31 @@ public:
     /// Convenience: construct with just width/height (uses default config).
     FluentApp(const std::string& title, int width, int height);
 
-    /// Construct from an **external** SDL window + GL context.
-    /// FluentApp will NOT create, destroy, or manage the window/context.
-    /// Use beginFrame()/endFrame() instead of run().
+    /// Construct from an **external** engine-owned window + GL context, passed as
+    /// opaque handles (WindowHandle / void*). FluentApp will NOT create, destroy,
+    /// or manage them. Use beginFrame()/endFrame() instead of run().
     ///
     /// @code
-    /// // Your engine already has a window and GL context:
-    /// SDL_Window* win = ...;
-    /// SDL_GLContext gl = SDL_GL_GetCurrentContext();
+    /// // Your engine already has a window and GL context (as opaque handles):
+    /// WindowHandle win = ...;   // your native window
+    /// void* gl = ...;           // your GL context (null on Vulkan)
     ///
-    /// FluentApp ui(win, gl);
-    /// ui.root([](UIBuilder& b) { b.button("Hello"); });
+    /// FluentApp app(win, gl);
+    /// app.root([](UIBuilder& b) { b.button("Hello"); });
     ///
-    /// // In your engine loop:
+    /// // In your engine loop, translate native events to UIEvent — SDL hosts use
+    /// // FluentUI::TranslateSDLEvent() from core/SDLPlatform.h — then:
     /// while (running) {
-    ///     SDL_Event e;
-    ///     while (SDL_PollEvent(&e)) {
-    ///         ui.processEvent(e);
+    ///     for (each native event e) {
+    ///         UIEvent ui;
+    ///         if (FluentUI::TranslateSDLEvent(e, ui)) app.processEvent(ui);
     ///     }
-    ///     ui.beginFrame(dt);
+    ///     app.beginFrame(dt);
     ///     // ... your 3D rendering ...
-    ///     ui.endFrame();       // renders UI on top, does NOT call SwapWindow
-    ///     SDL_GL_SwapWindow(win);
+    ///     app.endFrame();      // renders UI on top, does NOT swap buffers
     /// }
     /// @endcode
-    FluentApp(SDL_Window* externalWindow, SDL_GLContext externalGLContext,
+    FluentApp(WindowHandle externalWindow, void* externalGLContext,
               bool darkMode = true, bool enableDPI = true);
 
     ~FluentApp();
@@ -145,14 +173,15 @@ public:
     // ─── External-window integration ─────────────────────────────────
     // Use these instead of run() when FluentApp does NOT own the window.
 
-    /// Feed an SDL event to FluentUI (call for each event in your loop).
-    void processEvent(const SDL_Event& e);
+    /// Feed a neutral UI event to FluentUI (call for each event in your loop).
+    /// SDL hosts translate via FluentUI::TranslateSDLEvent (core/SDLPlatform.h).
+    void processEvent(const UIEvent& e);
 
     /// Start a new UI frame. Call after polling events, before building UI.
     void beginFrame(float dt);
 
     /// Finish the UI frame: renders deferred elements + final draw.
-    /// Does NOT call SDL_GL_SwapWindow — your engine does that.
+    /// Does NOT call the buffer swap — your engine does that.
     void endFrame();
 
     // Lifecycle hooks
@@ -171,7 +200,7 @@ public:
 
     // Access
     UIContext* context() { return ctx_; }
-    SDL_Window* window() { return window_; }
+    WindowHandle window() { return window_; }
     bool isRunning() const { return running_; }
 
     // Keyboard shortcuts
@@ -203,6 +232,19 @@ public:
     void setOnPanelDragOut(std::function<void(const std::string& panelId,
                                               int screenX, int screenY)> cb);
 
+    // brief 09 Fase 2: register the build callback for a dockable panel by id, so
+    // auto-detach can host it in a floating window without the user re-supplying it.
+    // Pass the SAME builder you use with UIBuilder::dockPanel(panelId, ...).
+    void registerPanelBuilder(const std::string& panelId,
+                              std::function<void(UIBuilder&)> builder);
+
+    // brief 09 Fase 2/3: turn on the full drag-out → floating window → re-dock flow.
+    // Requires the panel builders to be registered via registerPanelBuilder(). When
+    // a docked panel is dragged outside the main window it spawns a floating
+    // AppWindow; dragging that window's titlebar back over a main-window dock zone
+    // re-docks it and destroys the floating window.
+    void enableAutoDetach(bool enable = true);
+
     /// Phase E5: enumerate currently-detached viewports (for serialization).
     std::vector<ViewportInfo> getViewports() const;
 
@@ -231,11 +273,22 @@ private:
     float computeDelta();
     void updateDPIScale();
 
-    // Get the SDL window ID for an event (works for mouse, key, window events)
-    static SDL_WindowID getEventWindowID(const SDL_Event& e);
+    // brief 09 Fase 2: spawn a floating window hosting `panelId` using the
+    // registered builder; removes it from the main dock tree. Used by auto-detach.
+    AppWindow* autoDetachPanel(const std::string& panelId, int screenX, int screenY);
+    // brief 09 Fase 3: while a floating panel window's titlebar is dragged over a
+    // main-window dock zone, preview it; on release re-dock and destroy the window.
+    void updateFloatingRedock();
 
-    SDL_Window* window_ = nullptr;
-    SDL_GLContext mainGLContext_ = nullptr; // Cached main GL context for restore
+
+    // brief 25: the platform seam. Owns the window/event/OS side (SDLPlatform by
+    // default via CreateDefaultPlatform(); NullPlatform / host platform when
+    // embedded). Declared first so it outlives every other member and is destroyed
+    // LAST (its SDL_Quit must run after the window/context are torn down).
+    std::unique_ptr<PlatformBackend> platform_;
+
+    WindowHandle window_ = nullptr;         // native window handle (opaque; cast in the .cpp)
+    void* mainGLContext_ = nullptr;         // GL context (opaque; cast in the .cpp)
     UIContext* ctx_ = nullptr;
     bool running_ = false;
     bool initialized_ = false;
@@ -258,6 +311,17 @@ private:
 
     // Phase E: Drag-out detection callback
     std::function<void(const std::string&, int, int)> onPanelDragOut_;
+
+    // brief 09 Fase 2: panel id → build callback registry (for auto-detach).
+    std::unordered_map<std::string, std::function<void(UIBuilder&)>> panelBuilders_;
+    bool autoDetach_ = false;
+
+    // brief 09 Fase 3: live re-dock state (a floating panel window being dragged
+    // by its titlebar over a main-window dock zone).
+    AppWindow*  redockWin_ = nullptr;     // floating window currently hovering a zone
+    DockPosition redockZone_{};           // hovered zone (Float = none)
+    std::string redockTargetId_;          // panel the zone belongs to
+    bool        redockActive_ = false;    // a zone is currently hovered
 
     // Phase E5: viewports loaded from layout file, awaiting restoreViewports().
     std::vector<ViewportInfo> pendingViewports_;

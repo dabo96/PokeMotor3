@@ -117,6 +117,14 @@ public:
     void drawFrame();
     void onResize() { m_swapchainDirty = true; }
 
+    // Extent SOBRE EL QUE SE DIBUJARÁ ESTE FRAME, en píxeles del framebuffer. Es el
+    // mismo valor que recibirá el uiCallback, así que la UI puede construir su layout
+    // con él y quedar imposibilitada de desincronizarse del attachment (una UI
+    // maquetada a un tamaño menor que la imagen deja píxeles que NADIE escribe, y con
+    // loadOp=LOAD eso muestra el frame anterior / la escena). Si la swapchain está
+    // marcada sucia, devuelve el tamaño al que se va a recrear, no el vigente.
+    VkExtent2D uiExtent() const;
+
 private:
     bool createCommandResources();
     bool createSyncObjects();

@@ -11,10 +11,14 @@
 #include "core/FontMSDF.h"
 #include "core/MSDFGenerator.h"
 #include "core/FontManager.h"
+#include "core/FontSystem.h" // brief 23: font/atlas/MSDF subsystem (owned by Renderer)
+#include "core/SharedResourcePool.h" // complete type: originRenderer dereferenced in Init
 #include <memory>
 #include <iostream>
 
 namespace FluentUI {
+
+struct SharedResourcePool;
 
 enum class RenderLayer {
   Default = 0,
@@ -37,10 +41,28 @@ public:
     void* texture = nullptr;
     float projection[16];
     Color textColor;
+    // Brief 29 Part B: the MSDF atlas' real distanceRange (px), plumbed from
+    // FontMSDF::GetPixelRange() so the shader uses the true range instead of a
+    // hand-tuned constant. 0 => non-MSDF batch (backend keeps its own default).
+    // Carried per-batch because the static (12) and dynamic (4) atlases differ.
+    float msdfPxRange = 0.0f;
+    // Brief 35-A/35-B: transfer curve + subpixel mode this batch was built for.
+    // Part of the batch identity: two text runs with different contrast direction
+    // (light-on-dark vs dark-on-light) must NOT merge into one draw.
+    TextRenderParams textParams;
     ClipRect clipRect;
     bool hasClip = false;
     float lineWidth = 1.0f;
     bool isLines = false;
+    // SDF instanced batch (brief 02). When isSDF, `instances` holds the rounded-rect
+    // instances and `reveal` carries the per-frame reveal cursor {x,y,radius} (brief 04).
+    bool isSDF = false;
+    std::vector<SDFInstance> instances;
+    float reveal[3] = {0.0f, 0.0f, 0.0f};
+    // Acrylic/Mica deferred op (brief 06). Recorded in draw order; executed in
+    // EndFrame so the backend can capture+blur the backdrop drawn before it.
+    bool isAcrylic = false;
+    AcrylicParams acrylic;
   };
 
   Renderer() = default;
@@ -60,17 +82,40 @@ public:
   PerfCounters perfCounters;
 
   bool Init(RenderBackend* backend);
+  // brief 08 Part C: multi-window init. `pool` is the per-device shared resource
+  // pool. When the pool has no origin yet, this Renderer becomes the device-owner
+  // and publishes its atlas handles into the pool; otherwise it is a secondary
+  // window sharing the same device/GL-context and references the pool.
+  bool Init(RenderBackend* backend, SharedResourcePool* pool);
   void BeginFrame(const Color& clearColor = Color(0.13f, 0.13f, 0.13f, 1.0f));
   void EndFrame();
+  // Present this window's frame (backend-agnostic; brief 08/09 multi-window).
+  void Present() { if (backend) backend->Present(); }
   void Shutdown();
 
+  // Access the underlying backend (multi-window plumbing: shared GL context /
+  // Vulkan shared device extraction). Null before Init.
+  RenderBackend* GetBackend() const { return backend; }
+
+  // The per-device shared resource pool this Renderer is bound to (or null when
+  // standalone). Set by Init(backend, pool).
+  SharedResourcePool* GetSharedPool() const { return sharedPool; }
+
   // Gestión de capas
-  void SetLayer(RenderLayer layer) { currentLayer = layer; }
+  void SetLayer(RenderLayer layer) {
+    // Flush pending geometry of the outgoing layer before switching, so it
+    // lands in its own layer's batches instead of the new layer's.
+    if (layer != currentLayer) FlushBatch();
+    currentLayer = layer;
+  }
   RenderLayer GetLayer() const { return currentLayer; }
 
-  // Primitivas de dibujo
+  // Primitivas de dibujo.
+  // borderBottom (brief 34 Parte E): color del borde inferior para el bisel de
+  // elevación. Por defecto (0,0,0,0) ⇒ borde plano (el shader ignora el gradiente).
   void DrawRect(const Vec2 &pos, const Vec2 &size, const Color &color,
-                float cornerRadius = 0.0f);
+                float cornerRadius = 0.0f,
+                const Color &borderBottom = Color(0.0f, 0.0f, 0.0f, 0.0f));
   void DrawRectFilled(const Vec2 &pos, const Vec2 &size, const Color &color,
                       float cornerRadius = 0.0f);
   void DrawRectWithElevation(const Vec2 &pos, const Vec2 &size, const Color &color,
@@ -87,11 +132,25 @@ public:
   // fades the whole shadow (e.g. for tooltip fade-in). Draw BEFORE the fill.
   void DrawElevationShadow(const Vec2 &pos, const Vec2 &size, float cornerRadius,
                            float z, float opacityScale = 1.0f);
+  // Inner / inset shadow (brief 11): darkens INSIDE the rect, stronger near the
+  // inner edges (for pressed buttons and recessed inputs). sigma is the penumbra
+  // in logical px. Draw AFTER the element's own fill so it sits on top.
+  void DrawInsetShadow(const Vec2 &pos, const Vec2 &size, float cornerRadius,
+                       float sigma, const Color &color);
   void DrawRectGradient(const Vec2 &pos, const Vec2 &size,
                         const Color &topLeft, const Color &topRight,
                         const Color &bottomLeft, const Color &bottomRight);
+  // Acrylic material (brief 06): captures the backdrop behind the panel, blurs it
+  // (dual Kawase) and composites tint + luminosity + noise, masked to the rounded
+  // rect. Real GPU blur when the backend SupportsAcrylic(); otherwise a flat tinted
+  // fallback (DrawRectAcrylicFallback). Use for flyouts / dialogs (live backdrop).
   void DrawRectAcrylic(const Vec2 &pos, const Vec2 &size, const Color &tintColor,
                        float cornerRadius = 0.0f, float opacity = 0.8f, float blurAmount = 0.0f);
+  // Mica material (brief 06): a cheaper, near-static variant — backdrop is blurred
+  // once and reused (refreshed on resize), with a stronger tint. Use for window
+  // backgrounds / sidebars.
+  void DrawRectMica(const Vec2 &pos, const Vec2 &size, const Color &tintColor,
+                    float cornerRadius = 0.0f, float opacity = 0.8f);
   void DrawLine(const Vec2 &start, const Vec2 &end, const Color &color,
                 float width = 1.0f);
   void DrawCircle(const Vec2 &center, float radius, const Color &color,
@@ -129,8 +188,12 @@ public:
   void DrawText(const Vec2 &pos, const std::string &text, const Color &color,
                 float fontSize = 16.0f);
   bool LoadFont(const std::string &filepath, int pixelHeight);
-  bool IsFontLoaded() const { return fontLoaded; }
+  bool IsFontLoaded() const { return fontSystem_.IsFontLoaded(); }
   Vec2 MeasureText(const std::string &text, float fontSize = 16.0f);
+  // Mide el texto envolviendo por palabra dentro de maxWidth. Devuelve {ancho real usado, alto total}.
+  Vec2 MeasureTextWrapped(const std::string& text, float maxWidth, float fontSize = 0.0f);
+  // Dibuja el texto envuelto por palabra dentro de maxWidth desde pos (top-left).
+  void DrawTextWrapped(const Vec2& pos, const std::string& text, const Color& color, float maxWidth, float fontSize = 0.0f);
   // Métricas del font activo (en proporción al fontSize). Se usan para
   // centrar verticalmente texto dentro de un campo: el ascender devuelve
   // el offset desde pos.y hasta la baseline, así el centro visual del
@@ -140,7 +203,25 @@ public:
   // Icon font (secondary font for UI icons like Lucide)
   bool LoadIconFont(const std::string &filepath, int pixelHeight);
   void DrawIconGlyph(const Vec2 &pos, uint32_t codepoint, const Color &color, float fontSize = 16.0f);
-  bool IsIconFontLoaded() const { return iconFontLoaded; }
+  // Draws an icon glyph whose actual visual bounding box is vertically centered
+  // at centerY (independent of the icon font's ascent metric). Used so icons line
+  // up optically with adjacent text regardless of the two fonts' differing metrics.
+  void DrawIconGlyphVCentered(float x, float centerY, uint32_t codepoint, const Color &color, float fontSize = 16.0f);
+  bool IsIconFontLoaded() const { return fontSystem_.IsIconFontLoaded(); }
+
+  // Y to pass to DrawText so the text's LINE BOX is vertically centered inside
+  // [containerTop, containerTop + containerHeight].
+  //
+  // DrawText's pos.y is the top of the line box, not the top of the ink: the
+  // baseline lands at pos.y + ascender*fontSize and the box is
+  // fontSize*lineHeight tall (≈1.33*fontSize for Segoe UI). Centering with
+  // `(h - fontSize) * 0.5f` — the pattern this codebase grew — therefore places
+  // the text (lineHeight-1)/2 ≈ 0.165*fontSize too LOW. In a tall row that reads
+  // as a slight misalignment; in a tight container (a chip, a compact pill) the
+  // descenders spill out the bottom edge.
+  //
+  // Uses the same metric MeasureText reports, so measuring and centering agree.
+  float TextTopForVCenter(float containerTop, float containerHeight, float fontSize);
 
   // Issue 8: Public glyph advance accessor for FindCaretPosition
   float GetGlyphAdvance(uint32_t codepoint, float fontSize);
@@ -150,8 +231,10 @@ public:
                         const std::string& fontName, float fontSize = 16.0f);
   Vec2 MeasureTextWithFont(const std::string& text, const std::string& fontName, float fontSize = 16.0f);
 
-  // Font manager access
-  FontManager& GetFontManager() { return fontManager; }
+  // Font manager access. In a multi-window shared-device setup this routes to the
+  // device-owner's manager so fonts registered from any window land in the single
+  // shared atlas (brief 08 Part C — fonts are not re-baked per window).
+  FontManager& GetFontManager() { return fontSystem_.Manager(); }
 
   // Utilidades
   void SetViewport(int width, int height);
@@ -162,6 +245,81 @@ public:
   void SetDPIScale(float scale) { dpiScale = std::max(0.5f, std::min(4.0f, scale)); }
   float GetDPIScale() const { return dpiScale; }
 
+  // Brief 29 Part A: physical-px cutover below which UI text is served by hinted
+  // bitmap buckets instead of MSDF. Call from app/theme setup to tune (default 28).
+  void SetTextBitmapThreshold(float px) { fontSystem_.SetBitmapThresholdPx(px); }
+  float GetTextBitmapThreshold() const { return fontSystem_.BitmapThresholdPx(); }
+  // True if DrawText/MeasureText at this size will take the bitmap-bucket path.
+  // Exposed for tests and for callers that want to reason about the text pipeline.
+  bool WillUseBitmapText(float fontSize) const { return fontSystem_.PickTextPath(fontSize).bitmap; }
+
+  // ── Text quality (briefs 35-A / 35-B / 35-C) ──────────────────────────────
+  // Tunables for the text pipeline. All of it is per-frame state on the Renderer,
+  // so a debug panel can move these live without recreating any pipeline.
+  struct TextQuality {
+    // Brief 35-A — gamma + enhanced contrast. The correction is ASYMMETRIC:
+    // light-on-dark must thin (gamma > 1), dark-on-light must fatten (gamma < 1),
+    // because visual irradiation makes light-on-dark strokes bloom.
+    bool  contrastEnabled = true;
+    float gammaLightOnDark = 1.35f;
+    float gammaDarkOnLight = 0.85f;
+    float contrast = 0.35f;
+    // Brief 35-B — subpixel (ClearType-style) AA. This is the USER preference;
+    // whether a given frame actually uses it also depends on backend capability
+    // and on not rendering offscreen (see CanUseSubpixel).
+    bool  subpixelEnabled = true;
+    bool  bgrStripes = false;   // panel stripe order: false = RGB, true = BGR
+    // Extra desaturation on top of the shader's FIR5 filter. The filter does the
+    // real fringe removal; raise this only if a panel still shows color edges.
+    float fringe = 0.1f;
+    // Brief 35-C — vertical grid fitting (baseline snap + optimal phase δ).
+    bool  verticalGridFit = true;
+  };
+  void SetTextQuality(const TextQuality& q) { textQuality_ = q; }
+  const TextQuality& GetTextQuality() const { return textQuality_; }
+
+  // Brief 35-A: the surface color the NEXT text is drawn on, used to pick the
+  // contrast direction. Defaults to the frame's clear color, which is right for
+  // most UI; containers with their own fill (cards, flyouts, selected rows) push
+  // their color so the direction follows the real backdrop. Never read back from
+  // the framebuffer — that would stall the pipeline.
+  void PushTextBackdrop(const Color& c) { textBackdropStack_.push_back(c); }
+  void PopTextBackdrop() { if (!textBackdropStack_.empty()) textBackdropStack_.pop_back(); }
+  const Color& CurrentTextBackdrop() const {
+    return textBackdropStack_.empty() ? frameClearColor_ : textBackdropStack_.back();
+  }
+
+  // Brief 35-C §4: snapping a run that is MOVING produces sustained judder, which
+  // is far worse than a one-frame pop when it settles. Rule: continuous geometry
+  // while in transition, snap on settle. Wrap position-animated text in
+  // SetTextGridFitEnabled(false) … (true).
+  void SetTextGridFitEnabled(bool on) { textGridFitScope_ = on; }
+  bool IsTextGridFitEnabled() const { return textGridFitScope_; }
+
+  // Brief 35-B: hosts that redirect this Renderer's output into an offscreen
+  // target must say so — subpixel coverage is only valid when compositing
+  // directly against the final opaque surface.
+  void SetRenderingToOffscreen(bool v) { renderingToOffscreen_ = v; }
+  // True when subpixel text is actually usable this frame.
+  bool CanUseSubpixel() const;
+
+  // Reveal highlight (brief 04). Set once per frame (e.g. from the mouse position):
+  // SDF rects whose revealIntensity>0 light up their edge by proximity to the cursor.
+  // radius<=0 disables the effect for the frame.
+  void SetRevealCursor(const Vec2& pos, float radius) {
+    revealCursor[0] = pos.x; revealCursor[1] = pos.y; revealCursor[2] = radius;
+  }
+  // Set the reveal intensity (0..1) applied to the NEXT SDF rect emitted by
+  // DrawRectFilled/DrawRect. Consumed (reset to 0) after that single rect, so a
+  // widget marks each surface it wants to react to the cursor.
+  void SetNextRevealIntensity(float intensity) { nextRevealIntensity = intensity; }
+
+  // Themed shadow color (brief 11). DrawElevationShadow tints every drop shadow
+  // with this color; its alpha scales the per-layer opacity. Set per theme (e.g.
+  // black in light mode, a cooler/softer black in dark mode).
+  void SetShadowColor(const Color &c) { shadowColor = c; }
+  const Color &GetShadowColor() const { return shadowColor; }
+
   // Phase C6 (eyedropper): read a single pixel from the framebuffer.
   Color ReadPixel(int x, int y);
 
@@ -170,13 +328,16 @@ public:
 
 private:
   RenderBackend* backend = nullptr;
-  // Clear color captured in BeginFrame and consumed in EndFrame. The backend's
-  // BeginFrame is deferred to EndFrame so that, in Vulkan shared mode, it runs
-  // inside the engine's render pass when the external command buffer is valid
-  // (BeginFrame records the viewport/scissor and needs a live cmd). For
-  // standalone/OpenGL backends this is behaviorally identical — the whole
-  // acquire→record→submit sequence simply runs together in EndFrame.
-  Color pendingClearColor = Color(0, 0, 0, 1);
+  // brief 08 Part C: shared per-device resource pool (null = standalone).
+  SharedResourcePool* sharedPool = nullptr;
+
+  // brief 08 Part C: the font subsystem (fontSystem_) is a device-level resource.
+  // The first Renderer bound to a pool owns the atlases; secondary Renderers point
+  // their fontSystem_ at the owner's (see InitShared) so the atlas is never rebuilt
+  // per window. All font state/logic lives in FontSystem (brief 23).
+  // Shared-device init for a secondary Renderer: skips font baking and adopts the
+  // owner's FontSystem. Implemented in Renderer.cpp.
+  bool InitShared(RenderBackend* backend);
   Vec2 viewportSize = {800.0f, 600.0f};
   RenderLayer currentLayer = RenderLayer::Default;
   // Phase A4: DPI scale used to size the AA fringe (1 physical pixel always).
@@ -189,78 +350,47 @@ private:
   ShaderType currentBatchShader = ShaderType::Basic;
   void* currentBatchTexture = nullptr;
   Color currentBatchTextColor{1,1,1,1};
-  void EnsureBatchState(ShaderType shader, void* texture, const Color& color);
+  // Brief 29 Part B: real MSDF distanceRange for the pending quads. Set by the
+  // MSDF DrawText path from FontMSDF::GetPixelRange(); reset to 0 for any other
+  // shader in EnsureBatchState so non-text batches don't inherit a stale range.
+  float currentBatchPxRange = 0.0f;
+  // Brief 35-A/35-B: params for the quads currently accumulating. Identity for
+  // every non-text batch.
+  TextRenderParams currentTextParams;
+  // brief 10 Part D: color by value so a PushOpacity scope can scale its alpha.
+  // textParams (brief 35-A): non-null for MSDF text; a change in the curve or the
+  // subpixel mode forces a flush exactly like a color/texture change would.
+  void EnsureBatchState(ShaderType shader, void* texture, Color color,
+                        const TextRenderParams* textParams = nullptr);
+  // Brief 35-A: pick the transfer curve for `textColor` over the current backdrop.
+  TextRenderParams ComputeTextParams(const Color& textColor) const;
+
+  // Brief 35-A/35-B/35-C state.
+  TextQuality textQuality_;
+  std::vector<Color> textBackdropStack_;
+  Color frameClearColor_{0.13f, 0.13f, 0.13f, 1.0f};
+  bool textGridFitScope_ = true;
+  bool renderingToOffscreen_ = false;
 
   std::vector<RenderBatch> layerBatches[(int)RenderLayer::Count];
 
-  struct Glyph {
-    Vec2 size;     // size of glyph in pixels
-    Vec2 bearing;  // offset from baseline to top-left
-    float advance = 0.0f; // horizontal advance in pixels
-    Vec2 uv0;
-    Vec2 uv1;
-    bool valid = false;
-    uint32_t lastAccessFrame = 0;  // Perf R6: for LRU eviction
-  };
-  uint32_t glyphCacheFrame = 0;
-  static constexpr size_t MAX_GLYPH_CACHE = 2048;
-  static constexpr uint32_t GLYPH_EVICT_AGE = 600; // Evict after 10s at 60fps
+  // brief 23: font/atlas/MSDF subsystem. Owned per-Renderer, but a secondary
+  // window's fontSystem_ routes every read to the device-owner's (set in
+  // InitShared) so the atlas is shared, not rebuilt. The text DRAW methods stay in
+  // Renderer (they emit quads into the batch); fontSystem_ supplies glyphs/metrics.
+  FontSystem fontSystem_;
 
-  std::unordered_map<std::uint32_t, Glyph> glyphCache;
-  bool fontLoaded = false;
-  float fontPixelHeight = 16.0f;
-  float fontAscent = 0.0f;
-  float fontDescent = 0.0f;
-  float fontLineHeight = 0.0f;
-  FT_Library ftLibrary = nullptr;
-  FT_Face fontFace = nullptr;
-
-  void* fontAtlasTexture = nullptr;
-  int atlasWidth = 0;
-  int atlasHeight = 0;
-  int atlasNextX = 0;
-  int atlasNextY = 0;
-  int atlasCurrentRowHeight = 0;
-
-  // Icon font (secondary)
-  FT_Face iconFontFace = nullptr;
-  bool iconFontLoaded = false;
-  float iconFontPixelHeight = 16.0f;
-  float iconFontAscent = 0.0f;
-  std::unordered_map<uint32_t, Glyph> iconGlyphCache;
-  bool LoadIconGlyph(uint32_t cp);
-  const Glyph* GetIconGlyph(uint32_t cp);
-
-  std::unique_ptr<FontMSDF> msdfFont;
-  std::unique_ptr<MSDFGenerator> msdfGenerator;
-
-  // Multi-font manager (Phase 5)
-  FontManager fontManager;
-
-  static constexpr int DYNAMIC_ATLAS_SIZE = 2048;
-  static constexpr int MSDF_GLYPH_SIZE = 64;
-  void* dynamicMSDFAtlasTexture = nullptr;
-  int dynamicAtlasWidth = DYNAMIC_ATLAS_SIZE;
-  int dynamicAtlasHeight = DYNAMIC_ATLAS_SIZE;
-  int dynamicAtlasNextX = 0;
-  int dynamicAtlasNextY = 0;
-  int dynamicAtlasCurrentRowHeight = 0;
-  std::unordered_map<std::uint32_t, Glyph> dynamicMSDFGlyphCache;
-
-  // Helpers internos
-  void InitializeDefaultFont();
-  void ClearGlyphs();
-  const Glyph* GetGlyph(std::uint32_t codepoint);
-  bool LoadGlyph(std::uint32_t codepoint);
-  const Glyph* GetOrGenerateMSDFGlyph(std::uint32_t codepoint);
-  bool GenerateMSDFGlyph(std::uint32_t codepoint);
-  float GetKerning(std::uint32_t left, std::uint32_t right) const;
-  bool EnsureAtlasSpace(int glyphWidth, int glyphHeight, int& outX, int& outY);
-  bool EnsureDynamicMSDFAtlasSpace(int glyphWidth, int glyphHeight, int& outX, int& outY);
-
-  // Issue 15: Helper for acrylic multi-fill optimization
-  void DrawMultipleFilledRoundedRects(const Vec2& pos, const Vec2& size, float cornerRadius,
-                                       const Color* colors, int count);
+  // Brief 06: flat tinted fallback for Acrylic/Mica when the backend cannot blur
+  // (e.g. Vulkan shared mode, or no render targets). This is the old "fake acrylic"
+  // look: a few stacked translucent SDF fills + a hairline border.
+  void DrawRectAcrylicFallback(const Vec2& pos, const Vec2& size, const Color& tintColor,
+                               float cornerRadius, float opacity);
+  // Brief 06: build the AcrylicParams and record a deferred acrylic/mica op.
+  void EmitAcrylicOp(const Vec2& pos, const Vec2& size, const Color& tintColor,
+                     float cornerRadius, float opacity, float blurAmount, bool mica);
+  // Blue-noise grain texture (64x64, R8). Lazily created on first acrylic use.
+  void* blueNoiseTexture = nullptr;
+  void EnsureBlueNoise();
 
   // Phase A1: Path state and fan-with-fringe emitter (Basic shader, untextured)
   std::vector<Vec2> pathPoints;
@@ -274,12 +404,26 @@ private:
   std::vector<RenderVertex> lineVertices;
   float lineBatchWidth = 1.0f;
 
+  // SDF instance accumulator (brief 02). Flushed alongside the quad/line batches,
+  // preserving draw order via EnsureBatchState/FlushBatch.
+  std::vector<SDFInstance> sdfInstances;
+  static constexpr size_t MAX_SDF_INSTANCES = 4096;
+  // Reveal cursor for the frame {x, y, radius} (brief 04). radius<=0 disables.
+  float revealCursor[3] = {0.0f, 0.0f, 0.0f};
+  // Per-rect reveal intensity, consumed by the next DrawRectFilled/DrawRect.
+  float nextRevealIntensity = 0.0f;
+  // Themed drop-shadow color (brief 11); alpha scales the per-layer opacity.
+  Color shadowColor = Color(0.0f, 0.0f, 0.0f, 1.0f);
+
   // Optimización: límites de batch para evitar reallocaciones grandes
   static constexpr size_t MAX_QUAD_VERTICES = 10000; // ~2500 quads
   static constexpr size_t MAX_QUAD_INDICES = 15000;  // 6 indices por quad
   static constexpr size_t MAX_LINE_VERTICES = 5000;  // ~2500 líneas
 
-  // Perf 3.1: Pre-computed trig lookup table for rounded rects (8 segments per corner)
+  // Perf 3.1: Pre-computed trig lookup table for rounded rects (8 segments per corner).
+  // NOTE(brief06): kept — still used by DrawImage (rounded image corners) and
+  // PathArcToFast. DrawMultipleFilledRoundedRects (the old acrylic tessellator) was
+  // removed, but these tables have other live users so they stay.
   static constexpr int CORNER_SEGMENTS = 8;
   static constexpr int CORNER_POINTS = CORNER_SEGMENTS + 1; // 9 points per quarter
   float cosTable[CORNER_POINTS];
@@ -289,10 +433,27 @@ private:
 
   std::vector<ClipRect> clipStack;
 
+  // brief 10 Part D: global opacity multiplier (product of the PushOpacity stack).
+  // 1.0 = opaque (no effect), so existing draws are byte-identical when unused.
+  float globalAlpha_ = 1.0f;
+  std::vector<float> opacityStack_;
+
 public:
   void PushClipRect(const Vec2& pos, const Vec2& size);
   void PopClipRect();
   const std::vector<ClipRect>& GetClipStack() const { return clipStack; }
+
+  // ─── brief 10 Part D — global opacity scope (overlay fade) ──────────────────
+  // PushOpacity(a) multiplies the alpha of everything emitted until the matching
+  // PopOpacity(). Nestable (alphas multiply). Used to fade managed overlays
+  // (Flyout/Menu/Tooltip/Modal/Dialog/Toast) on enter/exit. Applied to the SDF
+  // fill/border alpha (DrawRectFilled/DrawRect) and to the text/icon color in
+  // EnsureBatchState, which covers the visual bulk of an overlay. NOTE: lines,
+  // triangles and gradients are NOT scaled (rare in overlay chrome) — documented
+  // bound for brief 10.
+  void PushOpacity(float alpha);
+  void PopOpacity();
+  float CurrentOpacity() const { return globalAlpha_; }
 };
 
 } // namespace FluentUI

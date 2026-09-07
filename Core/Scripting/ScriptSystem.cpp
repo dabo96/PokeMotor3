@@ -105,14 +105,18 @@ private:
     }
 };
 
-// Llama una función protegida y loguea (sin lanzar) si falla.
+// Llama una función protegida y loguea (sin lanzar) si falla. `outError` recoge además el
+// mensaje para el inspector; NO se limpia en éxito a propósito: un fallo se ve hasta que
+// el script se recarga (editar y guardar el .lua), no lo borra el siguiente frame que pase.
 template <typename... Args>
-void call(sol::protected_function& fn, const char* what, const std::string& path, Args&&... args) {
+void call(sol::protected_function& fn, const char* what, const std::string& path,
+          std::string* outError, Args&&... args) {
     if (!fn.valid()) return;
     sol::protected_function_result r = fn(std::forward<Args>(args)...);
     if (!r.valid()) {
         const sol::error err = r;
         LOG_ERROR("Lua %s '%s': %s", what, path.c_str(), err.what());
+        if (outError) *outError = std::string(what) + ": " + err.what();
     }
 }
 }  // namespace
@@ -123,8 +127,10 @@ struct ScriptSystem::Impl {
         fs::file_time_type      mtime;      // última escritura del .lua (hot-reload)
         sol::table              env;        // tabla/entorno del módulo (on_start/on_update/exports)
         sol::protected_function onUpdate;
-        bool                    started = false;
+        bool                    started = false;    // el .lua está CARGADO (chunk ejecutado)
+        bool                    begun   = false;    // y además ya corrió su on_start (solo jugando)
         bool                    mtimeError = false; // ya avisamos que no se lee el mtime
+        std::string             error;      // último fallo (carga/on_start/on_update); "" = sano
     };
 
     // Una función de script (on_interact, una cutscene...) corriendo como corrutina.
@@ -316,7 +322,10 @@ void ScriptSystem::init(LuaVM* vm, Input* input) {
     vm->installEventPrelude();
 }
 
-void ScriptSystem::update(Scene& scene, float dt) {
+void ScriptSystem::update(Scene& scene, float dt)  { run(scene, dt, true); }
+void ScriptSystem::refresh(Scene& scene)           { run(scene, 0.0f, false); }
+
+void ScriptSystem::run(Scene& scene, float dt, bool runCallbacks) {
     if (!m_impl->vm) return;
     m_impl->currentScene = &scene;   // visible para player_pos() durante este update
 
@@ -335,11 +344,10 @@ void ScriptSystem::update(Scene& scene, float dt) {
             inst = Impl::Instance{};
             inst.path     = sc.path;
             inst.mtime    = mtime;
-            inst.env      = m_impl->vm->loadModule(full);
+            inst.env      = m_impl->vm->loadModule(full, &inst.error);
             inst.onUpdate = inst.env["on_update"];
-            sol::protected_function onStart = inst.env["on_start"];
-            call(onStart, "on_start", sc.path);
-            inst.started = true;
+            inst.started  = true;      // CARGADA (el chunk corrió: ya hay tabla `exports`)
+            inst.begun    = false;     // pero on_start aún no: en edición no debe correr
             if (firstLoad) LOG_INFO("Script cargado: %s (hot-reload vigilando: %s)", sc.path.c_str(), full.c_str());
             else           LOG_INFO("Script recargado en caliente: %s", sc.path.c_str());
         } else if (ec) {
@@ -353,8 +361,21 @@ void ScriptSystem::update(Scene& scene, float dt) {
             inst.mtimeError = false;
         }
 
-        call(inst.onUpdate, "on_update", sc.path, ScriptEntity{ &scene, e, &m_impl->walkable }, dt);
+        if (!runCallbacks) return;   // edición: cargado es todo lo que queremos
+
+        // on_start se pospone hasta el primer frame que EJECUTA: si el script se cargó
+        // estando en edición (para leer sus exports), su inicio ocurre al pulsar Play.
+        if (!inst.begun) {
+            sol::protected_function onStart = inst.env["on_start"];
+            call(onStart, "on_start", sc.path, &inst.error);
+            inst.begun = true;
+        }
+
+        call(inst.onUpdate, "on_update", sc.path, &inst.error,
+             ScriptEntity{ &scene, e, &m_impl->walkable }, dt);
     });
+
+    if (!runCallbacks) return;   // el GridMover tampoco gobierna Transforms en edición
 
     // Tras correr los scripts, el GridMover GOBIERNA la posición de su entidad: una
     // vez sembrado (1er try_step), su Transform = celda actual, interpolada desde la
@@ -380,6 +401,12 @@ void ScriptSystem::clear() {
     m_impl->instances.clear();
     m_impl->running.clear();            // al cambiar de escena: corta los eventos en curso
     m_impl->current = nullptr;
+}
+
+void ScriptSystem::detach(Entity e) {
+    // Un evento (corrutina) en curso de esta entidad conserva su env por referencia
+    // propia (sol2) y termina solo — no hace falta cortarlo aquí.
+    m_impl->instances.erase(e.id);
 }
 
 void ScriptSystem::setWalkable(std::function<bool(int, int)> fn) { m_impl->walkable = std::move(fn); }
@@ -433,6 +460,11 @@ void ScriptSystem::pumpEvents(float dt) {
 }
 
 bool ScriptSystem::eventsActive() const { return !m_impl->running.empty(); }
+
+std::string ScriptSystem::errorOf(Entity e) const {
+    auto it = m_impl->instances.find(e.id);
+    return it == m_impl->instances.end() ? std::string{} : it->second.error;
+}
 
 std::vector<ScriptExport> ScriptSystem::exportsOf(Entity e) const {
     std::vector<ScriptExport> out;

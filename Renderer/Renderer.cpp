@@ -1,6 +1,7 @@
 #include "Renderer/Renderer.h"
 
 #include "Core/Log.h"
+#include "Core/Project.h"   // resolveAppFile: atlas MSDF junto al exe
 #include "Assets/AssetManager.h"
 #include "Renderer/Vulkan/VulkanContext.h"
 
@@ -83,9 +84,14 @@ bool Renderer::init(VulkanContext* ctx, AssetManager* assets) {
     if (!create2DResources())       return false;
     if (!create2DPipelines())       return false;
 
-    // Fuente MSDF de la UI del juego (atlas copiado junto al exe por el CMake). Si no
-    // carga, el texto simplemente no se dibuja (no es fatal para el resto del render).
-    if (!m_uiFont.load(*m_assets, "assets/fonts/atlas.json", "assets/fonts/atlas.png"))
+    // Fuente MSDF de la UI del juego. El atlas lo copia el CMake junto al exe, así que se
+    // resuelve con resolveAppFile (recurso de la APP): con la ruta relativa, el
+    // AssetManager la pasaba por resolveRead y en Debug la mandaba al árbol de FUENTES
+    // —donde no hay assets/fonts/— y la textura no cargaba. Si no carga, el texto
+    // simplemente no se dibuja (no es fatal para el resto del render).
+    const std::string atlasJson = Project::instance().resolveAppFile("assets/fonts/atlas.json");
+    const std::string atlasPng  = Project::instance().resolveAppFile("assets/fonts/atlas.png");
+    if (!m_uiFont.load(*m_assets, atlasJson, atlasPng))
         LOG_WARN("Renderer: la fuente MSDF de UI no cargó; el texto de juego no se verá.");
     // Proyección de pantalla para la UI: (0,0) arriba-izq, (lowRes) abajo-der, +Y abajo
     // (misma convención que la cámara 2D / NDC de Vulkan).
@@ -1004,6 +1010,18 @@ VkShaderModule Renderer::loadShader(const char* spvPath) {
         return VK_NULL_HANDLE;
     }
     return mod;
+}
+
+VkExtent2D Renderer::uiExtent() const {
+    // Swapchain sucia: este frame la recrea ANTES de grabar (ver drawFrame), así que
+    // el attachment será del tamaño nuevo. Devolverlo evita que la UI se maquete un
+    // frame con el tamaño viejo y deje una franja sin pintar tras un resize.
+    if (m_swapchainDirty) {
+        uint32_t w = 0, h = 0;
+        m_ctx->drawableSize(w, h);
+        if (w > 0 && h > 0) return VkExtent2D{ w, h };
+    }
+    return m_ctx->swapchain().Extent();
 }
 
 bool Renderer::recreateSwapchain() {
